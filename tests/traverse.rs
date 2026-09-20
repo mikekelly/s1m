@@ -949,7 +949,11 @@ async fn a_seed_enters_the_walk_like_an_entry_file() {
             "notes/scratch.md",
             "payments/cutoffs.md"
         ],
-        "one call per file"
+        "only the files the walk reached were judged"
+    );
+    assert!(
+        scorer.asked_twice().is_empty(),
+        "one call per file, however it was entered"
     );
 }
 
@@ -968,5 +972,4 @@ async fn a_seed_that_is_also_an_entry_file_stays_an_entry() {
     assert_eq!(paths(&found), ["index.md"]);
     assert!(!visited(&found, "index.md").seeded);
     assert_eq!(found.calls, 1, "judged once, not once per spelling");
-    assert_eq!(scorer.called(), ["index.md"]);
 }

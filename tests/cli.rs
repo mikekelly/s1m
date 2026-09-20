@@ -747,3 +747,47 @@ fn a_seed_count_without_seed_grep_exits_2() {
     assert!(error.contains("--seed-grep"), "{error}");
     assert_eq!(api.answered(), 0);
 }
+
+/// `--seed-count` is how many of the hits are used, and the entry file the
+/// caller named is left out before the count is applied rather than after: one
+/// takes the best hit, which is not the entry file, and two takes the orphan as
+/// well.
+#[test]
+fn seed_count_says_how_many_hits_are_used() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let one = run_with(
+        &[SEED_QUERY, SEED_ENTRY, "--seed-grep", "--seed-count", "1"],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(one.status.code(), Some(0), "{}", stderr(&one));
+    let one = json(&one);
+    assert_eq!(
+        paths(&one),
+        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED],
+        "one hit, and the orphan is not it"
+    );
+    assert_eq!(
+        result(&one, SEED_LINKED)["seeded"],
+        json!(true),
+        "the hit used is the best of them, not the entry file the caller named"
+    );
+
+    let two = run_with(
+        &[SEED_QUERY, SEED_ENTRY, "--seed-grep", "--seed-count", "2"],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(two.status.code(), Some(0), "{}", stderr(&two));
+    let two = json(&two);
+    assert_eq!(
+        paths(&two),
+        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED, SEED_ORPHAN],
+        "the second hit is the orphan"
+    );
+    assert_eq!(result(&two, SEED_ORPHAN)["seeded"], json!(true));
+}
