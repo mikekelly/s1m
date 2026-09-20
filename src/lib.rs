@@ -4,7 +4,12 @@
 //! lands in later issues and calls into this crate rather than reimplementing
 //! any of it.
 
+pub mod cache;
 pub mod jev;
 pub mod parse;
 pub mod scorer;
 pub mod traverse;
+
+/// Test-only helpers shared by the unit tests in more than one module.
+#[cfg(test)]
+pub(crate) mod testkit;

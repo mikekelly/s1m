@@ -91,7 +91,7 @@ Custom criteria can be supplied from a file for anything else.
 
 ### Caching
 
-Answers are cached on the hash of file content, query, mode and question. A wiki changes slowly and agents ask overlapping things, so repeat runs are close to free and fully deterministic.
+Answers are cached on the hash of the request that produced them — file content, query, mode and question, model and endpoint ([#7](https://github.com/mikekelly/s1m/issues/7)). A wiki changes slowly and agents ask overlapping things, so repeat runs are close to free and fully deterministic: Jev is stable but not bit-for-bit identical between identical requests, so the cache is where the determinism comes from. Entries live under `S1M_CACHE_DIR`, defaulting to the XDG cache directory's `s1m`; `--no-cache` bypasses them.
 
 ## Interface
 
@@ -110,6 +110,7 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | `--max-depth` | 6 | Link hops from an entry file |
 | `--threshold` | 0.6 | Minimum link scent to queue a target |
 | `--fanout` | 8 | Frontier files expanded per round |
+| `--no-cache` | off | Ignore stored answers and call the model again |
 | `--seed-grep` | off | Add top keyword hits as extra entry points |
 | `--format` | `json` | `json`, `md` (reading list) or `tree` (annotated link tree for humans) |
 | `--root` | entry file's directory | Links resolving outside it are not followed |

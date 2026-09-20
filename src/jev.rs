@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+use crate::cache::Cacheable;
 use crate::parse::{self, FrontmatterField, Link, ParsedFile};
 use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
 
@@ -152,8 +153,13 @@ struct PreviewState {
 }
 
 /// The request body, in the API's own shape.
+///
+/// Public because it is what [`Cacheable`] hands the cache to key an answer on,
+/// and deliberately opaque — no fields, no accessors — so that nothing outside
+/// this module can be built against its shape. What the API sees is this
+/// module's business; what the cache needs is [`Cacheable::key`]'s bytes.
 #[derive(Debug, Serialize)]
-struct Request {
+pub struct Request {
     state: State,
     model: &'static str,
     questions: BTreeMap<String, Question>,
@@ -334,8 +340,20 @@ impl JevScorer {
     /// Judges one file, keeping the accounting [`Scorer::score`] drops.
     pub async fn judge(&self, query: &str, file: &ParsedFile) -> Result<JevOutcome, ScorerError> {
         let request = self.request(query, file)?;
+        self.judge_request(&request, file).await
+    }
+
+    /// Sends one already-built request for `file`, keeping the accounting.
+    ///
+    /// The cache builds the request to key it, and this is the call that
+    /// follows a miss: the request that was hashed is the request that is sent.
+    async fn judge_request(
+        &self,
+        request: &Request,
+        file: &ParsedFile,
+    ) -> Result<JevOutcome, ScorerError> {
         let started = Instant::now();
-        let response = self.send(&request).await?;
+        let response = self.send(request).await?;
         let latency = started.elapsed();
         self.outcome(file, response, latency)
     }
@@ -522,6 +540,36 @@ impl Scorer for JevScorer {
     }
 }
 
+/// One Jev request is one question, and an answer to it can be kept.
+#[async_trait]
+impl Cacheable for JevScorer {
+    type Request = Request;
+    type Detail = JevDetail;
+
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
+        JevScorer::request(self, query, file)
+    }
+
+    /// The endpoint as well as the body: a proxy and the API can answer one body
+    /// differently, and a test's fake server must not read the entries a real
+    /// run wrote. Everything else an answer depends on — the model, the mode's
+    /// wording and criteria, the questions, the file's content and path, each
+    /// link's preview — is in the body.
+    fn key(&self, request: &Request) -> Result<Vec<u8>, ScorerError> {
+        serde_json::to_vec(&(&self.endpoint, request))
+            .map_err(|source| ScorerError::Encode { source })
+    }
+
+    async fn call(
+        &self,
+        request: &Request,
+        file: &ParsedFile,
+    ) -> Result<(FileJudgment, JevDetail), ScorerError> {
+        let outcome = self.judge_request(request, file).await?;
+        Ok((outcome.judgment, outcome.detail))
+    }
+}
+
 /// The key to call with: a blank variable is as good as an unset one.
 fn required_key(value: Option<String>) -> Result<String, ScorerError> {
     match value {
@@ -549,6 +597,7 @@ fn backoff(attempt: u32) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpListener, TcpStream};
     use std::path::Path;
@@ -559,6 +608,8 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::*;
+    use crate::cache::{Cacheable, CachedScorer};
+    use crate::testkit::TempDir;
 
     // --------------------------------------------------------- the fixture
 
@@ -773,6 +824,18 @@ mod tests {
     ];
 
     // ------------------------------------------------------------ the tests
+
+    /// A second mode, for the cache tests that need the questions to differ.
+    /// #10 owns the real modes; this one only has to be different from
+    /// [`USEFUL_FOR`].
+    static OTHER_MODE: Mode = Mode {
+        name: "test-mode",
+        file_question: "How much of `file` answers `query`?",
+        file_levels: &["nothing", "some", "everything"],
+        link_question: "Does `links[{index}]` answer `query`?",
+        link_true: "It does.",
+        link_false: "It does not.",
+    };
 
     #[tokio::test]
     async fn one_request_carries_the_file_and_every_link() {
@@ -1146,6 +1209,110 @@ mod tests {
             .await
             .expect_err("there is nothing to send");
         assert!(matches!(error, ScorerError::Read { .. }), "{error}");
+    }
+
+    // ------------------------------------------------------------- the cache
+
+    /// Every part of the request is part of the key, which is what keeps a
+    /// stored answer from being served to a different question.
+    #[test]
+    fn the_key_covers_everything_the_answer_depends_on() {
+        let dir = TempDir::new("key-coverage");
+        let path = dir.path().join("page.md");
+        fs::write(&path, "# Home\n\n[one](one.md)\n").expect("a page");
+        let page = parse::parse(&path, dir.path()).expect("a parse");
+        let scorer = JevScorer::new("test-key", dir.path()).expect("a client");
+        let key = |scorer: &JevScorer, query: &str, file: &ParsedFile| {
+            scorer
+                .key(&scorer.request(query, file).expect("a request"))
+                .expect("the key bytes")
+        };
+        let query = "how are payments settled";
+
+        let base = key(&scorer, query, &page);
+        assert_eq!(base, key(&scorer, query, &page), "one request, one key");
+
+        // A second scorer, as the next run of the process would build it: the
+        // same configuration has to land on the same key, or every run pays
+        // again.
+        let next_run = JevScorer::new("test-key", dir.path()).expect("a client");
+        assert_eq!(
+            base,
+            key(&next_run, query, &page),
+            "a repeat run is the same request"
+        );
+
+        assert_ne!(
+            base,
+            key(&scorer, "how do refunds work", &page),
+            "the query is in the key"
+        );
+
+        // The same page, rewritten: the key follows what is on disk, so a
+        // stored answer for the old text is never served to the new text.
+        fs::write(&path, "# Home\n\n[one](one.md) and more.\n").expect("an edit");
+        let edited = key(&scorer, query, &page);
+        assert_ne!(base, edited, "the content is in the key");
+
+        // A mode asks different questions of the same file. #10 owns the real
+        // modes, so the test brings its own; the point here is only that the
+        // questions are what the model answers.
+        let mut other_mode = JevScorer::new("test-key", dir.path()).expect("a client");
+        other_mode.mode = &OTHER_MODE;
+        assert_ne!(
+            edited,
+            key(&other_mode, query, &page),
+            "the mode's questions are in the key"
+        );
+
+        // And where the request goes: a fake server is not the API, and its
+        // answers must not be read back as the API's.
+        let elsewhere = JevScorer::new("test-key", dir.path())
+            .expect("a client")
+            .with_endpoint("http://127.0.0.1:1/v1/systemone");
+        assert_ne!(
+            edited,
+            key(&elsewhere, query, &page),
+            "the endpoint is in the key"
+        );
+    }
+
+    /// The acceptance criterion, over the real request path: a second identical
+    /// run is answered from disk, and an edit is not.
+    #[tokio::test]
+    async fn a_second_identical_run_makes_no_request() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 2.0)));
+        let dir = TempDir::new("cached-run");
+        let path = dir.path().join("page.md");
+        fs::write(&path, "# Home\n\n[one](one.md)\n").expect("a page");
+        let page = parse::parse(&path, dir.path()).expect("a parse");
+        let cached = CachedScorer::new(api.scorer(), dir.path()).expect("a cache");
+        let query = "how are payments settled";
+
+        let first = cached.score(query, &page).await.expect("a judgment");
+        let second = cached.score(query, &page).await.expect("a judgment");
+
+        assert_eq!(
+            first, second,
+            "the second run returns what the first stored"
+        );
+        assert_eq!(api.requests().len(), 1, "two runs, one request");
+        assert_eq!(cached.calls(), 1, "and one real call");
+        assert_eq!(cached.hits(), 1);
+
+        // The page changes, so the stored answer is for text that is no longer
+        // there.
+        fs::write(&path, "# Home\n\n[one](one.md) and more.\n").expect("an edit");
+        cached.score(query, &page).await.expect("a judgment");
+        assert_eq!(api.requests().len(), 2, "an edit is a new request");
+
+        // A different query about the same page, too.
+        cached
+            .score("how do refunds work", &page)
+            .await
+            .expect("a judgment");
+        assert_eq!(api.requests().len(), 3, "so is a new query");
+        assert_eq!(cached.calls(), 3, "every one of them was a call");
     }
 
     #[test]

@@ -2,15 +2,19 @@
 //!
 //! Every test here skips unless `TYPESAFE_API_KEY` is set, so `cargo test` and
 //! CI stay offline and free. On a machine with the key these are the checks
-//! behind `docs/spike-notes.md`: one request per file, one scent per link, and
-//! the numbers looking sensible on pages whose answer a person already knows.
+//! behind `docs/spike-notes.md`: one request per file, one scent per link, the
+//! numbers looking sensible on pages whose answer a person already knows, and —
+//! since the same request does not come back bit-for-bit identical — a repeat
+//! run answered from the cache instead of the API.
 //!
 //! The pages scored are public and committed — the vendored wiki in
 //! `eval/wikis/llm-wiki-manager/` and this repository's own plan — so the runs
 //! the notes describe can be repeated.
 
+use std::fs;
 use std::path::{Path, PathBuf};
 
+use s1m::cache::{CachedScorer, Scored};
 use s1m::jev::JevScorer;
 use s1m::parse::{ParsedFile, parse};
 use s1m::scorer::{FileJudgment, ScorerError};
@@ -148,4 +152,62 @@ async fn a_file_with_only_external_links_is_still_judged() {
         outcome.judgment.relevance
     );
     assert_eq!(outcome.detail.questions, 1, "the file question alone");
+}
+
+/// A directory for a live test to cache in: under the target directory, so a
+/// test never writes an entry into a home directory, and emptied on the way in
+/// so a run does not read an earlier one's answers.
+fn scratch(label: &str) -> PathBuf {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("cache-{label}"));
+    let _ = fs::remove_dir_all(&dir);
+    dir
+}
+
+/// The acceptance criterion for #7 as a caller meets it: the same file and
+/// query twice is one call, and the second run's numbers are the first run's.
+/// The model alone does not promise that — [`s1m::jev`] moves its numbers
+/// between identical requests — which is what the cache is for.
+#[tokio::test]
+async fn a_second_identical_run_is_answered_from_the_cache() {
+    let root = wiki();
+    let Some(scorer) = live_scorer(&root) else {
+        return;
+    };
+    let dir = scratch("repeat");
+    let cached = CachedScorer::new(scorer, &dir).expect("a cache");
+    let file = page(&root, "index.md");
+    let query = "how do I cut a release and publish the package";
+
+    let first = cached.judge(query, &file).await.expect("the API answers");
+    let second = cached.judge(query, &file).await.expect("the cache answers");
+
+    assert!(
+        matches!(first, Scored::Called { .. }),
+        "the first run has to call"
+    );
+    assert!(
+        matches!(second, Scored::Reused(_)),
+        "the second run must not"
+    );
+    assert_eq!(
+        first.judgment(),
+        second.judgment(),
+        "the answer is the same, bit for bit"
+    );
+    assert_eq!(cached.calls(), 1, "one call for two runs");
+    assert_eq!(cached.hits(), 1);
+
+    // A different query is a different question, and is not answered from the
+    // entry for this one.
+    let other = cached
+        .judge("how are payments settled", &file)
+        .await
+        .expect("the API answers");
+    assert!(
+        matches!(other, Scored::Called { .. }),
+        "a new query is a call"
+    );
+    assert_eq!(cached.calls(), 2);
+
+    let _ = fs::remove_dir_all(&dir);
 }
