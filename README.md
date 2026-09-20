@@ -8,12 +8,15 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: scaffold.** The CLI prints usage and nothing else; traversal, scoring and output
-> are still to come. What exists is the project skeleton from
-> [#3](https://github.com/mikekelly/s1m/issues/3) and the parser from
-> [#4](https://github.com/mikekelly/s1m/issues/4): `s1m::parse` turns one markdown file into
-> its title, frontmatter, heading sections with line ranges, and outgoing links. The design
-> lives in [docs/initial-plan.md](docs/initial-plan.md).
+> **Status: scaffold.** The CLI does not run a query yet; traversal, budgets and output are
+> still to come. What exists is the project skeleton from
+> [#3](https://github.com/mikekelly/s1m/issues/3), the parser from
+> [#4](https://github.com/mikekelly/s1m/issues/4) — `s1m::parse` turns one markdown file into
+> its title, frontmatter, heading sections with line ranges, and outgoing links — and the
+> Jev judgment from [#5](https://github.com/mikekelly/s1m/issues/5): `s1m::jev` scores one
+> file per request, returning a relevance score for the file and a scent for each of its
+> links. The design lives in [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls
+> cost and how they read on real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
 ## Your content leaves the machine
 
@@ -41,6 +44,21 @@ The stub implements `-h`/`--help` and `-V`/`--version` only: usage or version on
 No arguments, an unknown flag or one of the planned flags prints usage on stderr and exits 2 —
 running `s1m` with no arguments is missing its query and entry files, not a reading list.
 
+One hidden command works, and it is the spike's debug view rather than the interface:
+
+```bash
+cargo run -- score-file "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+cargo run -- score-file --no-previews "how does s1m decide which links to follow" \
+  docs/initial-plan.md
+```
+
+It parses one file, sends one Jev request, and prints the file's relevance, the call's model,
+token count, latency and cost, then one row per link, best scent first. `--root DIR` sets the
+directory links resolve against (the file's own directory by default). It needs
+`TYPESAFE_API_KEY` and exits 2, with the reason on stderr, when the key is missing or the API
+refuses the request.
+
 The plan's interface, once implemented:
 
 ```bash
@@ -52,13 +70,15 @@ Exit codes: `0` reading list returned, `1` nothing cleared the threshold, `2` er
 
 ## Library
 
-The parser later stages build on lives in `src/parse.rs` and is reachable without the CLI, so
-it can be driven directly from tests:
+The parser and the Jev judgment later stages build on live in `src/` and are reachable without
+the CLI, so they can be driven directly from tests:
 
 | Item | What it does |
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
+| `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1) and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, in the file's own order |
+| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, holding the query, the file and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`; `judge` also returns the model, token counts and latency of the call |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
@@ -67,12 +87,17 @@ followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wik
 
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it.
+`eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
+([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
+`docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it
+came back under, so answers land on their own link; a link whose target cannot be read is
+still judged, from the text the caller wrote about it.
 
 ## Development
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit, parser and CLI tests |
+| `cargo test` | Unit, parser, Jev client and CLI tests; the live tests skip without `TYPESAFE_API_KEY` |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
@@ -82,3 +107,8 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo
 usage, no arguments exits 2 with usage on stderr, an unknown flag exits 2
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the same binary,
 so the usage text, the streams and the exit codes above are what CI exercises.
+
+`tests/jev_live.rs` is the only test that leaves the machine. It calls the real API for
+`TYPESAFE_API_KEY`, and skips itself when the variable is unset, so CI stays offline and free;
+with the key set it scores the vendored wiki's index page and release page and this
+repository's plan, and checks that the release page outranks an unrelated one.
