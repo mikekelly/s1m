@@ -8,15 +8,17 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: scaffold.** The CLI does not run a query yet; traversal, budgets and output are
-> still to come. What exists is the project skeleton from
+> **Status: scaffold.** The CLI does not run a query yet; budgets, caching and the output
+> formats are still to come. What exists is the project skeleton from
 > [#3](https://github.com/mikekelly/s1m/issues/3), the parser from
 > [#4](https://github.com/mikekelly/s1m/issues/4) — `s1m::parse` turns one markdown file into
-> its title, frontmatter, heading sections with line ranges, and outgoing links — and the
-> Jev judgment from [#5](https://github.com/mikekelly/s1m/issues/5): `s1m::jev` scores one
-> file per request, returning a relevance score for the file and a scent for each of its
-> links. The design lives in [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls
-> cost and how they read on real pages is in [docs/spike-notes.md](docs/spike-notes.md).
+> its title, frontmatter, heading sections with line ranges, and outgoing links — the Jev
+> judgment from [#5](https://github.com/mikekelly/s1m/issues/5) — `s1m::jev` scores one file
+> per request, returning a relevance score for the file and a scent for each of its links —
+> and the walk from [#6](https://github.com/mikekelly/s1m/issues/6): `s1m::traverse` searches
+> the link graph best-first against an injected `s1m::scorer::Scorer`. The design lives in
+> [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
+> real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
 ## Your content leaves the machine
 
@@ -77,16 +79,27 @@ the CLI, so they can be driven directly from tests:
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
-| `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1) and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, in the file's own order |
+| `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1) and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
 | `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, holding the query, the file and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`; `judge` also returns the model, token counts and latency of the call |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
 followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wikilinks
 (`[[target]]`, `[[target|alias]]`) resolve by file name under `root`, preferring `.md`.
 
+Traversal takes its `entries` against the same base as `parse`, and every path it returns —
+`path`, `via` and link targets — is spelled relative to `root`, so `root.join(path)` is the
+file to read. The walk is async because the scorer is: a round joins one future per file, and
+the caller brings the runtime. Ties on path score are broken by path, the round's answers are
+collected in the order they were asked for however they come back, and the reading list is
+sorted by relevance: the same query on the same files gives the same result, whatever the
+answers' latency. A file that cannot be parsed or scored is reported in `failed` and does not
+end the walk.
+
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
-the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it.
+the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
+`tests/traverse.rs` walks it with a fake scorer.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
 `docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it
@@ -97,7 +110,7 @@ still judged, from the text the caller wrote about it.
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit, parser, Jev client and CLI tests; the live tests skip without `TYPESAFE_API_KEY` |
+| `cargo test` | Unit, parser, Jev client, traversal and CLI tests; the live tests skip without `TYPESAFE_API_KEY` |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |

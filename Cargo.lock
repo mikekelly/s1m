@@ -1086,6 +1086,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "futures-util",
  "pulldown-cmark",
  "reqwest",
  "serde",

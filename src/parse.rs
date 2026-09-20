@@ -144,7 +144,7 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
     let scan = Scan::of(&source);
     let starts = line_starts(&source);
     let last_line = line_count(&source);
-    let directory = normalize(&relative_to(root, path.parent().unwrap_or(Path::new(""))));
+    let directory = relative_to_root(root, path.parent().unwrap_or(Path::new("")));
 
     // The tree is walked at most once, and only if a wikilink needs it.
     let mut index = None;
@@ -189,6 +189,15 @@ pub fn preview(path: impl AsRef<Path>) -> Result<Preview, ParseError> {
         frontmatter: scan.frontmatter,
         first_paragraph: scan.first_paragraph,
     })
+}
+
+/// `path` as [`parse`] spells a link target: normalised, and relative to
+/// `root`.
+///
+/// Traversal uses it so that an entry file is spelled exactly the way a link
+/// reaching that file is spelled, and the two name the same file.
+pub fn relative_to_root(root: impl AsRef<Path>, path: impl AsRef<Path>) -> PathBuf {
+    normalize(&relative_to(root.as_ref(), path.as_ref()))
 }
 
 /// Frontmatter title, else first H1, else the file name.
