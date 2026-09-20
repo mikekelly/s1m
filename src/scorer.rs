@@ -11,13 +11,13 @@
 
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::parse::ParsedFile;
 
 /// What one link is worth: how likely following it is to reach something
 /// useful for the query.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkJudgment {
     /// The link's target, resolved against the root by
     /// [`crate::parse::parse`], and the same path as
@@ -30,7 +30,7 @@ pub struct LinkJudgment {
 }
 
 /// What one file is worth, and what each of its links is worth.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileJudgment {
     /// How useful the file is for the query, 0 to 1, where 1 means the file is
     /// central to it. Ordered, so it can rank a reading list directly.
@@ -85,6 +85,29 @@ pub enum ScorerError {
         id: String,
         expected: &'static str,
         found: &'static str,
+    },
+    /// Nowhere to put cached answers: none of `S1M_CACHE_DIR`, `XDG_CACHE_HOME`
+    /// and `HOME` is set. `--no-cache` runs without a cache at all.
+    #[error(
+        "no cache directory: set S1M_CACHE_DIR, XDG_CACHE_HOME or HOME, or run with --no-cache"
+    )]
+    NoCacheDir,
+    /// The cache directory could not be created: a typo in `S1M_CACHE_DIR`, a
+    /// path that is a file, a filesystem that will not take it.
+    #[error("could not use the cache directory {path}: {source}")]
+    Cache {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    /// The request could not be turned into the bytes a cache keys on. Nothing
+    /// this crate sends can fail to serialise — the request is strings and
+    /// numbers — but [`crate::cache::Cacheable`] does not promise that of every
+    /// implementation.
+    #[error("could not serialise the request: {source}")]
+    Encode {
+        #[source]
+        source: serde_json::Error,
     },
 }
 
