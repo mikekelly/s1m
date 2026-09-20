@@ -10,17 +10,21 @@
 //!
 //! What the reading list is:
 //!
-//! - The plan's `Output` section, minus `sections`, which is
-//!   [#9](https://github.com/mikekelly/s1m/issues/9): the query, the criterion
-//!   the answers were judged against, how many files were visited and how many
-//!   calls they cost, and one entry per visited file with its relevance, the
-//!   scent of the link that reached it, the `via` path, whether it entered the
-//!   walk as a keyword seed, and the outgoing links that were judged.
+//! - The plan's `Output` section: the query, the criterion the answers were
+//!   judged against, how many files were visited and how many calls they cost,
+//!   and one entry per visited file with its relevance, the scent of the link
+//!   that reached it, the `via` path, whether it entered the walk as a keyword
+//!   seed, the line ranges worth reading and the outgoing links that were
+//!   judged.
 //! - Sorted by relevance descending, then path. Every path is spelled the way
 //!   the caller spelled its entry files, so `--root wiki` with `wiki/index.md`
 //!   reads `wiki/payments/cutoffs.md` and not `payments/cutoffs.md`. That is
 //!   the spelling the plan's example uses, and the one a caller can hand
 //!   straight back to an editor or another command.
+//! - Sections are the parser's ranges and the model's scores, most useful
+//!   first, with the ones below `section_threshold` left out. A section's range
+//!   contains its subsections', so a caller that reads a returned range has
+//!   read everything returned inside it.
 //!
 //! `--seed-grep` adds the query's keyword hits under the root to the frontier as
 //! extra entry files ([`crate::seed`]), and `--seed-count` says how many. A seed
@@ -53,7 +57,9 @@ use crate::cache::{Cacheable, CachedScorer};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
 use crate::seed;
-use crate::traverse::{Config, FailedFile, Failure, Traversal, TraverseError, traverse};
+use crate::traverse::{
+    Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
+};
 
 /// One run's inputs: the flags the CLI carries, with their defaults applied.
 ///
@@ -77,6 +83,13 @@ pub struct Options {
     pub max_depth: usize,
     /// Least link scent that queues a target.
     pub threshold: f64,
+    /// Least section score the reading list keeps. A section the model scored
+    /// below this is dropped from its file's `sections`.
+    ///
+    /// Nothing here has a default of its own: the CLI's `--section-threshold`
+    /// defaults to whatever `--threshold` is, the way the plan's flag table
+    /// says.
+    pub section_threshold: f64,
     /// Frontier files expanded per round.
     pub fanout: usize,
     /// Most keyword hits `--seed-grep` adds as extra entry files under the
@@ -190,9 +203,9 @@ impl<S: Scorer> Judge for Uncached<S> {
 /// The reading list, in the shape the plan's `Output` section describes it.
 ///
 /// Field names and order are that section: `query`, `mode`, `visited`, `calls`,
-/// `results`, and per result `path`, `relevance`, `scent`, `via`, `links`, each
-/// link carrying `target`, `scent` and `followed`. `sections` is the one field
-/// the plan has that this does not, because #9 brings it.
+/// `results`, and per result `path`, `relevance`, `scent`, `via`, `sections`,
+/// `links`, each section carrying `heading`, `lines` and `score` and each link
+/// `target`, `scent` and `followed`.
 #[derive(Debug, Serialize)]
 pub struct ReadingList {
     /// The query, unchanged.
@@ -204,6 +217,10 @@ pub struct ReadingList {
     /// Answers bought from the API: the cache's misses, or every score when
     /// `--no-cache` skipped the cache. A repeat run of the same query is
     /// therefore `0`.
+    ///
+    /// A judgment, not an HTTP request: a file whose sections and links did not
+    /// fit the API's state budget in one request costs several, and is still
+    /// one answer here (`s1m score-file` reports the requests).
     pub calls: u64,
     /// The visited files, most relevant first, ties broken by path.
     pub results: Vec<RankedFile>,
@@ -243,8 +260,28 @@ pub struct RankedFile {
     /// Whether this file entered the walk as a `--seed-grep` keyword seed
     /// rather than as an entry file the caller named or along a link.
     pub seeded: bool,
+    /// The file's heading sections that cleared `--section-threshold`, most
+    /// useful first and ties broken by the file's own order, each with the line
+    /// range to read.
+    ///
+    /// This is where the caller reads from: the range is the parser's, so the
+    /// lines named are the text that was scored, and a section's range contains
+    /// its subsections' — a reader that has read one range has read everything
+    /// inside it.
+    pub sections: Vec<RankedSection>,
     /// This file's outgoing links, in the order they appear, one per target.
     pub links: Vec<RankedLink>,
+}
+
+/// One heading section of a ranked file, as it was judged.
+#[derive(Debug, PartialEq, Serialize)]
+pub struct RankedSection {
+    /// Heading text, `null` for content before the first heading.
+    pub heading: Option<String>,
+    /// `[first, last]` line, inclusive, 1-based, as the parser gave them.
+    pub lines: [usize; 2],
+    /// How useful the section is for the query, 0 to 1.
+    pub score: f64,
 }
 
 /// One outgoing link of a ranked file, as it was judged.
@@ -354,6 +391,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
             scent: file.scent,
             via: file.via.iter().map(|via| display(&root, via)).collect(),
             seeded: file.seeded,
+            sections: ranked_sections(&file.sections, options.section_threshold),
             links: file
                 .links
                 .into_iter()
@@ -384,20 +422,50 @@ fn display(root: &Path, path: &Path) -> String {
     parse::from_root(root, path).display().to_string()
 }
 
+/// A visited file's sections as the reading list carries them: the ones that
+/// cleared `threshold`, most useful first.
+///
+/// A section below the threshold is one the model did not call useful, and the
+/// list exists so that the caller reads the ranges in it and nothing else.
+/// Ties are broken by the file's own order — the sections' starting lines are
+/// strictly increasing, so that order is total — which is what keeps the list
+/// from depending on the order the answers arrived in.
+fn ranked_sections(sections: &[JudgedSection], threshold: f64) -> Vec<RankedSection> {
+    let mut ranked: Vec<RankedSection> = sections
+        .iter()
+        .filter(|section| section.score >= threshold)
+        .map(|section| RankedSection {
+            heading: section.heading.clone(),
+            lines: section.lines,
+            score: section.score,
+        })
+        .collect();
+    ranked.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.lines[0].cmp(&b.lines[0]))
+    });
+    ranked
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::scorer::LinkJudgment;
+    use crate::parse::Section;
+    use crate::scorer::{LinkJudgment, SectionJudgment};
 
     const ENTRY: &str = "tests/fixtures/cli/entry.md";
     const BROKEN: &str = "tests/fixtures/cli/broken.md";
+    const NESTED: &str = "tests/fixtures/cli/nested.md";
+    const PREAMBLE: &str = "tests/fixtures/cli/preamble.md";
 
     // ------------------------------------------------------------- the fake
 
-    /// A scorer with an answer the test sets: the relevance of a file and one
-    /// scent for all of its links.
+    /// A scorer with an answer the test sets: the relevance of a file, one
+    /// scent for all of its links, and one score per section through
+    /// `section`.
     ///
     /// It counts what it answers the way a scorer that had to ask does, so a
     /// test can tell what the reading list reports `calls` from: `buys` is a
@@ -405,11 +473,20 @@ mod tests {
     /// like from here.
     struct Fake {
         relevance: fn(&ParsedFile) -> f64,
+        /// The score every section gets, section by section; `flat` unless a
+        /// test wants the reading list's own ordering to show.
+        section: fn(&Section) -> f64,
         scent: f64,
         /// A file name to refuse, as the API refusing one page's question does.
         refuse: Option<&'static str>,
         buys: bool,
         calls: AtomicU64,
+    }
+
+    /// Every section scored alike, which is what a test that is not about
+    /// section scores wants.
+    fn flat(_: &Section) -> f64 {
+        0.9
     }
 
     impl Fake {
@@ -433,9 +510,16 @@ mod tests {
             }
         }
 
+        /// The same answers, with every section scored by `section`.
+        fn sectioning(mut self, section: fn(&Section) -> f64) -> Fake {
+            self.section = section;
+            self
+        }
+
         fn answering(relevance: fn(&ParsedFile) -> f64, scent: f64, buys: bool) -> Fake {
             Fake {
                 relevance,
+                section: flat,
                 scent,
                 refuse: None,
                 buys,
@@ -468,6 +552,15 @@ mod tests {
             }
             Ok(FileJudgment {
                 relevance: (self.relevance)(file),
+                sections: file
+                    .sections
+                    .iter()
+                    .map(|section| SectionJudgment {
+                        heading: section.heading.clone(),
+                        lines: section.lines,
+                        score: (self.section)(section),
+                    })
+                    .collect(),
                 links: file
                     .links
                     .iter()
@@ -509,6 +602,7 @@ mod tests {
             max_files: 25,
             max_depth: 6,
             threshold: 0.6,
+            section_threshold: 0.6,
             fanout: 8,
             seed_grep: None,
             mode: "useful-for".to_string(),
@@ -541,6 +635,9 @@ mod tests {
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md", "tests/fixtures/cli/next.md"],
                         "seeded": false,
+                        "sections": [
+                            {"heading": "Deep", "lines": [1, 3], "score": 0.9},
+                        ],
                         "links": [],
                     },
                     {
@@ -549,6 +646,9 @@ mod tests {
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md"],
                         "seeded": false,
+                        "sections": [
+                            {"heading": "Next", "lines": [1, 3], "score": 0.9},
+                        ],
                         "links": [
                             {
                                 "target": "tests/fixtures/cli/deep.md",
@@ -563,6 +663,9 @@ mod tests {
                         "scent": null,
                         "via": [],
                         "seeded": false,
+                        "sections": [
+                            {"heading": "Entry", "lines": [1, 4], "score": 0.9},
+                        ],
                         "links": [
                             {
                                 "target": "tests/fixtures/cli/next.md",
@@ -575,6 +678,96 @@ mod tests {
             })
         );
         assert_eq!(list.exit_code(), 0);
+    }
+
+    /// The line ranges in the list are #4's parser's, section for section, and
+    /// the list carries them most useful first with the weak ones left out: a
+    /// page whose sections nest comes back with the two the scores put above
+    /// the threshold, in score order, each on its own lines.
+    #[tokio::test]
+    async fn sections_are_the_parsers_ranges_ranked_by_score() {
+        // Every section scored from its own first line, over fifteen: the
+        // document order and the score order are different, and two of the
+        // four sections fall below the threshold of six tenths.
+        fn by_first_line(section: &Section) -> f64 {
+            section.lines[0] as f64 / 15.0
+        }
+
+        let list = run_with(
+            NESTED,
+            &Fake::uncached(by_relevance, 0.9).sectioning(by_first_line),
+        )
+        .await
+        .expect("the fixture walks");
+
+        assert_eq!(list.results.len(), 1);
+        let parsed = parse::parse(NESTED, "tests/fixtures/cli").expect("the fixture parses");
+        assert_eq!(
+            parsed
+                .sections
+                .iter()
+                .map(|section| (section.heading.clone(), section.lines))
+                .collect::<Vec<_>>(),
+            [
+                (Some("Nested".to_string()), [1, 15]),
+                (Some("First".to_string()), [5, 12]),
+                (Some("Deeper".to_string()), [9, 12]),
+                (Some("Second".to_string()), [13, 15]),
+            ],
+            "the fixture the expectations below are read off"
+        );
+
+        assert_eq!(
+            list.results[0].sections,
+            vec![
+                RankedSection {
+                    heading: Some("Second".to_string()),
+                    lines: [13, 15],
+                    score: 13.0 / 15.0,
+                },
+                RankedSection {
+                    heading: Some("Deeper".to_string()),
+                    lines: [9, 12],
+                    score: 9.0 / 15.0,
+                },
+            ],
+            "most useful first, the parser's ranges, and nothing below the threshold"
+        );
+    }
+
+    /// Content before the first heading comes back as a section with a `null`
+    /// heading, on the parser's lines: it is the one range no heading names,
+    /// and two sections the model scored alike keep the file's own order.
+    #[tokio::test]
+    async fn the_preamble_is_reported_as_a_section_with_no_heading() {
+        let list = run_with(PREAMBLE, &Fake::uncached(by_relevance, 0.9))
+            .await
+            .expect("the fixture walks");
+
+        assert_eq!(
+            list.results[0].sections,
+            vec![
+                RankedSection {
+                    heading: None,
+                    // To the line before the first heading, blank line and all.
+                    lines: [1, 3],
+                    score: 0.9,
+                },
+                RankedSection {
+                    heading: Some("Preamble".to_string()),
+                    lines: [4, 6],
+                    score: 0.9,
+                },
+            ],
+            "the preamble and the heading, in the file's order on a tie"
+        );
+
+        let json: Value = serde_json::from_str(&list.to_json()).expect("the reading list is JSON");
+        assert_eq!(
+            json["results"][0]["sections"][0]["heading"],
+            Value::Null,
+            "a section no heading names is `null`, not absent"
+        );
     }
 
     /// A link below the threshold queues nothing, so the walk reaches nothing

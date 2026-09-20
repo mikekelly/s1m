@@ -14,8 +14,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::sleep;
 
-use s1m::parse::{ParsedFile, relative_to_root};
-use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
+use s1m::parse::{self, ParsedFile, relative_to_root};
+use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
 use s1m::traverse::{Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
 
 const QUERY: &str = "settlement timing for instant payouts";
@@ -133,6 +133,22 @@ impl Scorer for Fake {
 
         Ok(FileJudgment {
             relevance: entry.relevance,
+            // Section `i` scores `0.5 + i/100`, so a section judgment landing
+            // on the wrong section of the file is visible, and the score order
+            // is the file's own order. The heading and the range are the
+            // fake's own and deliberately not the parser's, so a walk that
+            // reported the judgment's heading or range rather than the parsed
+            // file's would show `"not the parser's"` or `[0, 0]` in a result.
+            sections: file
+                .sections
+                .iter()
+                .enumerate()
+                .map(|(index, _)| SectionJudgment {
+                    heading: Some("not the parser's".to_string()),
+                    lines: [0, 0],
+                    score: 0.5 + index as f64 / 100.0,
+                })
+                .collect(),
             links: entry
                 .links
                 .iter()
@@ -272,6 +288,18 @@ fn judged(file: &VisitedFile) -> Vec<Judged> {
         .collect()
 }
 
+/// What a test compares about a judged section: its heading, the lines it
+/// covers and its score.
+type JudgedSection = (Option<String>, [usize; 2], f64);
+
+/// Every section of a record, in the order the file has them.
+fn sections(file: &VisitedFile) -> Vec<JudgedSection> {
+    file.sections
+        .iter()
+        .map(|section| (section.heading.clone(), section.lines, section.score))
+        .collect()
+}
+
 /// Whether a record's link to `target` queued its target.
 fn followed(file: &VisitedFile, target: &str) -> bool {
     file.links
@@ -302,6 +330,77 @@ fn failures(traversal: &Traversal) -> Vec<(String, String)> {
             )
         })
         .collect()
+}
+
+/// Every visited file carries its sections: the parser's own ranges — parent
+/// sections included, so a parent's range covers its subsections' — in the
+/// file's order, each with the score the scorer answered for that section.
+#[tokio::test]
+async fn a_visited_file_carries_its_sections_with_the_parsers_ranges() {
+    let scorer = Fake::new(&[
+        ("index.md", Entry::new(0.5, &[("payments/README.md", 0.9)])),
+        ("payments/README.md", Entry::new(0.4, &[])),
+    ]);
+
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
+
+    // The ranges the list is held to, as #4's parser reports them.
+    let parsed = parse::parse(root().join("payments/README.md"), root()).expect("a parse");
+    assert_eq!(
+        parsed
+            .sections
+            .iter()
+            .map(|section| (section.heading.clone(), section.lines))
+            .collect::<Vec<_>>(),
+        [
+            (Some("Payments".to_string()), [1, 25]),
+            (Some("Instant payouts".to_string()), [5, 12]),
+            (Some("Windows".to_string()), [9, 12]),
+            (Some("Settlement".to_string()), [13, 25]),
+        ],
+        "the fixture the expectation below is read off"
+    );
+
+    assert_eq!(
+        sections(visited(&found, "payments/README.md")),
+        [
+            (Some("Payments".to_string()), [1, 25], 0.5),
+            (Some("Instant payouts".to_string()), [5, 12], 0.51),
+            (Some("Windows".to_string()), [9, 12], 0.52),
+            (Some("Settlement".to_string()), [13, 25], 0.53),
+        ],
+        "document order, the parser's lines, and the fake's score by position"
+    );
+}
+
+/// Content before the first heading is a section like any other, reported with
+/// `heading: None` and the lines the parser gave it: it is the one part of a
+/// file no heading names, so dropping or renaming it would lose the only range
+/// that covers it.
+#[tokio::test]
+async fn the_preamble_before_the_first_heading_is_a_section() {
+    let scorer = Fake::new(&[("notes/scratch.md", Entry::new(0.5, &[]))]);
+
+    let found = Settings::new(&["notes/scratch.md"]).run(&scorer).await;
+
+    let parsed = parse::parse(root().join("notes/scratch.md"), root()).expect("a parse");
+    assert_eq!(
+        parsed
+            .sections
+            .iter()
+            .map(|section| (section.heading.clone(), section.lines))
+            .collect::<Vec<_>>(),
+        [(None, [1, 2]), (Some("Scratch".to_string()), [3, 5]),],
+        "the fixture the expectation below is read off"
+    );
+    assert_eq!(
+        sections(visited(&found, "notes/scratch.md")),
+        [
+            (None, [1, 2], 0.5),
+            (Some("Scratch".to_string()), [3, 5], 0.51)
+        ],
+        "the preamble keeps its place, its lines and no heading"
+    );
 }
 
 #[tokio::test]

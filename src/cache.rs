@@ -33,8 +33,10 @@ const ENTRIES: &str = "judgments";
 
 /// The shape of a stored entry. An entry written by another format is a miss
 /// rather than a wrong answer, which is what makes it safe to change
-/// [`FileJudgment`] later.
-const FORMAT: u32 = 1;
+/// [`FileJudgment`] later. 2 is the shape with section scores in it
+/// ([#9](https://github.com/mikekelly/s1m/issues/9)); 1 had the file and its
+/// links only, and an entry of that shape cannot answer for a file's sections.
+const FORMAT: u32 = 2;
 
 // ------------------------------------------------------------------ caching
 
@@ -266,7 +268,7 @@ mod tests {
 
     use super::*;
     use crate::parse;
-    use crate::scorer::{FileJudgment, LinkJudgment};
+    use crate::scorer::{FileJudgment, LinkJudgment, SectionJudgment};
     use crate::testkit::TempDir;
 
     // ------------------------------------------------------------- the fake
@@ -300,6 +302,11 @@ mod tests {
     fn answer(request: &str) -> FileJudgment {
         FileJudgment {
             relevance: request.chars().count() as f64,
+            sections: vec![SectionJudgment {
+                heading: Some("Heading".to_string()),
+                lines: [1, 3],
+                score: 0.5,
+            }],
             links: vec![LinkJudgment {
                 target: PathBuf::from("linked.md"),
                 scent: 0.5,

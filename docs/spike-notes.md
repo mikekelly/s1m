@@ -103,11 +103,61 @@ there is no question-count wall anywhere near this data — the cost is the stat
 therefore binds at **roughly 100–120 links with previews**, and later if previews get shorter
 or frontmatter is dropped. The risk row in the plan ("hub pages with hundreds of links may
 exceed per-request question or state limits") is real, but it is a token budget problem, not a
-question-count problem: chunk the link table or trim previews above ~100 links. Every page in
+question-count problem: chunk the link table or trim previews above ~100 links. [#9](https://github.com/mikekelly/s1m/issues/9)
+chunks the questions — see [below](#section-questions-and-splitting-a-file-that-does-not-fit). Every page in
 the vendored wiki is far below that (largest: `concepts/repo-layout.md`, 18 links).
 
 I did not push a request over the limit, so the exact failure mode at 32k (422 or truncation) is
 untested.
+
+## Section questions, and splitting a file that does not fit
+
+Measured 2026-09-20 for [#9](https://github.com/mikekelly/s1m/issues/9), with the same
+`jev-latest` alias. The request now also carries the file's heading sections and asks one Noul
+per section — "is the text under this heading, at these lines, useful" — which is what turns a
+file's relevance into line ranges. What that costs:
+
+| File | Sections | Links | Questions | Input tokens | Latency | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| `wiki/concepts/release.md` | 2 | 5 | 8 | 3,206 | 0.30 s | $0.000135 |
+| `wiki/concepts/node-version-and-types.md` | 8 | 5 | 14 | 5,181 | 0.26 s | $0.000218 |
+| `docs/initial-plan.md` (no links) | 17 | 0 | 18 | 5,999 | 0.22 s | $0.000252 |
+
+The plan's own question alone cost 3,226 input tokens before this change, so seventeen section
+questions added 2,773 — about **160 tokens a section**, against about 250 for a link with a
+preview. Nothing about the shape changed: one request, 0.3 s, and the cost is again the state.
+
+What a section question reads, and what it does not:
+
+- **The heading, its depth and its lines — not the section's text.** The text is already in
+  `state.file.content`, and a parent section contains its subsections' text, so copying each
+  section's text into its own state entry would multiply the state by the nesting depth. A
+  duplicated heading ("See also" appears under several pages) is told apart by its depth and
+  lines, and a section of a file long enough to be truncated is judged from its heading alone,
+  the way a link with no readable target is judged from its anchor.
+- **Both parents and leaves.** A parent owns the prose between its heading and its first
+  subsection, which no leaf covers, so judging leaves only would strand it. A parent that is a
+  mix of useful and useless subsections lands near the middle of the scale, which is what the
+  caller's section threshold is for: on `release.md` the page's own text scored 0.73 and its
+  "See also" list 0.14, and on the plan, for the query it is about, "Scoring and pruning" scored
+  0.91 while "Sources" scored 0.25.
+
+On splitting, the notes above left the failure mode at the 32k budget untested. It is now
+handled the other way round from the suggestion there: **the questions are what get chunked,
+not the link table's previews.** The file's content is capped at 40,000 characters already, so
+the unbounded part is the question set; a file is posted as many times as it takes, with the
+same file in every post, the file's own Score in the first, and the answers merged. A generated
+hub of 300 links (302 questions, the shape of the synthetic hub earlier in these notes):
+
+```bash
+cargo run -- score-file "how do I cut a release and publish the package" \
+  /tmp/jev-hub/hub.md --root /tmp/jev-hub
+# call  jev-1.13.0  302 questions in 2 request(s)  83,848 tokens in + 5,822 out  0.58 s  $0.003522
+```
+
+Two requests of about 42k tokens each: one request could not have carried them, and the API
+accepted both. The split is decided before sending, from the JSON of each part at four
+characters per token, with a margin, so it needs no error to trigger it.
 
 ## Do target previews earn their tokens
 
@@ -175,8 +225,10 @@ threshold on a probability is exactly what the frontier wants.
 The plan's other open question — score very long files by section only, skipping the whole-file
 judgment — is not answered here. One datapoint: this repository's 11 KB plan scored 2.98–2.99
 of 3 with 0.98–0.99 confidence as a whole file for a query it is about, so the whole-file
-judgment is sound at that size. Section scores are
-[#9](https://github.com/mikekelly/s1m/issues/9).
+judgment is sound at that size. [#9](https://github.com/mikekelly/s1m/issues/9) answered it by
+keeping the whole-file Score and adding section scores beside it: the file Score is what ranks
+the reading list, and a section-only number would mix a best paragraph against another file's
+average in one column.
 
 ## What else the runs showed
 
@@ -207,7 +259,8 @@ judgment is sound at that size. Section scores are
 - Calibration. No gold set, so nothing here says whether scent 0.89 is *right*, only that it is
   clearly above 0.16 on the same page. The default `--threshold` needs
   [#9](https://github.com/mikekelly/s1m/issues/9)/evaluation, not this data.
-- The exact behaviour at the 32k state limit, and whether chunking a link table is better than
-  trimming its previews.
+- Whether splitting a file's questions across requests is better than trimming its previews, past
+  the measurements [#9](https://github.com/mikekelly/s1m/issues/9) took: a split keeps every
+  answer at full fidelity, and costs a second round trip for the same file.
 - Whether the Score's four levels beat a different number of levels, or beat a Noul plus a
   second "is it even on topic" question. One run per page is not enough to tell.

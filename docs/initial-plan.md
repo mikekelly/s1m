@@ -60,7 +60,7 @@ Each round expands the top-k frontier files concurrently, so latency is one roun
 
 ### One request per file
 
-Jev answers independent questions over the same state in parallel, so each visited file is a single request. The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph) read from disk.
+Jev answers independent questions over the same state in parallel, so each visited file is a single request — unless its sections and links do not fit the API's 32k state budget in one, when it is split and the answers merged (see `docs/spike-notes.md`). The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph) read from disk.
 
 | Judgment | Primitive | Question | Used for |
 | --- | --- | --- | --- |
@@ -111,6 +111,7 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | `--max-files` | 25 | Files visited before stopping |
 | `--max-depth` | 6 | Link hops from an entry file |
 | `--threshold` | 0.6 | Minimum link scent to queue a target |
+| `--section-threshold` | `--threshold` | Minimum section score to keep in the output |
 | `--fanout` | 8 | Frontier files expanded per round |
 | `--no-cache` | off | Ignore stored answers and call the model again |
 | `--seed-grep` | off | Add top keyword hits as extra entry points |

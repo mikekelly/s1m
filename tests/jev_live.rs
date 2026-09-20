@@ -60,6 +60,11 @@ fn assert_judged(file: &ParsedFile, judgment: &FileJudgment) {
         file.links.len(),
         "one scent per link, in the file's own order"
     );
+    assert_eq!(
+        judgment.sections.len(),
+        file.sections.len(),
+        "one score per section, in the parser's own order"
+    );
     assert!(
         (0.0..=1.0).contains(&judgment.relevance),
         "relevance is a 0 to 1 fraction, got {}",
@@ -74,6 +79,34 @@ fn assert_judged(file: &ParsedFile, judgment: &FileJudgment) {
             judged.scent
         );
     }
+    for (section, judged) in file.sections.iter().zip(&judgment.sections) {
+        assert_eq!(
+            section.heading, judged.heading,
+            "answers keep the section order"
+        );
+        assert_eq!(
+            section.lines,
+            judged.lines,
+            "{} is judged on the lines the parser gave it",
+            section.heading.as_deref().unwrap_or("(no heading)")
+        );
+        assert!(
+            (0.0..=1.0).contains(&judged.score),
+            "{} scored {}",
+            section.heading.as_deref().unwrap_or("(no heading)"),
+            judged.score
+        );
+    }
+}
+
+/// One section's score, found by heading.
+fn section(judgment: &FileJudgment, heading: &str) -> f64 {
+    judgment
+        .sections
+        .iter()
+        .find(|section| section.heading.as_deref() == Some(heading))
+        .unwrap_or_else(|| panic!("no section headed {heading}"))
+        .score
 }
 
 /// The hub page: it says nothing about releasing, and links to the page that
@@ -103,7 +136,10 @@ async fn a_hub_page_is_not_central_but_its_release_link_stands_out() {
         "the release page scored {release}, the unit tests page {unrelated}"
     );
 
-    assert_eq!(outcome.detail.questions, file.links.len() + 1);
+    assert_eq!(
+        outcome.detail.questions,
+        file.sections.len() + file.links.len() + 1
+    );
     assert!(outcome.detail.input_tokens > 0);
 }
 
@@ -128,6 +164,22 @@ async fn the_release_page_is_judged_useful_for_a_release_query() {
         "a page about releasing is at least supporting, got {}",
         outcome.judgment.relevance
     );
+
+    // #9 as a caller meets it: the page's own section is the range to read, and
+    // the "See also" list under it is navigation. The threshold the plan
+    // proposes (0.6) separates them, which is what lets a caller read the
+    // returned range and skip the rest of the page.
+    let body = section(&outcome.judgment, "Release");
+    let see_also = section(&outcome.judgment, "See also");
+    assert!(
+        body > 0.6,
+        "the page's own text is what to read, got {body}"
+    );
+    assert!(
+        see_also < body,
+        "the link list scored {see_also}, the page's own text {body}"
+    );
+    assert_eq!(outcome.detail.requests, 1, "a leaf page fits one request");
 }
 
 /// The plan scores with no links at all: every link in it is an external URL,
@@ -151,7 +203,76 @@ async fn a_file_with_only_external_links_is_still_judged() {
         "the plan is about the thing the query describes, got {}",
         outcome.judgment.relevance
     );
-    assert_eq!(outcome.detail.questions, 1, "the file question alone");
+    assert_eq!(
+        outcome.detail.questions,
+        file.sections.len() + 1,
+        "the file question and one per section: the plan has no local links"
+    );
+    assert!(
+        outcome
+            .judgment
+            .sections
+            .iter()
+            .all(|section| section.heading.is_some()),
+        "every section of the plan is headed: {:?}",
+        outcome.judgment.sections
+    );
+}
+
+/// The wall [#9] exists to stay under: a hub page whose links do not fit the
+/// API's 32k state budget in one request is split, and the API answers every
+/// post. Three posts of about a tenth of a million characters would be one
+/// request the API refuses, and the token count that comes back — the sum over
+/// the posts — is the evidence they were not one.
+///
+/// [#9]: https://github.com/mikekelly/s1m/issues/9
+#[tokio::test]
+async fn a_hub_page_too_big_for_one_request_is_split_and_answered() {
+    let root = repo().join("eval/wikis/llm-wiki-manager/wiki");
+    let Some(scorer) = live_scorer(&root) else {
+        return;
+    };
+
+    // 300 links with a preview each: the shape the spike's synthetic hub has,
+    // and well past the ~100 the notes say one request holds.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("big-hub");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("a hub directory");
+    let mut source = String::from("# Hub\n\nA hub with three hundred links.\n\n");
+    for index in 0..300 {
+        let page = format!("page-{index:03}.md");
+        fs::write(
+            dir.join(&page),
+            format!("# Page {index}\n\nPage {index} covers step {index} of the release runbook.\n"),
+        )
+        .expect("a page");
+        source.push_str(&format!(
+            "- [Page {index}]({page}) — step {index} of the release runbook.\n"
+        ));
+    }
+    fs::write(dir.join("hub.md"), &source).expect("the hub");
+
+    let file = page(&dir, "hub.md");
+    let outcome = scorer
+        .judge("how do I cut a release and publish the package", &file)
+        .await
+        .expect("the API answers every post");
+    assert_judged(&file, &outcome.judgment);
+
+    assert!(
+        outcome.detail.requests > 1,
+        "300 links with previews should not fit one request: {} questions in {} requests",
+        outcome.detail.questions,
+        outcome.detail.requests
+    );
+    assert_eq!(outcome.judgment.links.len(), 300);
+    assert!(
+        outcome.detail.input_tokens > 32_000,
+        "one request could not have carried these {} tokens",
+        outcome.detail.input_tokens
+    );
+
+    let _ = fs::remove_dir_all(&dir);
 }
 
 /// A directory for a live test to cache in: under the target directory, so a
