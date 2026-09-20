@@ -8,10 +8,12 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: scaffold.** This repository currently contains only the project skeleton from
-> [#3](https://github.com/mikekelly/s1m/issues/3). The CLI prints usage and nothing else;
-> linking, traversal and scoring are still to come. The design lives in
-> [docs/initial-plan.md](docs/initial-plan.md).
+> **Status: scaffold.** The CLI prints usage and nothing else; traversal, scoring and output
+> are still to come. What exists is the project skeleton from
+> [#3](https://github.com/mikekelly/s1m/issues/3) and the parser from
+> [#4](https://github.com/mikekelly/s1m/issues/4): `s1m::parse` turns one markdown file into
+> its title, frontmatter, heading sections with line ranges, and outgoing links. The design
+> lives in [docs/initial-plan.md](docs/initial-plan.md).
 
 ## Your content leaves the machine
 
@@ -48,11 +50,29 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md
 
 Exit codes: `0` reading list returned, `1` nothing cleared the threshold, `2` error.
 
+## Library
+
+The parser later stages build on lives in `src/parse.rs` and is reachable without the CLI, so
+it can be driven directly from tests:
+
+| Item | What it does |
+| --- | --- |
+| `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
+| `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
+
+`path` and `root` must be given against the same base: both relative to the working directory,
+or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
+followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wikilinks
+(`[[target]]`, `[[target|alias]]`) resolve by file name under `root`, preferring `.md`.
+
+`tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
+the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it.
+
 ## Development
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit and CLI tests |
+| `cargo test` | Unit, parser and CLI tests |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
