@@ -29,10 +29,10 @@ cargo run --release --bin eval -- \
   --wiki eval/wikis/llm-wiki-manager/wiki \
   --gold eval/gold/llm-wiki-manager.json \
   --cache eval/cache \
-  --out <path>
+  --out PATH
 ```
 
-This report goes to stdout without `--out`, and `--out <path>` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
+This report goes to stdout without `--out`, and `--out PATH` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
 
 ## The gold set
 

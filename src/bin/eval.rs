@@ -1330,12 +1330,12 @@ impl Findings {
         if let Some(flag) = &self.cache_flag {
             let _ = writeln!(out, "{flag}");
         }
-        let _ = writeln!(out, "  --out <path>");
+        let _ = writeln!(out, "  --out PATH");
         let _ = writeln!(out, "```");
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "This report goes to stdout without `--out`, and `--out <path>` writes it to a file \
+            "This report goes to stdout without `--out`, and `--out PATH` writes it to a file \
              instead. Every judgment is cached on the request that produced it, and the cache \
              stores the tokens each call spent beside its answer, so the cache committed under that \
              directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The \
