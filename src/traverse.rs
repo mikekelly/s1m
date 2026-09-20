@@ -52,8 +52,8 @@ use crate::scorer::{FileJudgment, Scorer, ScorerError};
 /// One traversal: the query, where to start, and the budgets that stop it.
 ///
 /// Nothing here has a default. The plan's defaults (`max_files` 25,
-/// `max_depth` 6, `threshold` 0.6, `fanout` 8) belong to the CLI flags that
-/// carry them.
+/// `max_depth` 6, `threshold` 0.6) belong to the CLI flags that carry them;
+/// `fanout` is the constant `main.rs` hands the walk.
 #[derive(Debug, Clone)]
 pub struct Config<'a> {
     /// The query, passed unchanged to every [`Scorer::score`] call.
