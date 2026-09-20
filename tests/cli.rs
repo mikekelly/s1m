@@ -482,6 +482,12 @@ fn stderr(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
 
+/// Everything the child wrote on stdout, as text: what the `md` and `tree`
+/// formats print, where `json` is read as a [`Value`].
+fn stdout(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 /// The result paths, in the order the reading list gives them.
 fn paths(list: &Value) -> Vec<&str> {
     list["results"]
@@ -881,4 +887,112 @@ fn seed_count_says_how_many_hits_are_used() {
         "the second hit is the orphan"
     );
     assert_eq!(result(&two, SEED_ORPHAN)["seeded"], json!(true));
+}
+
+// ------------------------------------------------------------- the formats
+
+/// `--format md` prints the same reading list as something to read: the files in
+/// order, each with the lines worth reading inside it. The numbers and the shape
+/// are the whole contract, so the test holds the run to every byte of it.
+#[test]
+fn md_prints_the_reading_list_as_markdown() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--format", "md"], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "\
+# Reading list: what is there to read
+
+Criterion: useful-for; 3 files visited, 3 calls
+
+## 1. `tests/fixtures/cli/deep.md`
+
+relevance 1.00; scent 0.90; via `tests/fixtures/cli/entry.md` -> `tests/fixtures/cli/next.md`
+
+- lines 1-3, score 0.70, Deep
+
+## 2. `tests/fixtures/cli/entry.md`
+
+relevance 1.00; entry file
+
+- lines 1-4, score 0.70, Entry
+
+## 3. `tests/fixtures/cli/next.md`
+
+relevance 1.00; scent 0.90; via `tests/fixtures/cli/entry.md`
+
+- lines 1-3, score 0.70, Next
+"
+    );
+}
+
+/// `--format tree` prints the walk: the entry file at the root — no link reached
+/// it — and under it each link it judged, at the scent the model gave it and
+/// marked with what the walk did about it. Every link here cleared the
+/// threshold, so every one of them was followed.
+#[test]
+fn tree_prints_the_walks_link_tree() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--format", "tree"], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        "\
+what is there to read (useful-for); 3 files visited, 3 calls
+
+tests/fixtures/cli/entry.md  entry file; relevance 1.00
+  tests/fixtures/cli/next.md  followed; scent 0.90; relevance 1.00
+    tests/fixtures/cli/deep.md  followed; scent 0.90; relevance 1.00
+"
+    );
+}
+
+/// A scent below the threshold queues nothing, and the tree says so on the link
+/// itself: `pruned`, with the scent that was not enough, beside the file the
+/// walk reached instead.
+#[test]
+fn tree_marks_a_link_below_the_threshold_pruned() {
+    let api = FakeApi::new(3.0, 0.1, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--format", "tree"], &api, &cache);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "nothing cleared the threshold: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        stdout(&output),
+        "\
+what is there to read (useful-for); 1 file visited, 1 call
+
+tests/fixtures/cli/entry.md  entry file; relevance 1.00
+  tests/fixtures/cli/next.md  pruned; scent 0.10
+"
+    );
+}
+
+/// A format that is not one of the three is the flag's vocabulary, not a run:
+/// clap names the value it did not recognise and exits 2, the way it does for a
+/// flag that does not exist.
+#[test]
+fn an_unknown_format_exits_2_naming_it() {
+    let output = run(&["--format", "yaml", QUERY, ENTRY]);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--format"), "{error}");
+    assert!(error.contains("yaml"), "{error}");
 }
