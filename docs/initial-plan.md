@@ -80,7 +80,9 @@ The query text goes in the state. The mode selects which instructions and criter
 | `useful-for` | The content would help someone doing what the query describes | Agents with a task |
 | `answers` | The content contains the answer to the query | Question lookup |
 
-Custom criteria can be supplied from a file for anything else.
+Custom criteria can be supplied from a file for anything else: the file's whole content is the
+criterion, and it replaces the mode's rather than adding to it. The file format is documented in
+the README's Custom criteria section.
 
 ### Scoring and pruning
 
@@ -105,7 +107,7 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--mode` | `useful-for` | Relevance criterion: `about`, `useful-for`, `answers` |
-| `--criteria` | none | Path to custom true/false criteria, overrides `--mode` |
+| `--criteria` | none | Path to a file whose whole content is the criterion, in place of `--mode`'s |
 | `--max-files` | 25 | Files visited before stopping |
 | `--max-depth` | 6 | Link hops from an entry file |
 | `--threshold` | 0.6 | Minimum link scent to queue a target |

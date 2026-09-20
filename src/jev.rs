@@ -80,8 +80,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// is in the request's bytes, which is what makes one criterion's stored answers
 /// unusable for another's.
 ///
-/// The wording is borrowed from static text for the built-in modes and owned for
-/// a criteria file, which is the only reason the fields are [`Cow`]s.
+/// Only the name and the two questions are [`Cow`]s, because a criteria file
+/// supplies those in the caller's own words: its path names the mode and its
+/// criterion goes into both questions. The ladder and the yes/no wording are this
+/// module's and are static, which is why the criteria file borrows them.
 #[derive(Debug, Clone)]
 pub struct Mode {
     /// The mode's name, as `--mode` spells it; a criteria file's path, as
@@ -92,14 +94,14 @@ pub struct Mode {
     /// The Score levels, least useful first. The order is load-bearing: a Score
     /// answer is the probability-weighted position over these levels, numbered
     /// from zero, so the last level is the top of the scale.
-    pub file_levels: Cow<'static, [&'static str]>,
+    pub file_levels: &'static [&'static str],
     /// The question about one link. `{index}` is replaced with that link's
     /// position in `state.links`, which is how the instructions point at it.
     pub link_question: Cow<'static, str>,
     /// What a yes means for that link.
-    pub link_true: Cow<'static, str>,
+    pub link_true: &'static str,
     /// What a no means for that link.
-    pub link_false: Cow<'static, str>,
+    pub link_false: &'static str,
 }
 
 impl Mode {
@@ -127,19 +129,19 @@ impl Mode {
     /// that holds nothing is the caller's mistake.
     pub fn custom(name: impl Into<Cow<'static, str>>, criterion: &str) -> Mode {
         let mut file_question =
-            String::from("How useful is `file` for `query`, judged by this criterion: ");
+            String::from("How relevant is `file` for `query`, judged by this criterion: ");
         file_question.push_str(criterion);
         let mut link_question = String::from(
-            "Is following `links[{index}]` likely to lead to content judged by this criterion: ",
+            "Is following `links[{index}]` likely to lead to content that meets this criterion: ",
         );
         link_question.push_str(criterion);
         Mode {
             name: name.into(),
             file_question: Cow::Owned(file_question),
-            file_levels: Cow::Borrowed(CRITERION_LEVELS),
+            file_levels: CRITERION_LEVELS,
             link_question: Cow::Owned(link_question),
-            link_true: Cow::Borrowed(CRITERION_LINK_TRUE),
-            link_false: Cow::Borrowed(CRITERION_LINK_FALSE),
+            link_true: CRITERION_LINK_TRUE,
+            link_false: CRITERION_LINK_FALSE,
         }
     }
 }
@@ -150,21 +152,17 @@ impl Mode {
 pub const ABOUT: Mode = Mode {
     name: Cow::Borrowed("about"),
     file_question: Cow::Borrowed("How much of `file` is on the subject of `query`?"),
-    file_levels: Cow::Borrowed(&[
+    file_levels: &[
         "unrelated — `file` has nothing to do with `query`.",
         "mention — `file` mentions the subject of `query` in passing, without covering it.",
         "related — `file` is on a subject next to `query`, and covers part of it.",
         "on the subject — `file` is about the subject of `query`: the page to collect.",
-    ]),
+    ],
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content on the subject of `query`?",
     ),
-    link_true: Cow::Borrowed(
-        "The target is about the subject, or is a page of links that lead to pages about it.",
-    ),
-    link_false: Cow::Borrowed(
-        "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
-    ),
+    link_true: "The target is about the subject, or is a page of links that lead to pages about it.",
+    link_false: OFF_SUBJECT,
 };
 
 /// The default, and the criterion the spike measured: would this help someone
@@ -172,21 +170,17 @@ pub const ABOUT: Mode = Mode {
 pub const USEFUL_FOR: Mode = Mode {
     name: Cow::Borrowed("useful-for"),
     file_question: Cow::Borrowed("How useful is `file` for someone doing what `query` describes?"),
-    file_levels: Cow::Borrowed(&[
+    file_levels: &[
         "unrelated — nothing in `file` bears on `query`.",
         "tangential — `file` is on a nearby subject, but someone doing what `query` describes would not read it.",
         "supporting — `file` holds context or part of what `query` needs, but is not where that person should start.",
         "central — `file` is about what `query` describes, or is the page to start from.",
-    ]),
+    ],
     link_question: Cow::Borrowed(
         "Is following `links[{index}]` likely to lead to content useful for someone doing what `query` describes?",
     ),
-    link_true: Cow::Borrowed(
-        "The target is on the subject, or is a page of links that lead to it, so following this link is worth a reader's next step.",
-    ),
-    link_false: Cow::Borrowed(
-        "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
-    ),
+    link_true: "The target is on the subject, or is a page of links that lead to it, so following this link is worth a reader's next step.",
+    link_false: OFF_SUBJECT,
 };
 
 /// Question lookup: the page that answers the query, and the pages on the way
@@ -195,22 +189,23 @@ pub const USEFUL_FOR: Mode = Mode {
 pub const ANSWERS: Mode = Mode {
     name: Cow::Borrowed("answers"),
     file_question: Cow::Borrowed("Does `file` contain the answer to `query`?"),
-    file_levels: Cow::Borrowed(&[
+    file_levels: &[
         "no answer — `file` does not bear on `query`.",
         "background — `file` is context for `query`, but does not answer any part of it.",
         "part of the answer — `file` answers part of `query`, or names where the answer is.",
         "the answer — `file` contains the answer to `query`.",
-    ]),
+    ],
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content containing the answer to `query`?",
     ),
-    link_true: Cow::Borrowed(
-        "The target contains the answer or part of it, or is a page of links that lead to content that does.",
-    ),
-    link_false: Cow::Borrowed(
-        "The target does not answer `query`, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
-    ),
+    link_true: "The target contains the answer or part of it, or is a page of links that lead to content that does.",
+    link_false: "The target does not answer `query`, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
 };
+
+/// What a link's no is when the target is not about the subject: `about` and
+/// `useful-for` ask the same thing of a link here, so they say the same thing
+/// about one that leads nowhere.
+const OFF_SUBJECT: &str = "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
 
 /// The ladder a criterion of the caller's own is scored on: the same four
 /// degrees for every criterion, because the criterion itself is in the
@@ -290,16 +285,16 @@ enum Question {
     },
     Score {
         instructions: String,
-        criteria: Cow<'static, [&'static str]>,
+        criteria: &'static [&'static str],
     },
 }
 
 #[derive(Debug, Serialize)]
 struct NoulCriteria {
     #[serde(rename = "true")]
-    yes: Cow<'static, str>,
+    yes: &'static str,
     #[serde(rename = "false")]
-    no: Cow<'static, str>,
+    no: &'static str,
 }
 
 /// The answer to link `index` comes back under this id, and the question asks
@@ -518,7 +513,7 @@ impl JevScorer {
             FILE_QUESTION.to_string(),
             Question::Score {
                 instructions: self.mode.file_question.to_string(),
-                criteria: self.mode.file_levels.clone(),
+                criteria: self.mode.file_levels,
             },
         );
         for index in 0..file.links.len() {
@@ -530,8 +525,8 @@ impl JevScorer {
                         .link_question
                         .replace("{index}", &index.to_string()),
                     criteria: NoulCriteria {
-                        yes: self.mode.link_true.clone(),
-                        no: self.mode.link_false.clone(),
+                        yes: self.mode.link_true,
+                        no: self.mode.link_false,
                     },
                 },
             );
@@ -984,9 +979,19 @@ mod tests {
                     "link {index} under {}",
                     mode.name
                 );
-                assert_eq!(link["criteria"]["true"], mode.link_true.as_ref());
-                assert_eq!(link["criteria"]["false"], mode.link_false.as_ref());
+                assert_eq!(link["criteria"]["true"], mode.link_true);
+                assert_eq!(link["criteria"]["false"], mode.link_false);
             }
+        }
+
+        // A mode is a criterion, not a different query: the query, the file and
+        // its links go in exactly as they are whatever mode asks about them.
+        for (mode, request) in &sent {
+            assert_eq!(
+                request["state"], sent[0].1["state"],
+                "{} changed the state, not just the questions",
+                mode.name
+            );
         }
 
         for (index, (mode, request)) in sent.iter().enumerate() {
@@ -1172,11 +1177,8 @@ mod tests {
                     .contains(&format!("`links[{index}]`")),
                 "link {index} is named in its own question"
             );
-            assert_eq!(question["criteria"]["true"], USEFUL_FOR.link_true.as_ref());
-            assert_eq!(
-                question["criteria"]["false"],
-                USEFUL_FOR.link_false.as_ref()
-            );
+            assert_eq!(question["criteria"]["true"], USEFUL_FOR.link_true);
+            assert_eq!(question["criteria"]["false"], USEFUL_FOR.link_false);
         }
         assert!(questions.get("link_8").is_none());
     }
