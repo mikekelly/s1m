@@ -688,8 +688,11 @@ fn a_round_scores_at_most_fanout_files_at_once() {
     );
 }
 
-/// A graph with multi-file rounds, two paths to one file, a broken link and a
-/// link out of the root: everything a round's answer order could disturb.
+/// A graph with multi-file rounds, two equal-score paths to one file, a broken
+/// link and a link out of the root: everything a round's answer order could
+/// disturb. The index and the README both reach settlement at scent 0.85 in the
+/// same round, so which of them the record names as the way in is decided by
+/// the order the round was recorded in, not by who answered first.
 fn mixed_graph() -> Fake {
     Fake::new(&[
         (
@@ -700,6 +703,7 @@ fn mixed_graph() -> Fake {
                     ("payments/README.md", 0.9),
                     ("payments/cutoffs.md", 0.6),
                     ("notes/ledger.md", 0.8),
+                    ("payments/settlement.md", 0.85),
                     ("payments/missing.md", 0.7),
                     ("../outside.md", 0.99),
                 ],
@@ -709,21 +713,23 @@ fn mixed_graph() -> Fake {
             "payments/README.md",
             Entry::new(
                 0.6,
-                &[("notes/ledger.md", 0.85), ("payments/settlement.md", 0.9)],
+                &[
+                    ("payments/settlement.md", 0.85),
+                    ("notes/ledger.md", 0.85),
+                    ("payments/cutoffs.md", 0.9),
+                ],
             ),
         ),
         (
-            "payments/cutoffs.md",
-            Entry::new(0.7, &[("payments/settlement.md", 0.9)]),
+            "notes/scratch.md",
+            Entry::new(0.7, &[("notes/ledger.md", 0.8)]),
         ),
         (
             "payments/settlement.md",
             Entry::new(0.8, &[("payments/cutoffs.md", 0.9)]),
         ),
-        (
-            "notes/ledger.md",
-            Entry::new(0.5, &[("payments/settlement.md", 0.9)]),
-        ),
+        ("notes/ledger.md", Entry::new(0.5, &[])),
+        ("payments/cutoffs.md", Entry::new(0.7, &[])),
         ("../outside.md", Entry::new(1.0, &[])),
     ])
 }
@@ -749,10 +755,41 @@ fn run(settings: &Settings, scorer: Fake) -> Run {
 
 #[test]
 fn the_same_input_gives_the_same_output_with_random_latency() {
-    let settings = Settings::new(&["index.md", "payments/cutoffs.md"]).fanout(3);
+    let settings = Settings::new(&["index.md", "payments/README.md", "notes/scratch.md"]).fanout(3);
     let first = run(&settings, mixed_graph());
     assert!(first.results.len() >= 4, "the graph should span rounds");
     assert_eq!(first.failed.len(), 1, "one link of the graph is broken");
+    assert_eq!(first.calls, 6);
+    assert_eq!(
+        first.called,
+        [
+            "index.md",
+            "notes/ledger.md",
+            "notes/scratch.md",
+            "payments/README.md",
+            "payments/cutoffs.md",
+            "payments/settlement.md"
+        ],
+        "one call per file visited, none for the out-of-root link"
+    );
+    // Two entries reach it at path score 0.85 in the same round, so the round's
+    // order — not the answers' order — decided the way in.
+    let settlement = first
+        .results
+        .iter()
+        .find(|file| file.path == Path::new("payments/settlement.md"))
+        .expect("settlement should be visited");
+    assert_eq!(settlement.path_score, 0.85);
+    assert_eq!(settlement.via, [PathBuf::from("index.md")]);
+    // Queued at 0.6 from the index, then reached again at 0.9 from the README:
+    // the better path is the one kept.
+    let cutoffs = first
+        .results
+        .iter()
+        .find(|file| file.path == Path::new("payments/cutoffs.md"))
+        .expect("cutoffs should be visited");
+    assert_eq!(cutoffs.path_score, 0.9);
+    assert_eq!(cutoffs.via, [PathBuf::from("payments/README.md")]);
 
     for attempt in 1..=10 {
         assert_eq!(
