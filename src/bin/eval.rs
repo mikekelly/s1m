@@ -1205,7 +1205,8 @@ impl Findings {
             sum(s1m, |run| run.score.returned),
             sum(s1m, |run| run.score.returned) as f64 / s1m.len() as f64,
             match tight == wide {
-                true => "One budget was measured, so nothing here says whether a different one                          would return more."
+                true => "One budget was measured, so nothing here says whether a wider one would \
+                         return more."
                     .to_string(),
                 false => format!(
                     "The budget is not what binds: the walk runs out of links above `--threshold` \
@@ -1329,12 +1330,12 @@ impl Findings {
         if let Some(flag) = &self.cache_flag {
             let _ = writeln!(out, "{flag}");
         }
-        let _ = writeln!(out, "  --out REPORT.md");
+        let _ = writeln!(out, "  --out PATH");
         let _ = writeln!(out, "```");
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "This report goes to stdout without `--out`, and `--out <path>` writes it to a file \
+            "This report goes to stdout without `--out`, and `--out PATH` writes it to a file \
              instead. Every judgment is cached on the request that produced it, and the cache \
              stores the tokens each call spent beside its answer, so the cache committed under that \
              directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The \
@@ -1927,6 +1928,12 @@ impl Findings {
             row(out, &cells);
         }
         let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "Judging that one page under each policy is the only measurement here that is not a \
+             walk, so it has no row in the tables above; it is in the run's total, three answers."
+        );
+        let _ = writeln!(out);
 
         // What the knobs do to the decision rather than to the number: a
         // ranking that moves inside a bin the threshold keeps does not change
@@ -2410,29 +2417,37 @@ mod tests {
             1
         );
 
-        for (label, body) in [
+        // The second element is the part of the message that names what is
+        // wrong: a guess at `contains('q')` would be satisfied by the word
+        // "queries" in any of them.
+        for (label, names, body) in [
             (
                 "an entry the wiki does not hold",
+                "q: entry gone.md is not a page under wiki",
                 r#"{"queries":[{"id":"q","query":"a","mode":"answers",
                     "entry":"gone.md","expected":["page.md"]}]}"#,
             ),
             (
                 "a page the wiki does not hold",
+                "q: expected page gone.md is not under wiki",
                 r#"{"queries":[{"id":"q","query":"a","mode":"answers",
                     "entry":"index.md","expected":["gone.md"]}]}"#,
             ),
             (
                 "a mode no one implements",
+                r#"q: no mode named "vibes""#,
                 r#"{"queries":[{"id":"q","query":"a","mode":"vibes",
                     "entry":"index.md","expected":["page.md"]}]}"#,
             ),
             (
                 "no expected pages",
+                "q: no expected pages",
                 r#"{"queries":[{"id":"q","query":"a","mode":"answers",
                     "entry":"index.md","expected":[]}]}"#,
             ),
             (
                 "two queries under one id",
+                "q: two queries share this id",
                 r#"{"queries":[
                     {"id":"q","query":"a","mode":"answers","entry":"index.md","expected":["page.md"]},
                     {"id":"q","query":"b","mode":"answers","entry":"index.md","expected":["page.md"]}]}"#,
@@ -2441,7 +2456,7 @@ mod tests {
             let file = dir.join("bad.json");
             fs::write(&file, body).expect("a gold set");
             let error = Gold::load(&file, &corpus).expect_err(label);
-            assert!(error.contains('q'), "{label}: {error}");
+            assert!(error.contains(names), "{label}: {error}");
         }
         let _ = fs::remove_dir_all(&dir);
     }

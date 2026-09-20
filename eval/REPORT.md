@@ -29,10 +29,10 @@ cargo run --release --bin eval -- \
   --wiki eval/wikis/llm-wiki-manager/wiki \
   --gold eval/gold/llm-wiki-manager.json \
   --cache eval/cache \
-  --out REPORT.md
+  --out PATH
 ```
 
-This report goes to stdout without `--out`, and `--out <path>` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
+This report goes to stdout without `--out`, and `--out PATH` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
 
 ## The gold set
 
@@ -234,6 +234,8 @@ At the scale of one page: `index.md` — the entry file of query `release-and-pu
 | `concepts/template-system.md` | 0.25 | 0.16 | 0.11 |
 | `concepts/unit-tests.md` | 0.22 | 0.17 | 0.12 |
 | `concepts/wiki-scripts.md` | 0.26 | 0.14 | 0.13 |
+
+Judging that one page under each policy is the only measurement here that is not a walk, so it has no row in the tables above; it is in the run's total, three answers.
 
 `previews, no frontmatter` against the default, on this page: 4 of 14 links change whether the walk would follow them, and the mean scent moves by 0.21.
 `previews off` against the default, on this page: 3 of 14 links change whether the walk would follow them, and the mean scent moves by 0.21.
