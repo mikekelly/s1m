@@ -48,6 +48,30 @@ const SEED_ORPHAN: &str = "tests/fixtures/seed/orphan.md";
 /// links to are the ones it meets the terms on least.
 const SEED_QUERY: &str = "release checklist";
 
+/// The `.s1mignore` fixture: an entry page, a page it links to, and two pages
+/// the root's `.s1mignore` covers — one behind a matched directory, which the
+/// entry links to, and one matched by name, which is a keyword hit and nothing
+/// else.
+const IGNORE_ROOT: &str = "tests/fixtures/ignore";
+const IGNORE_ENTRY: &str = "tests/fixtures/ignore/entry.md";
+const IGNORE_PUBLIC: &str = "tests/fixtures/ignore/public.md";
+const IGNORE_VAULT: &str = "tests/fixtures/ignore/private/vault.md";
+const IGNORE_DRAFTS: &str = "tests/fixtures/ignore/drafts.md";
+
+/// The query the ignore fixture's entry page and its links are written for.
+const IGNORE_QUERY: &str = "settlement timing for instant payouts";
+
+/// A query the matched draft page is the only page in the fixture to answer:
+/// `--seed-grep` would put it on the frontier, if it were not ignored.
+const IGNORE_SEED_QUERY: &str = "unfinished drafts";
+
+/// A line from the matched page that must never leave the machine, so a test
+/// can look for it in every request the binary sent.
+const IGNORE_SECRET: &str = "Combination 4471 opens the safe";
+
+/// A root whose `.s1mignore` does not parse, and the page beside it.
+const BROKEN_ENTRY: &str = "tests/fixtures/ignore-broken/entry.md";
+
 /// The id the scorer asks the file's own question under; every other question
 /// in a request is a link, `link_0`, `link_1`, and so on.
 const FILE_QUESTION: &str = "file_relevance";
@@ -75,6 +99,31 @@ fn help_prints_usage() {
     assert_eq!(output.status.code(), Some(0));
     assert!(output.stderr.is_empty());
     assert!(String::from_utf8_lossy(&output.stdout).contains("Usage:"));
+}
+
+/// The name reads as "sim", and the first guess it invites is a simulator. The
+/// help text is where that is answered: both the one-line description and the
+/// paragraph `--help` opens with lead with what s1m reads and ranks, and say
+/// what it is not, before a flag is explained.
+#[test]
+fn help_leads_with_what_s1m_reads_and_says_what_it_is_not() {
+    let described = "reads local markdown files and ranks them for a query";
+
+    let long = run(&["--help"]);
+    let long = stdout(&long);
+    assert!(long.contains(described), "{long}");
+    assert!(long.contains("not a simulator"), "{long}");
+    assert!(long.contains(".s1mignore"), "{long}");
+    assert!(
+        long.find(described).expect("the phrase") < long.find("Options:").expect("the flags"),
+        "what s1m is comes before its flags: {long}"
+    );
+
+    let short = stdout(&run(&["-h"]));
+    assert!(
+        short.contains("Reads local markdown files and ranks them for a query"),
+        "{short}"
+    );
 }
 
 #[test]
@@ -887,6 +936,260 @@ fn seed_count_says_how_many_hits_are_used() {
         "the second hit is the orphan"
     );
     assert_eq!(result(&two, SEED_ORPHAN)["seeded"], json!(true));
+}
+
+// ----------------------------------------------------------- the .s1mignore
+
+/// The whole guarantee, seen from the other end of the wire: a page the root's
+/// `.s1mignore` covers is not merely absent from the reading list, it is absent
+/// from every request the run sent — its path, its text and its link are not in
+/// the state the model was asked about, and so not in the reading list either.
+#[test]
+fn an_ignored_page_is_not_in_a_request_or_in_the_reading_list() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[IGNORE_QUERY, IGNORE_ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let list = json(&output);
+    assert_eq!(
+        paths(&list),
+        [IGNORE_ENTRY, IGNORE_PUBLIC],
+        "the matched page is not visited, and the page beside it is"
+    );
+    assert_eq!(list["calls"], 2, "nothing was bought for the matched page");
+    assert_eq!(api.answered(), 2);
+
+    for request in api.requests() {
+        let links = request["state"]["links"]
+            .as_array()
+            .expect("a request carries the links it judges");
+        assert!(
+            links
+                .iter()
+                .all(|link| link["target"] != json!("private/vault.md")),
+            "no question is asked about the matched page: {request}"
+        );
+        assert!(
+            !request.to_string().contains(IGNORE_SECRET),
+            "not a byte of the matched page's text is sent: {request}"
+        );
+    }
+
+    let entry = result(&list, IGNORE_ENTRY);
+    assert_eq!(
+        entry["links"].as_array().map(Vec::len),
+        Some(1),
+        "the link to the matched page is not reported at all: {}",
+        entry["links"]
+    );
+    assert_eq!(entry["links"][0]["target"], json!(IGNORE_PUBLIC));
+
+    // The tree prints every link the walk judged, so a link that was never sent
+    // is a link that is not here either.
+    let tree = run_with(
+        &[IGNORE_QUERY, IGNORE_ENTRY, "--format", "tree"],
+        &api,
+        &cache,
+    );
+    let tree = stdout(&tree);
+    assert!(tree.contains(IGNORE_PUBLIC), "{tree}");
+    assert!(!tree.contains("vault"), "{tree}");
+}
+
+/// `--seed-grep` reads the pages under the root to find its hits, so the ignore
+/// applies before it does: a matched page is not a candidate, and the run that
+/// seeds is the run without seeding — same list, same `seeded` flags, and a
+/// request that never named the page the query was written for.
+#[test]
+fn an_ignored_page_is_not_seeded() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let plain = Cache::new();
+    let seeded = Cache::new();
+
+    let without = run_with(&[IGNORE_SEED_QUERY, IGNORE_ENTRY], &api, &plain);
+    assert_eq!(without.status.code(), Some(0), "{}", stderr(&without));
+
+    let output = run_with(
+        &[IGNORE_SEED_QUERY, IGNORE_ENTRY, "--seed-grep"],
+        &api,
+        &seeded,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let list = json(&output);
+    assert_eq!(
+        paths(&list),
+        paths(&json(&without)),
+        "the only page the query is written for is ignored, so there is nothing to seed"
+    );
+    assert!(!paths(&list).contains(&IGNORE_DRAFTS));
+    assert!(
+        list["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .all(|file| file["seeded"] == json!(false)),
+        "{list}"
+    );
+
+    for request in api.requests() {
+        let links = request["state"]["links"]
+            .as_array()
+            .expect("a request carries the links it judges");
+        assert!(
+            links
+                .iter()
+                .all(|link| link["target"] != json!("drafts.md")),
+            "the matched page is not judged: {request}"
+        );
+        assert!(
+            !request.to_string().contains("not for sharing"),
+            "not a byte of the matched page's text is sent: {request}"
+        );
+    }
+}
+
+/// An entry file the caller named is the one case where a matched path is not
+/// quietly dropped: the names on the command line are what the caller asked
+/// for, so s1m says which rule covers it and exits 2 without reading a byte of
+/// it or buying a call — for a page behind a matched directory and for a page
+/// matched by its own name.
+#[test]
+fn an_ignored_entry_file_exits_2_rather_than_reading_it() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    for entry in [IGNORE_VAULT, IGNORE_DRAFTS] {
+        let output = run_with(&[IGNORE_QUERY, entry, "--root", IGNORE_ROOT], &api, &cache);
+
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+        assert!(output.stdout.is_empty());
+        let error = stderr(&output);
+        assert!(error.contains(entry), "{error}");
+        assert!(error.contains(".s1mignore"), "{error}");
+        assert!(error.contains("never reads an ignored file"), "{error}");
+        assert_eq!(error.lines().count(), 1, "{error}");
+    }
+    assert_eq!(api.answered(), 0);
+}
+
+/// A `.s1mignore` s1m cannot use is exit 2 naming the line, before the entry
+/// file is read: dropping the rule quietly would send the paths the rule was
+/// written for, which is the one failure the file exists to prevent.
+#[test]
+fn a_s1mignore_that_does_not_parse_exits_2_naming_its_line() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[IGNORE_QUERY, BROKEN_ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains(".s1mignore"), "{error}");
+    assert!(error.contains("line 2"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(api.answered(), 0);
+}
+
+/// The hidden debug view runs under the same rules as a query: one file the
+/// root's `.s1mignore` matches is exit 2 naming it, and the API is not asked —
+/// the view reads the file and previews its links, and a matched path is not
+/// read. A *link* to a matched page is the other half of that: it is out of the
+/// file before the request is built, so the view is asked about the page the
+/// file does link to and never about the one it does not.
+#[test]
+fn score_file_will_not_read_an_ignored_file() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(
+        &[
+            "score-file",
+            IGNORE_QUERY,
+            IGNORE_VAULT,
+            "--root",
+            IGNORE_ROOT,
+        ],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains(IGNORE_VAULT), "{error}");
+    assert!(error.contains(".s1mignore"), "{error}");
+    assert_eq!(api.answered(), 0);
+
+    let output = run_with(
+        &[
+            "score-file",
+            IGNORE_QUERY,
+            IGNORE_ENTRY,
+            "--root",
+            IGNORE_ROOT,
+        ],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let report = stdout(&output);
+    assert!(
+        report.contains("public.md"),
+        "the link the file does link to is judged: {report}"
+    );
+    assert!(!report.contains("vault"), "{report}");
+    for request in api.requests() {
+        let links = request["state"]["links"]
+            .as_array()
+            .expect("a request carries the links it judges");
+        assert!(
+            links
+                .iter()
+                .all(|link| link["target"] != json!("private/vault.md")),
+            "the matched target is not judged: {request}"
+        );
+        assert!(
+            !request.to_string().contains(IGNORE_SECRET),
+            "not a byte of the matched page's text is sent: {request}"
+        );
+    }
+}
+
+/// An entry file and a root spelled against different bases are the caller's
+/// mistake, and the run says so in one line: the ignore check reads the path
+/// before `parse` rejects the pair, so it has to answer for the pair rather than
+/// bring the process down.
+#[test]
+fn an_entry_file_on_another_base_than_the_root_exits_2() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let absolute = PathBuf::from(MANIFEST_DIR).join(IGNORE_ENTRY);
+
+    let output = run_with(
+        &[
+            IGNORE_QUERY,
+            &absolute.display().to_string(),
+            "--root",
+            IGNORE_ROOT,
+        ],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains("must both be relative or both absolute"),
+        "{error}"
+    );
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(api.answered(), 0);
 }
 
 // ------------------------------------------------------------- the formats

@@ -53,6 +53,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use s1m::cache::{CachedScorer, Scored};
+use s1m::ignore::Ignore;
 use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, Scorer, ScorerError};
@@ -675,6 +676,11 @@ struct Env<'a> {
     /// Read once: a keyless run that misses the cache fails on the call, and
     /// the report says so before the first walk.
     key: String,
+    /// The wiki's `.s1mignore` ([`s1m::ignore`]), read once: the harness walks a
+    /// private wiki as often as the vendored one, and a path the wiki excludes
+    /// is not part of what s1m would read. The keyword ranker obeys it too, so
+    /// the comparison stays between two runs over the same pages.
+    ignore: Ignore,
 }
 
 impl Env<'_> {
@@ -696,7 +702,7 @@ impl Env<'_> {
         let entries = [self.root.join(query.entry())];
         let seeds = match seed_count {
             0 => Vec::new(),
-            count => seed::seed(self.root, &query.query, count, &entries),
+            count => seed::seed(self.root, &query.query, count, &entries, &self.ignore),
         };
         let config = Config {
             query: &query.query,
@@ -707,6 +713,7 @@ impl Env<'_> {
             max_depth: MAX_DEPTH,
             fanout: FANOUT,
             threshold,
+            ignore: &self.ignore,
         };
         let traversal = traverse(&config, &meter)
             .await
@@ -805,7 +812,7 @@ impl Env<'_> {
     ///
     /// No model, so nothing spent — the control the plan asks the model to beat.
     fn grep(&self, query: &Query, budget: usize) -> Run {
-        let hits: Vec<PathBuf> = seed::seed(self.root, &query.query, budget, &[])
+        let hits: Vec<PathBuf> = seed::seed(self.root, &query.query, budget, &[], &self.ignore)
             .iter()
             .map(|hit| parse::relative_to_root(self.root, hit))
             .collect();
@@ -926,11 +933,13 @@ async fn evaluate(args: &Args) -> Result<String, String> {
             cache.label()
         );
     }
+    let ignore = Ignore::at(&args.wiki).map_err(|error| error.to_string())?;
     let env = Env {
         root: &args.wiki,
         corpus: &corpus,
         cache: &cache,
         key,
+        ignore,
     };
 
     let mut budgets = args.budgets.clone();
@@ -2367,6 +2376,7 @@ mod tests {
             corpus: &corpus,
             cache: &Cache::Off,
             key: String::new(),
+            ignore: Ignore::none(),
         };
         let query = query("q", &["wanted.md", "also.md"]);
         let visits = [visit("wanted.md", &[[1, 2]]), visit("noise.md", &[[1, 1]])];

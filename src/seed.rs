@@ -22,13 +22,16 @@
 //!
 //! The candidates are [`crate::parse::pages`], the same `.md`/`.txt` listing
 //! the parser resolves wikilinks against: hidden directories are not descended,
-//! and unreadable directories and files that are not UTF-8 text are skipped. It
-//! is in-process string work — no ripgrep, no dependency, no index.
+//! unreadable directories and files that are not UTF-8 text are skipped, and so
+//! is anything the root's `.s1mignore` matches ([`crate::ignore`]) — a seed is a
+//! read, and a matched page is not read. It is in-process string work — no
+//! ripgrep, no dependency, no index.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::ignore::Ignore;
 use crate::parse::{from_root, pages, relative_to_root};
 
 /// Shortest query word that counts as a keyword.
@@ -43,10 +46,20 @@ const MIN_TERM_LEN: usize = 3;
 /// files are already on the frontier, and a hit on one of them would spend a
 /// place on a file the walk already had.
 ///
+/// `ignore` is the root's `.s1mignore` ([`crate::ignore`]): a page it matches is
+/// not a candidate, and is not opened — seeding is a read, and a matched page is
+/// not read.
+///
 /// Only pages with a hit come back, so fewer than `count` is normal. There is no
 /// failure to report: a root that cannot be read has no hits, the way
 /// [`crate::parse::pages`] treats a directory it cannot open.
-pub fn seed(root: &Path, query: &str, count: usize, skip: &[PathBuf]) -> Vec<PathBuf> {
+pub fn seed(
+    root: &Path,
+    query: &str,
+    count: usize,
+    skip: &[PathBuf],
+    ignore: &Ignore,
+) -> Vec<PathBuf> {
     let terms = terms(query);
     if count == 0 || terms.is_empty() {
         return Vec::new();
@@ -58,7 +71,7 @@ pub fn seed(root: &Path, query: &str, count: usize, skip: &[PathBuf]) -> Vec<Pat
 
     let mut hits: Vec<Hit> = Vec::new();
     for page in pages(root) {
-        if skipped.contains(&page) {
+        if skipped.contains(&page) || ignore.matched(&page) {
             continue;
         }
         let Ok(bytes) = fs::read(root.join(&page)) else {
@@ -147,7 +160,7 @@ mod tests {
 
     /// The hits for a query, as the paths a caller would get back.
     fn hits(query: &str) -> Vec<String> {
-        seed(&root(), query, 5, &[])
+        seed(&root(), query, 5, &[], &Ignore::none())
             .iter()
             .map(|path| path.display().to_string())
             .collect()
@@ -189,19 +202,47 @@ mod tests {
     /// is not one of them: it is on the frontier already.
     #[test]
     fn the_count_limits_the_hits_and_entries_are_left_out() {
-        let all = seed(&root(), "release checklist", 5, &[]);
+        let ignore = Ignore::none();
+        let all = seed(&root(), "release checklist", 5, &[], &ignore);
         assert_eq!(all.len(), 3);
 
-        let top = seed(&root(), "release checklist", 1, &[]);
+        let top = seed(&root(), "release checklist", 1, &[], &ignore);
         assert_eq!(top, all[..1].to_vec());
 
         let entries = [root().join("index.md")];
         assert_eq!(
-            seed(&root(), "release checklist", 5, &entries),
+            seed(&root(), "release checklist", 5, &entries, &ignore),
             all[1..].to_vec()
         );
 
-        assert!(seed(&root(), "release checklist", 0, &[]).is_empty());
+        assert!(seed(&root(), "release checklist", 0, &[], &ignore).is_empty());
+    }
+
+    /// The root's `.s1mignore` is read before the pages are: a matched page is
+    /// not a candidate, so the walk never opens it to count a keyword in it.
+    #[test]
+    fn a_matched_page_is_not_a_candidate() {
+        let dir = crate::testkit::TempDir::new("seed-ignore");
+        std::fs::write(
+            dir.path().join("public.md"),
+            "Release checklist for the public page.",
+        )
+        .expect("a writable fixture");
+        std::fs::write(
+            dir.path().join("private.md"),
+            "Release checklist for the private page.",
+        )
+        .expect("a writable fixture");
+        std::fs::write(dir.path().join(crate::ignore::FILE), "private.md\n")
+            .expect("a writable fixture");
+
+        let ignore = Ignore::at(dir.path()).expect("the fixture should parse");
+        let hits: Vec<String> = seed(dir.path(), "release checklist", 5, &[], &ignore)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+
+        assert_eq!(hits, [dir.path().join("public.md").display().to_string()]);
     }
 
     /// A query is words, not letters: terms shorter than three characters are

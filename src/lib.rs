@@ -7,6 +7,7 @@
 pub mod cache;
 pub mod cli;
 pub mod format;
+pub mod ignore;
 pub mod jev;
 pub mod parse;
 pub mod scorer;

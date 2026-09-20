@@ -1,0 +1,2 @@
+# The line below does not parse: an alternate group is never closed.
+private/{vault

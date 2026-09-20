@@ -36,6 +36,10 @@
 //! Every path in the result — `path`, `via`, link targets — is spelled the way
 //! [`parse`] spells link targets: normalised and relative to the root, so
 //! `config.root.join(path)` is the file to read.
+//!
+//! Nothing the root's `.s1mignore` matches is read: an entry file or seed
+//! drops out of the frontier, and a link whose target matches is out of the
+//! file before the scorer sees it ([`Config::ignore`], [`crate::ignore`]).
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -44,6 +48,7 @@ use std::path::{Path, PathBuf};
 use futures_util::future::join_all;
 use serde::Serialize;
 
+use crate::ignore::Ignore;
 use crate::parse::{ParseError, ParsedFile, parse, relative_to_root};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
 
@@ -78,6 +83,16 @@ pub struct Config<'a> {
     /// Least link scent that queues a target. A Noul near 0.5 means uncertain,
     /// so this is meant to sit above it.
     pub threshold: f64,
+    /// The root's `.s1mignore` patterns ([`crate::ignore`]), applied to every
+    /// path the walk could read.
+    ///
+    /// An entry file or seed that matches is dropped before it is parsed, and a
+    /// link whose target matches is taken out of the file before it is scored —
+    /// so a matched target is never read, never previewed, and never in a
+    /// request. The CLI turns the entry-file case into an error rather than a
+    /// silent drop ([`crate::cli::Error::Ignored`]); the drop is here so that no
+    /// caller of the walk can read a matched path by passing one.
+    pub ignore: &'a Ignore,
 }
 
 /// What one traversal found.
@@ -295,6 +310,9 @@ impl<'a> Search<'a> {
     /// Puts the entry files on the frontier at path score 1: the ones the
     /// caller named first, then the seeds, so a file that is both is the entry
     /// file it was named as.
+    ///
+    /// An entry file or seed the root's `.s1mignore` matches never reaches the
+    /// frontier, so nothing reads it.
     fn seed(&mut self) -> Result<(), TraverseError> {
         for (seeded, paths) in [(false, self.config.entries), (true, self.config.seeds)] {
             for path in paths {
@@ -304,8 +322,12 @@ impl<'a> Search<'a> {
                         root: self.config.root.to_path_buf(),
                     });
                 }
+                let path = relative_to_root(self.config.root, path);
+                if self.config.ignore.matched(&path) {
+                    continue;
+                }
                 self.enqueue(Frontier {
-                    path: relative_to_root(self.config.root, path),
+                    path,
                     score: 1.0,
                     depth: 0,
                     scent: None,
@@ -349,12 +371,20 @@ impl<'a> Search<'a> {
     /// Scores one round: one future per file, polled together, so a round costs
     /// one round trip rather than one per file. Answers come back in the order
     /// the batch was popped, whatever order they are ready in.
+    ///
+    /// A link whose target the root's `.s1mignore` matches is taken out of the
+    /// file here, before the scorer sees it: the target is not read for a
+    /// preview, its path is not in the request, and the judgment has no question
+    /// to answer about it. What comes back is the file's own links minus those,
+    /// which is also what the reading list reports.
     async fn score(&self, batch: &[Frontier]) -> Vec<Result<(ParsedFile, FileJudgment), Failure>> {
         let root = self.config.root;
         let query = self.config.query;
+        let ignore = self.config.ignore;
         let scorer = self.scorer;
         join_all(batch.iter().map(|entry| async move {
-            let file = parse(root.join(&entry.path), root)?;
+            let mut file = parse(root.join(&entry.path), root)?;
+            file.links.retain(|link| !ignore.matched(&link.target));
             let judgment = scorer.score(query, &file).await?;
             Ok((file, judgment))
         }))

@@ -3,7 +3,8 @@ name = "s1m"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "Finds the parts of a markdown knowledge base relevant to a query by walking its links."
+description = "Reads local markdown files and ranks them for a query, so an agent opens only what matters."
+license = "MIT"
 publish = false
 
 [dependencies]
@@ -11,6 +12,7 @@ anyhow = "1.0.104"
 async-trait = "0.1.92"
 clap = { version = "4", features = ["derive"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["alloc"] }
+ignore = "0.4.30"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }

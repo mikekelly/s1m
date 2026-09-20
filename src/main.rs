@@ -19,6 +19,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use s1m::cache::{CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::format::Format;
+use s1m::ignore::{self, Ignore};
 use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
@@ -32,6 +33,28 @@ const MAX_DEPTH: usize = 6;
 const THRESHOLD: f64 = 0.6;
 const FANOUT: usize = 8;
 const SEED_COUNT: usize = 5;
+
+/// The one paragraph that says what s1m is, for `--help`: the same wording the
+/// README opens with and `SKILL.md` carries, so a person or an agent that meets
+/// s1m anywhere is told the same thing.
+///
+/// It leads with what the tool does because the name reads as "sim" and the
+/// first guess is a simulator, which is the one thing this is not.
+const DESCRIPTION: &str = "\
+s1m reads local markdown files and ranks them for a query, so an agent opens
+only what matters. The name is pronounced \"sim\" — it is short for System 1
+memex, after Vannevar Bush's memex — and s1m is not a simulator.
+
+Give it a query and one or more entry files: it scores each file and each of
+its outgoing links with a fast judgment model (Jev, TypeSafe's System One
+model), follows the most promising links first, and prints a ranked reading
+list with the line ranges worth reading. JSON is the default; md and tree are
+for a person. It generates no text, answers no question and builds no index:
+the output is what to open, and the caller decides.
+
+The files the walk visits, and the links it judges, are sent to the TypeSafe
+API — that is what the judgment is bought with — so a private wiki needs a
+`.s1mignore` at the root saying what must not leave the machine.";
 
 const AFTER_HELP: &str = "\
 The reading list goes to stdout as JSON by default: most relevant first, then
@@ -55,6 +78,12 @@ Scores print at two decimals in md and tree; json keeps the model's own numbers.
 content, trimmed. --criteria wins when both are given, and the reading list
 reports the path as `mode`.
 
+A `.s1mignore` in the root holds the paths that are never read, in gitignore
+syntax (`private/`, `*.key.md`, `!keep.md`). A link whose target it matches is
+not sent to the model, not previewed and not followed; a page it matches is not
+seeded by --seed-grep; and an entry file it matches is an error rather than a
+silent read.
+
 Exit codes:
   0  the walk reached files beyond the entry files
   1  nothing cleared the threshold: only the entry files were reached
@@ -69,7 +98,8 @@ per link (see docs/spike-notes.md).";
 #[command(
     name = "s1m",
     version,
-    about = "Ranks local files for a query so an agent reads only what matters",
+    about = "Reads local markdown files and ranks them for a query, so an agent opens only what matters",
+    long_about = DESCRIPTION,
     override_usage = "s1m <query> <entry-file...> [OPTIONS]",
     after_help = AFTER_HELP,
     arg_required_else_help = true,
@@ -387,7 +417,19 @@ async fn score_file(
             .to_path_buf()
     });
 
-    let parsed = parse::parse(file, &root)?;
+    // The same rules a query runs under, for the same reason: this view reads
+    // the file and previews its link targets, and a matched path is not read.
+    let ignore = Ignore::at(&root)?;
+    if ignore.matched(&parse::relative_to_root(&root, file)) {
+        anyhow::bail!(
+            "{} is matched by {}: s1m never reads an ignored file",
+            file.display(),
+            root.join(ignore::FILE).display()
+        );
+    }
+
+    let mut parsed = parse::parse(file, &root)?;
+    parsed.links.retain(|link| !ignore.matched(&link.target));
     let jev = scorer(&root)?.with_previews(previews);
     let mode = jev.mode().clone();
 

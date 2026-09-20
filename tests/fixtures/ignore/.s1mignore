@@ -1,0 +1,3 @@
+# Nothing under here is safe to send to a third party.
+private/
+drafts.md
