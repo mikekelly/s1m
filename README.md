@@ -1,6 +1,12 @@
 # s1m
 
-s1m reads local files and ranks them for a query, so an LLM agent opens only what matters.
+s1m reads local markdown files and ranks them for a query, so an LLM agent opens only what
+matters.
+
+The name is short for **System 1 memex** — after Vannevar Bush's memex, which followed
+associative trails through linked documents. It is pronounced "sim", and it is not a simulator:
+what it reads is a folder of files, and what it returns is a list of what to open, not a
+simulation of anything.
 
 You give it a query and one or more entry point files. It scores each file and each outgoing
 link with a fast judgment model, follows the most promising links first, and returns a ranked
@@ -8,7 +14,7 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: milestones 2 and 3.** The CLI walks a real wiki: `s1m "<query>" <entry>...`
+> **Status: milestones 2, 3 and 4.** The CLI walks a real wiki: `s1m "<query>" <entry>...`
 > returns the plan's reading list as JSON — every result carrying the line ranges worth reading —
 > with the plan's flags, defaults and exit codes, and `--mode` / `--criteria` pick what relevance
 > means. What it builds on is in place too — the parser from
@@ -33,31 +39,41 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > list to read or paste — or as `tree`, the walk's annotated link tree
 > ([#13](https://github.com/mikekelly/s1m/issues/13)). Milestone 3's numbers are in
 > [`eval/REPORT.md`](eval/REPORT.md), which `cargo run --release --bin eval` reproduced on a
-> vendored wiki and reruns on any other. The design lives in
+> vendored wiki and reruns on any other. Milestone 4 is the packaging around all of it: `--help`,
+> this README and [`SKILL.md`](SKILL.md) all lead with what s1m reads and ranks, and
+> `.s1mignore` keeps paths out of the scoring calls entirely
+> ([below](#keeping-paths-out-of-it-s1mignore)). The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
+
+## Install
+
+```bash
+cargo install --git https://github.com/mikekelly/s1m
+```
+
+Stable Rust, edition 2024 — rustc 1.85 or newer — is the only requirement. The crate is not
+published to crates.io or anywhere else, so `cargo install --git` is the install. From a
+checkout, `cargo build --release` leaves the binary at `target/release/s1m`, which is what the
+rest of this README spells `s1m`: run `./target/release/s1m` there, or `cargo install --path .`
+to put it on your `PATH`. Either way the binary is one command, and the scoring calls need a key
+from your TypeSafe account — the variable is the only thing s1m reads it from:
+
+```bash
+export TYPESAFE_API_KEY=...     # see .env.example
+s1m "how do I cut a release and publish the package" wiki/index.md
+```
 
 ## Your content leaves the machine
 
 Scoring calls send the query and the content of the files visited to the TypeSafe API. The key
 is read from `TYPESAFE_API_KEY`; see [`.env.example`](.env.example). Do not point s1m at a
-knowledge base you are not willing to send to a third party.
-
-## Requirements
-
-Stable Rust, edition 2024 — rustc 1.85 or newer.
-
-## Build
-
-```bash
-cargo build --release     # target/release/s1m
-```
+knowledge base you are not willing to send to a third party. A root whose wiki has pages that
+must not go can say so in [`.s1mignore`](#keeping-paths-out-of-it-s1mignore).
 
 ## Use
 
 ```bash
-cargo build --release     # target/release/s1m
-
 s1m "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
 ```
@@ -80,7 +96,9 @@ it: a section is one yes-or-no question to the model, and a Noul near 0.5 means 
 so the default leaves those out. Nothing is derived from the scores — a range is never narrowed
 or widened — and because a section's range contains its subsections', a parent that is a mix of
 useful and useless text lands near the middle and is dropped while the subsection that mattered
-stays. A caller that has read one returned range has read everything returned inside it.
+stays. A caller that has read one returned range has read everything returned inside it. A file
+whose sections all fell below `--section-threshold` carries `"sections": []` in the JSON — it was
+scored, and nothing cleared the bar — and the `md` view says the same in words.
 
 Every path is spelled the way the entry files were given: `--root wiki` with `wiki/index.md`
 gives `wiki/payments/cutoffs.md`, not `payments/cutoffs.md`, and those are the paths a caller
@@ -314,13 +332,60 @@ frontmatter costs 0.21 of mean recall (0.67 → 0.46) for 43% of the input token
 dropping previews altogether costs 0.28, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
+### Keeping paths out of it: `.s1mignore`
+
+A wiki that holds anything private needs to say so, because this is a run that sends what it
+visits to a third party. Put a `.s1mignore` beside the pages, in the root the walk is bounded
+by, and its lines are [gitignore patterns](https://git-scm.com/docs/gitignore) — the matcher is
+the `ignore` crate's, the one ripgrep uses, and s1m walks a path's levels from the root down the
+way git does, so the syntax and the semantics are git's and not an approximation of them:
+
+```text
+# Nothing under private/ leaves this machine.
+private/
+
+# Every key, except the one that is meant to be shared.
+*.key.md
+!public.key.md
+```
+
+A `!` line re-includes what a broader line took, at the level it is written for. It cannot reach
+inside a directory an earlier line excluded — `private/` excludes `private/readme.md` however
+loudly a later line asks for it — because git does not look inside an excluded directory either,
+and neither does s1m.
+
+A matched path is never read, on the way in and on the way out:
+
+| Where | What happens |
+| --- | --- |
+| A link whose target matches | The link is out of the file before it is judged: no question is asked about it, its target is not opened for a [preview](#what-is-sent-about-each-link), its path is not among the request's links, and the walk does not queue it whatever the model would have scored it. The reading list reports no such link — not as pruned, but not at all |
+| A page `--seed-grep` would hit | It is not a candidate: the keyword match reads the pages under the root, and a matched page is not one of them |
+| An entry file you name | Exit 2 with the path, the `.s1mignore` and one line on stderr, before anything is read or bought. Naming a path is asking for it, so silence would be the wrong answer |
+| The `.s1mignore` itself | A file that cannot be read, that holds a pattern that does not parse, or that is there but is not a readable file — a directory, a symlink whose target has gone — is exit 2. Dropping a rule quietly would send exactly the files the rule was written for |
+
+What is *not* removed is another page's prose about a matched one: a page you do link to still
+says "see the vault" in its own words, and the words of a page the walk reads are what is sent.
+The rules cover the target — its text, its path as a link to judge, its preview — not the
+sentences other authors wrote around it.
+
+Three consequences worth knowing:
+
+- Only the root's `.s1mignore` is read. One in a subdirectory is not: what a wiki excludes is
+  stated in one place, and `--root` is what decides which file that is.
+- The rules are part of what a request is. A page judged with the file visible and the same page
+  judged with it ignored are different questions, so the [cache](#cache) keys them apart and
+  narrowing `.s1mignore` never serves an answer bought while the file was readable.
+- `s1m score-file` runs under the same rules, and so does everything driven from the library —
+  the [evaluation harness](#evaluation) included: `s1m::ignore::Ignore` is one value a run is
+  built around, not a filter over its output.
+
 Exit codes:
 
 | Code | Meaning |
 | --- | --- |
 | 0 | The walk reached files beyond the entry files |
 | 1 | Nothing cleared the threshold: the model judged the entry files' links and none passed, so the list is the entry files and nothing more. The JSON is still on stdout, and one line on stderr says so |
-| 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
+| 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, an entry file the root's `.s1mignore` covers, a `.s1mignore` that cannot be read or parsed, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
 
 A file the walk *reached* but could not read is neither an error nor a silent omission: a link
 to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
@@ -344,8 +409,10 @@ query to be worth a hit, and matching a term anywhere in the text would count `f
 `before` and `note` inside `notes`. Files rank by how many of the query's terms they match, then
 by how many hits they have, then by path — the page covering more of the query first, and never
 the order a directory happened to list its files in. The candidates are the same `.md`/`.txt`
-files the parser resolves wikilinks against, so a hidden directory is not searched, and the
-entry files the caller named are left out of the hits: they are on the frontier already.
+files the parser resolves wikilinks against, so a hidden directory is not searched and a page
+the root's [`.s1mignore`](#keeping-paths-out-of-it-s1mignore) matches is not a candidate — it is
+not read to count a keyword in it — and the entry files the caller named are left out of the
+hits: they are on the frontier already.
 
 This is a keyword match, not a second opinion: it recovers pages that are orphaned or weakly
 linked, and the ranking still comes from the model. A seed that the walk would have reached
@@ -376,7 +443,9 @@ s1m score-file --no-previews "how does s1m decide which links to follow" \
 
 `--root DIR` sets the directory links resolve against (the file's own directory by default), and
 `--no-previews` leaves the target's title, frontmatter and first paragraph out of the request,
-which is the control case for whether a preview earns its tokens.
+which is the control case for whether a preview earns its tokens. The root's
+[`.s1mignore`](#keeping-paths-out-of-it-s1mignore) applies here too: a file it matches is an
+error naming it, and a link to one is not judged at all.
 
 Answers are cached (see [Cache](#cache)), so it also prints `cache hit`, `miss` or `off` with
 the directory the entries are in, and `files` and `calls` on separate lines — one file scored,
@@ -456,6 +525,20 @@ reproducible rather than merely repeated — a cache entry stores what its call 
 number in the report is a wall clock — so with `eval/cache` committed the command above prints
 the same bytes with no key at all, and `--no-cache` with a key buys every judgment again.
 
+Its headline, in three lines:
+
+- **Recall and precision at `--max-files` 10**: mean recall 0.67, mean precision 0.27 — 23 of the
+  39 wanted pages, over 83 files returned. The budget is not what binds: the walk runs out of
+  links above `--threshold` first, and `--max-files 25` returns 87 files for the same mean recall.
+- **What an agent reads**: 35,245 tokens for the returned ranges, against 72,795 for the same
+  files whole and 346,160 for every page on every query. Reading the returned files whole costs
+  21% of the corpus's text; the section scores take 52% off that, and the ranking 90% off reading
+  everything.
+- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s
+  an answer. On this wiki the keyword ranker finds more and reads far more — recall 0.94 against
+  s1m's 0.67, at 6.9× the tokens — and `--seed-grep 5` on top of the walk is the middle, at recall
+  0.89 for 94,790 tokens.
+
 ## Library
 
 The parser and the Jev judgment later stages build on live in `src/` and are reachable without
@@ -465,13 +548,14 @@ the CLI, so they can be driven directly from tests:
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
+| `ignore::Ignore` | The root's `.s1mignore`: `Ignore::at(root)` reads it (a root without one matches nothing, a file that cannot be read or parsed is an error, and `Ignore::none()` is the empty set), `matched(relative_path)` answers for a path or any directory above it. One value a run is built around, asked by the CLI for its entry files, by the walk for what it may read and link to, and by `seed` for its candidates |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1), one `SectionJudgment` (`heading`, `lines` as the parser gave them, `score` 0 to 1) per section and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, each in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
 | `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's sections and links would not fit the API's 32k state budget in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
-| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, whether they were a keyword seed, their sections (the parser's ranges, in document order) and the outgoing links it judged |
-| `seed::seed(root, query, count, skip)` | In-process keyword match, no ripgrep: the best `count` pages under `root` for `query`'s keywords, spelled the way `traverse` wants its entry files, with `skip` — the caller's entry files — left out. Whole words of three characters or more, ranked by terms matched, then hits, then path |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file or seed before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, whether they were a keyword seed, their sections (the parser's ranges, in document order) and the outgoing links it judged |
+| `seed::seed(root, query, count, skip, ignore)` | In-process keyword match, no ripgrep: the best `count` pages under `root` for `query`'s keywords, spelled the way `traverse` wants its entry files, with `skip` — the caller's entry files — left out and `ignore`'s matched pages left out before they are read. Whole words of three characters or more, ranked by terms matched, then hits, then path |
 | `cli::Options` | One run's flags — the query, the entry files, the root, the budgets and how many keyword hits to seed — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
@@ -504,7 +588,12 @@ sections nest and a page with no heading at the top, and `tests/fixtures/criteri
 criterion of a caller's own; `tests/cli.rs` runs the binary over both: the API is a loopback
 server the test answers itself, pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON and
 the two reading views on stdout, which criterion reached the request, and the cache behaviour
-are checked end to end without a key or a network. `tests/fixtures/seed/` is the `--seed-grep` tree — an entry page,
+are checked end to end without a key or a network. `tests/fixtures/ignore/` is the `.s1mignore`
+tree — an entry page, the page it links to, and two pages the root's rules cover, one behind a
+directory pattern and one by name — which `tests/cli.rs` walks while holding the fake API to
+the guarantee: no request names those pages and no request carries a byte of their text.
+`tests/fixtures/ignore-broken/` is a root whose `.s1mignore` does not parse, and is the run
+that exits 2 naming the line. `tests/fixtures/seed/` is the `--seed-grep` tree — an entry page,
 the chain it links to, a page in a hidden directory, and a page nothing links to — which
 `src/seed.rs` measures the keyword match against and `tests/cli.rs` walks both ways.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
@@ -520,12 +609,8 @@ long enough to be truncated is judged from its heading and lines, the same way.
 
 | Command | What it does |
 | --- | --- |
-<<<<<<< HEAD
-| `cargo test` | Unit, parser, cache, Jev client, traversal, format and CLI tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
-=======
-| `cargo test` | Unit, parser, cache, Jev client, traversal, CLI and eval-harness tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
+| `cargo test` | Unit, parser, cache, Jev client, traversal, format, CLI and eval-harness tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
 | `cargo run --release --bin eval -- --wiki <dir> --gold <file>` | The evaluation harness: see [Evaluation](#evaluation), and [`eval/REPORT.md`](eval/REPORT.md) for what it last said |
->>>>>>> bb11bc7 (Evaluation: gold set and eval harness on a real wiki (#11))
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
@@ -542,3 +627,7 @@ and covers the rest of the interface: the exit codes, the reading list on stdout
 with the key set it scores the vendored wiki's index page and release page and this
 repository's plan, checks that the release page outranks an unrelated one, and checks that the
 second identical run is answered from the cache rather than the API.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright Mike Kelly 2026.

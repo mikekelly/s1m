@@ -14,6 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::time::sleep;
 
+use s1m::ignore::Ignore;
 use s1m::parse::{self, ParsedFile, relative_to_root};
 use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
 use s1m::traverse::{Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
@@ -78,6 +79,13 @@ impl Fake {
     /// from the one they were asked in.
     fn jittered(mut self) -> Fake {
         self.jitter = true;
+        self
+    }
+
+    /// The same fake over another root, so a walk over a different tree has its
+    /// paths spelled back the same way.
+    fn over(mut self, root: PathBuf) -> Fake {
+        self.root = root;
         self
     }
 
@@ -185,13 +193,20 @@ struct Settings {
     max_depth: usize,
     fanout: usize,
     threshold: f64,
+    ignore: Ignore,
 }
 
 impl Settings {
     fn new(entries: &[&str]) -> Settings {
-        let root = root();
+        Settings::over(root(), entries)
+    }
+
+    /// The same walk over another root, entry files and all: the tree the root
+    /// names is the one that is walked, `.s1mignore` and all.
+    fn over(root: PathBuf, entries: &[&str]) -> Settings {
         Settings {
             entries: entries.iter().map(|entry| root.join(entry)).collect(),
+            ignore: Ignore::at(&root).expect("the fixture's .s1mignore should parse"),
             root,
             seeds: Vec::new(),
             max_files: 8,
@@ -238,6 +253,7 @@ impl Settings {
             max_depth: self.max_depth,
             fanout: self.fanout,
             threshold: self.threshold,
+            ignore: &self.ignore,
         };
         traverse(&config, scorer)
             .await
@@ -985,6 +1001,7 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
     let scorer = Fake::new(&[]);
     let root = root();
     let entries = [PathBuf::from("tests/fixtures/wiki/index.md")];
+    let ignore = Ignore::none();
     let config = Config {
         query: QUERY,
         entries: &entries,
@@ -994,12 +1011,56 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
         max_depth: 6,
         fanout: 4,
         threshold: 0.6,
+        ignore: &ignore,
     };
 
     assert!(matches!(
         traverse(&config, &scorer).await,
         Err(TraverseError::BaseMismatch { .. })
     ));
+}
+
+/// The root's `.s1mignore` is part of the walk and not a sieve over what it
+/// found: a link whose target it matches is out of the file before the scorer
+/// is asked, so the target is never scored — its path never reaches the model
+/// and its text is never read for a preview — and the reading list has no link
+/// to report, however sure the model would have been about it.
+#[tokio::test]
+async fn a_matched_link_target_is_out_of_the_file_before_it_is_scored() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ignore");
+    let settings = Settings::over(root.clone(), &["entry.md"]);
+    let scorer = Fake::new(&[
+        (
+            "entry.md",
+            Entry::new(0.9, &[("public.md", 0.9), ("private/vault.md", 0.95)]),
+        ),
+        ("public.md", Entry::new(0.5, &[])),
+        ("private/vault.md", Entry::new(1.0, &[])),
+    ])
+    .over(root);
+
+    let traversal = settings.run(&scorer).await;
+
+    assert_eq!(
+        paths(&traversal),
+        ["entry.md", "public.md"],
+        "the matched page is not visited, whatever the walk would have scored it"
+    );
+    assert_eq!(
+        scorer.called(),
+        ["entry.md", "public.md"],
+        "the matched page is never asked about"
+    );
+    let links: Vec<&Path> = visited(&traversal, "entry.md")
+        .links
+        .iter()
+        .map(|link| link.target.as_path())
+        .collect();
+    assert_eq!(
+        links,
+        [Path::new("public.md")],
+        "the link is gone from the judgment and from the result"
+    );
 }
 
 /// A seed is an entry file the walk was not given: it starts at path score 1

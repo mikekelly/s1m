@@ -43,9 +43,10 @@
 //!   The list is still printed — a caller that wants it gets it — with one line
 //!   on stderr saying why the code is not 0.
 //! - 2 for anything that stops a list being an answer: bad flags, no query, an
-//!   entry file that cannot be read, a missing `TYPESAFE_API_KEY`, and a
-//!   judgment that failed. A *reached* file that cannot be read is not in this
-//!   list; see [`run`].
+//!   entry file that cannot be read, an entry file the root's `.s1mignore`
+//!   covers ([`Error::Ignored`]), a `.s1mignore` that cannot be read or parsed,
+//!   a missing `TYPESAFE_API_KEY`, and a judgment that failed. A *reached* file
+//!   that cannot be read is not in this list; see [`run`].
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,6 +55,7 @@ use async_trait::async_trait;
 use serde::Serialize;
 
 use crate::cache::{Cacheable, CachedScorer};
+use crate::ignore::{Ignore, IgnoreError};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
 use crate::seed;
@@ -317,6 +319,16 @@ pub enum Error {
     /// cached answers.
     #[error(transparent)]
     Scorer(#[from] ScorerError),
+    /// The root's `.s1mignore` could not be used ([`crate::ignore`]).
+    #[error(transparent)]
+    Ignore(#[from] IgnoreError),
+    /// An entry file the caller named is one the root's `.s1mignore` covers.
+    /// The file is never read, so there is no list to return: the caller either
+    /// means it — and can say so by narrowing `.s1mignore` — or named the wrong
+    /// path. Exit 2, because a reading list built around a file that was
+    /// silently dropped would answer a question the caller did not ask.
+    #[error("{path} is matched by {file}: s1m never reads an ignored file")]
+    Ignored { path: String, file: String },
     /// A file the walk reached could not be judged. A reading list with a hole
     /// where a judgment should be is a different answer, and a caller could not
     /// tell the difference, so there is no list.
@@ -335,6 +347,12 @@ pub enum Error {
 /// paying for a round of judgments would be too late. A link to a file that is
 /// not there is the opposite case — the wiki's business, not the caller's — so
 /// it is named on stderr as skipped and the walk carries on.
+///
+/// The root's `.s1mignore` is read first, and it is what the whole run is
+/// bounded by: an entry file the caller names that matches is
+/// [`Error::Ignored`] rather than a read, and nothing else the walk touches —
+/// a link target, a keyword hit, a link preview — is read if it matches
+/// ([`crate::ignore`]).
 pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Error> {
     if options.query.trim().is_empty() {
         return Err(Error::MissingArguments);
@@ -343,12 +361,19 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         return Err(Error::MissingArguments);
     };
 
+    let ignore = Ignore::at(&root)?;
     for entry in &options.entries {
+        if ignore.matched(&parse::relative_to_root(&root, entry)) {
+            return Err(Error::Ignored {
+                path: entry.display().to_string(),
+                file: root.join(crate::ignore::FILE).display().to_string(),
+            });
+        }
         parse::parse(entry, &root)?;
     }
 
     let seeds = match options.seed_grep {
-        Some(count) => seed::seed(&root, &options.query, count, &options.entries),
+        Some(count) => seed::seed(&root, &options.query, count, &options.entries, &ignore),
         None => Vec::new(),
     };
 
@@ -361,6 +386,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         max_depth: options.max_depth,
         fanout: options.fanout,
         threshold: options.threshold,
+        ignore: &ignore,
     };
     let traversal = traverse(&config, judge.scorer()).await?;
 
