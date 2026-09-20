@@ -8,12 +8,14 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: scaffold.** The CLI prints usage and nothing else; traversal, scoring and output
-> are still to come. What exists is the project skeleton from
-> [#3](https://github.com/mikekelly/s1m/issues/3) and the parser from
-> [#4](https://github.com/mikekelly/s1m/issues/4): `s1m::parse` turns one markdown file into
-> its title, frontmatter, heading sections with line ranges, and outgoing links. The design
-> lives in [docs/initial-plan.md](docs/initial-plan.md).
+> **Status: scaffold.** The CLI prints usage and nothing else; the scoring client and the output
+> formats are still to come. What exists is the project skeleton from
+> [#3](https://github.com/mikekelly/s1m/issues/3), the parser from
+> [#4](https://github.com/mikekelly/s1m/issues/4) — `s1m::parse` turns one markdown file into
+> its title, frontmatter, heading sections with line ranges, and outgoing links — and the walk
+> from [#6](https://github.com/mikekelly/s1m/issues/6): `s1m::traverse` searches the link graph
+> best-first against an injected `s1m::scorer::Scorer`. The design lives in
+> [docs/initial-plan.md](docs/initial-plan.md).
 
 ## Your content leaves the machine
 
@@ -59,20 +61,31 @@ it can be driven directly from tests:
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
+| `traverse::traverse(config, scorer)` | Best-first walk of the link graph: a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
+| `scorer::Scorer` | The judgment seam, called once per visited file: a file's relevance plus a scent per outgoing link. [#5](https://github.com/mikekelly/s1m/issues/5) implements it against Jev; tests use a fake |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
 followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wikilinks
 (`[[target]]`, `[[target|alias]]`) resolve by file name under `root`, preferring `.md`.
 
+Traversal takes its `entries` against the same base as `parse`, and every path it returns —
+`path`, `via` and link targets — is spelled relative to `root`, so `root.join(path)` is the
+file to read. Ties on path score are broken by path, a round's files are scored concurrently
+but recorded in the order they were popped, and the reading list comes back sorted by
+relevance: the same query on the same files gives the same result, whatever the answers'
+latency. A file that cannot be parsed or scored is reported in `failed` and does not end the
+walk.
+
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
-the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it.
+the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
+`tests/traverse.rs` walks it with a fake scorer.
 
 ## Development
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit, parser and CLI tests |
+| `cargo test` | Unit, parser, traversal and CLI tests |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |

@@ -5,3 +5,5 @@
 //! any of it.
 
 pub mod parse;
+pub mod scorer;
+pub mod traverse;
