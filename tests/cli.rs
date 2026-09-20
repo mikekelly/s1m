@@ -7,6 +7,7 @@ use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 
@@ -28,6 +29,13 @@ const DEEP: &str = "tests/fixtures/cli/deep.md";
 
 /// An entry file that is not there, for the run that must name it.
 const GONE: &str = "tests/fixtures/cli/gone.md";
+
+/// A criterion of the caller's own, for the run that replaces a mode with one.
+const CRITERIA: &str = "tests/fixtures/criteria/payouts.md";
+
+/// What that file says, and so what a request under it must judge by.
+const CRITERION: &str =
+    "The content states the cut-off that decides whether an instant payout can still be sent.";
 
 /// The id the scorer asks the file's own question under; every other question
 /// in a request is a link, `link_0`, `link_1`, and so on.
@@ -66,12 +74,154 @@ fn unknown_flag_exits_2_and_names_itself() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("--nope"));
 }
 
+/// A mode that is not one of the plan's three is the flag's vocabulary, not a
+/// run: clap names the value it did not recognise and exits 2, the way it does
+/// for a flag that does not exist.
 #[test]
-fn planned_arguments_are_rejected() {
-    let output = run(&["--mode", "about", "chargebacks", "wiki/index.md"]);
+fn an_unknown_mode_exits_2_naming_it() {
+    let output = run(&["--mode", "everything", "chargebacks", "wiki/index.md"]);
 
     assert_eq!(output.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("--mode"));
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--mode"), "{error}");
+    assert!(error.contains("everything"), "{error}");
+}
+
+/// The plan's Relevance modes table, end to end: each mode sends its own
+/// questions to the API, the reading list names the one that judged the
+/// answers, and — the questions being part of what the cache keys on — a change
+/// of mode buys fresh answers instead of reading the previous mode's.
+#[test]
+fn every_mode_sends_its_own_instructions_and_the_list_reports_it() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let mut reported = Vec::new();
+    let mut file_questions = Vec::new();
+    let mut link_questions = Vec::new();
+    for mode in ["about", "useful-for", "answers"] {
+        let before = api.requests().len();
+        let output = run_with(&[QUERY, ENTRY, "--mode", mode], &api, &cache);
+
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let list = json(&output);
+        reported.push(list["mode"].as_str().expect("a mode").to_string());
+
+        let sent = api.requests();
+        assert_eq!(
+            sent.len() - before,
+            3,
+            "{mode} is a different question on the same three files, so it is bought, not read: {sent:?}"
+        );
+        file_questions.push(instructions(&sent[before], FILE_QUESTION));
+        link_questions.push(instructions(&sent[before], "link_0"));
+    }
+
+    assert_eq!(reported, ["about", "useful-for", "answers"]);
+    assert_eq!(
+        distinct(file_questions),
+        3,
+        "every mode asks its own file question"
+    );
+    assert_eq!(distinct(link_questions), 3, "and its own link question");
+}
+
+/// `--criteria` replaces the mode, and the list says which file did: the
+/// criterion is what the request judges by, even though `--mode` was given too,
+/// because the plan's flag table says the file overrides it.
+#[test]
+fn a_criteria_file_sends_its_own_criterion_and_is_reported_as_the_mode() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = run_with(
+        &[QUERY, ENTRY, "--mode", "about", "--criteria", CRITERIA],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let list = json(&output);
+    assert_eq!(
+        list["mode"], CRITERIA,
+        "the criterion's own name, not --mode's"
+    );
+
+    let sent = api.requests();
+    let entry = sent
+        .iter()
+        .find(|request| request["questions"].get("link_0").is_some())
+        .expect("the entry page's request");
+    let file = instructions(entry, FILE_QUESTION);
+    assert!(file.contains(CRITERION), "{file}");
+    let link = instructions(entry, "link_0");
+    assert!(link.contains(CRITERION), "{link}");
+    assert!(
+        !file.contains("on the subject"),
+        "the mode that was overridden is not asked as well: {file}"
+    );
+}
+
+/// A criteria file that cannot be read, or that holds nothing, is the caller's
+/// mistake, and it is named before anything is bought: no API call, nothing on
+/// stdout, one line on stderr naming the file.
+#[test]
+fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let missing = run_with(
+        &[
+            QUERY,
+            ENTRY,
+            "--criteria",
+            "tests/fixtures/criteria/gone.md",
+        ],
+        &api,
+        &cache,
+    );
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    let error = stderr(&missing);
+    assert!(error.contains("gone.md"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+
+    let blank = cache.dir.join("blank.md");
+    fs::write(&blank, "  \n").expect("a criteria file holding nothing");
+    let output = run_with(
+        &[QUERY, ENTRY, "--criteria", blank.to_str().expect("a path")],
+        &api,
+        &cache,
+    );
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains("blank.md"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+
+    assert_eq!(
+        api.answered(),
+        0,
+        "the criteria file is read before anything is bought"
+    );
+}
+
+/// The one-shot HTTP reply the fake server sends, and the request bodies it
+/// saw, are enough to answer the two questions above; these read the wording
+/// out of one.
+fn instructions(request: &Value, id: &str) -> String {
+    request["questions"][id]["instructions"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{id} should carry instructions: {request}"))
+        .to_string()
+}
+
+/// How many different strings a list holds.
+fn distinct(mut values: Vec<String>) -> usize {
+    values.sort();
+    values.dedup();
+    values.len()
 }
 
 // -------------------------------------------------------------- the fixtures
@@ -141,7 +291,9 @@ fn run_with(args: &[&str], api: &FakeApi, cache: &Cache) -> std::process::Output
 struct FakeApi {
     url: String,
     address: SocketAddr,
-    answered: Arc<AtomicUsize>,
+    /// Every request body the binary sent, in order: what a test asserts the
+    /// criterion's wording on, and the count of what the API was asked.
+    requests: Arc<Mutex<Vec<Value>>>,
     stop: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -151,15 +303,15 @@ impl FakeApi {
     /// question with `noul`.
     ///
     /// `score` is the file's own Score, on the mode's scale: 3 is the top of the
-    /// four levels `useful-for` has, which the scorer reports as a relevance of
+    /// four levels every mode has, which the scorer reports as a relevance of
     /// 1.0. `noul` is what every link's scent comes back as, and it is what a
     /// test varies to put links above or below `--threshold`.
     fn new(score: f64, noul: f64) -> FakeApi {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("the bound address");
-        let answered = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let counted = Arc::clone(&answered);
+        let recorded = Arc::clone(&requests);
         let flag = Arc::clone(&stop);
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
@@ -170,7 +322,10 @@ impl FakeApi {
                 let Some(request) = read_request(&mut stream) else {
                     continue;
                 };
-                counted.fetch_add(1, Ordering::SeqCst);
+                recorded
+                    .lock()
+                    .expect("the lock is not poisoned")
+                    .push(request.clone());
                 let body = reply(&request, score, noul);
                 let _ = stream.write_all(response(&body).as_bytes());
             }
@@ -178,7 +333,7 @@ impl FakeApi {
         FakeApi {
             url: format!("http://{address}/"),
             address,
-            answered,
+            requests,
             stop,
             thread: Some(thread),
         }
@@ -189,10 +344,18 @@ impl FakeApi {
         &self.url
     }
 
+    /// Every request body the binary sent, in order.
+    fn requests(&self) -> Vec<Value> {
+        self.requests
+            .lock()
+            .expect("the lock is not poisoned")
+            .clone()
+    }
+
     /// Requests answered: what the binary reports as `calls`, seen from the
     /// other end of the wire.
     fn answered(&self) -> usize {
-        self.answered.load(Ordering::SeqCst)
+        self.requests().len()
     }
 }
 

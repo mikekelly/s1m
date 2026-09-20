@@ -12,6 +12,7 @@
 //! [`Mode`], so adding a relevance mode (#10) means adding a table entry, not
 //! changing the builder.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
@@ -70,22 +71,33 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 // ------------------------------------------------------------------- modes
 
-/// Everything that changes between relevance modes: the name, and the wording
-/// of the two questions.
+/// Everything that changes between relevance criteria: the name, and the
+/// wording of the two questions.
 ///
-/// #10 adds a mode by adding one of these, leaving the builder alone.
+/// The three modes the plan's Relevance modes table names are consts below, and
+/// [`Mode::custom`] builds one from a criterion of the caller's own. All of them
+/// leave the builder alone: what a run asks is this table, and every field of it
+/// is in the request's bytes, which is what makes one criterion's stored answers
+/// unusable for another's.
+///
+/// Only the name and the two questions are [`Cow`]s, because a criteria file
+/// supplies those in the caller's own words: its path names the mode and its
+/// criterion goes into both questions. The ladder and the yes/no wording are this
+/// module's and are static, which is why the criteria file borrows them.
+#[derive(Debug, Clone)]
 pub struct Mode {
-    /// The mode's name, as `--mode` will spell it.
-    pub name: &'static str,
+    /// The mode's name, as `--mode` spells it; a criteria file's path, as
+    /// `--criteria` was given it, when the criterion came from there.
+    pub name: Cow<'static, str>,
     /// The question about the file as a whole.
-    pub file_question: &'static str,
+    pub file_question: Cow<'static, str>,
     /// The Score levels, least useful first. The order is load-bearing: a Score
     /// answer is the probability-weighted position over these levels, numbered
     /// from zero, so the last level is the top of the scale.
     pub file_levels: &'static [&'static str],
     /// The question about one link. `{index}` is replaced with that link's
     /// position in `state.links`, which is how the instructions point at it.
-    pub link_question: &'static str,
+    pub link_question: Cow<'static, str>,
     /// What a yes means for that link.
     pub link_true: &'static str,
     /// What a no means for that link.
@@ -103,23 +115,112 @@ impl Mode {
     pub fn top_level(&self) -> f64 {
         (self.levels() - 1) as f64
     }
+
+    /// A criterion from a file of the caller's own, in place of a mode.
+    ///
+    /// The criterion sentence is the caller's and goes into both questions; the
+    /// wording around it is this module's, because each built-in ladder is
+    /// written for its own criterion and a caller's sentence has no ladder to
+    /// match. The scale is therefore the criterion-independent one below, and
+    /// `name` is what the reading list reports as `mode` — `--criteria` passes
+    /// the path it was given.
+    ///
+    /// `criterion` is expected trimmed and non-empty; the CLI is where a file
+    /// that holds nothing is the caller's mistake.
+    pub fn custom(name: impl Into<Cow<'static, str>>, criterion: &str) -> Mode {
+        let mut file_question =
+            String::from("How relevant is `file` for `query`, judged by this criterion: ");
+        file_question.push_str(criterion);
+        let mut link_question = String::from(
+            "Is following `links[{index}]` likely to lead to content that meets this criterion: ",
+        );
+        link_question.push_str(criterion);
+        Mode {
+            name: name.into(),
+            file_question: Cow::Owned(file_question),
+            file_levels: CRITERION_LEVELS,
+            link_question: Cow::Owned(link_question),
+            link_true: CRITERION_LINK_TRUE,
+            link_false: CRITERION_LINK_FALSE,
+        }
+    }
 }
 
-/// The criterion the issue names for v1: would this help someone doing what the
-/// query describes?
+/// Browsing: everything on a subject, however much of it a page covers. The top
+/// level is a page *about* the subject rather than the page to start from,
+/// because what a caller collecting a subject wants is every page on it.
+pub const ABOUT: Mode = Mode {
+    name: Cow::Borrowed("about"),
+    file_question: Cow::Borrowed("How much of `file` is on the subject of `query`?"),
+    file_levels: &[
+        "unrelated — `file` has nothing to do with `query`.",
+        "mention — `file` mentions the subject of `query` in passing, without covering it.",
+        "related — `file` is on a subject next to `query`, and covers part of it.",
+        "on the subject — `file` is about the subject of `query`: the page to collect.",
+    ],
+    link_question: Cow::Borrowed(
+        "Does following `links[{index}]` lead to content on the subject of `query`?",
+    ),
+    link_true: "The target is about the subject, or is a page of links that lead to pages about it.",
+    link_false: OFF_SUBJECT,
+};
+
+/// The default, and the criterion the spike measured: would this help someone
+/// doing what the query describes?
 pub const USEFUL_FOR: Mode = Mode {
-    name: "useful-for",
-    file_question: "How useful is `file` for someone doing what `query` describes?",
+    name: Cow::Borrowed("useful-for"),
+    file_question: Cow::Borrowed("How useful is `file` for someone doing what `query` describes?"),
     file_levels: &[
         "unrelated — nothing in `file` bears on `query`.",
         "tangential — `file` is on a nearby subject, but someone doing what `query` describes would not read it.",
         "supporting — `file` holds context or part of what `query` needs, but is not where that person should start.",
         "central — `file` is about what `query` describes, or is the page to start from.",
     ],
-    link_question: "Is following `links[{index}]` likely to lead to content useful for someone doing what `query` describes?",
+    link_question: Cow::Borrowed(
+        "Is following `links[{index}]` likely to lead to content useful for someone doing what `query` describes?",
+    ),
     link_true: "The target is on the subject, or is a page of links that lead to it, so following this link is worth a reader's next step.",
-    link_false: "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
+    link_false: OFF_SUBJECT,
 };
+
+/// Question lookup: the page that answers the query, and the pages on the way
+/// to it. A page that answers part of the question ranks above one that is only
+/// background, which is what separates this mode from `useful-for`.
+pub const ANSWERS: Mode = Mode {
+    name: Cow::Borrowed("answers"),
+    file_question: Cow::Borrowed("Does `file` contain the answer to `query`?"),
+    file_levels: &[
+        "no answer — `file` does not bear on `query`.",
+        "background — `file` is context for `query`, but does not answer any part of it.",
+        "part of the answer — `file` answers part of `query`, or names where the answer is.",
+        "the answer — `file` contains the answer to `query`.",
+    ],
+    link_question: Cow::Borrowed(
+        "Does following `links[{index}]` lead to content containing the answer to `query`?",
+    ),
+    link_true: "The target contains the answer or part of it, or is a page of links that lead to content that does.",
+    link_false: "The target does not answer `query`, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
+};
+
+/// What a link's no is when the target is not about the subject: `about` and
+/// `useful-for` ask the same thing of a link here, so they say the same thing
+/// about one that leads nowhere.
+const OFF_SUBJECT: &str = "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
+
+/// The ladder a criterion of the caller's own is scored on: the same four
+/// degrees for every criterion, because the criterion itself is in the
+/// instructions and a caller's sentence comes with no ladder of its own.
+const CRITERION_LEVELS: &[&str] = &[
+    "unrelated — `file` does not meet the criterion.",
+    "tangential — `file` touches the criterion without meeting it.",
+    "supporting — `file` meets the criterion in part, or holds the context for meeting it.",
+    "central — `file` meets the criterion: it is where a reader should start.",
+];
+
+const CRITERION_LINK_TRUE: &str =
+    "The target meets the criterion, or is a page of links that lead to content that does.";
+
+const CRITERION_LINK_FALSE: &str = "The target does not meet the criterion, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
 
 // ------------------------------------------------------------- the request
 
@@ -298,12 +399,13 @@ pub struct JevScorer {
     endpoint: String,
     api_key: String,
     root: PathBuf,
-    mode: &'static Mode,
+    mode: Mode,
     previews: bool,
 }
 
 impl JevScorer {
-    /// A scorer with an explicit key, for callers that have one.
+    /// A scorer with an explicit key, for callers that have one. It judges by
+    /// [`USEFUL_FOR`] until [`JevScorer::with_mode`] says otherwise.
     pub fn new(api_key: impl Into<String>, root: impl Into<PathBuf>) -> Result<Self, ScorerError> {
         Ok(JevScorer {
             client: reqwest::Client::builder()
@@ -313,7 +415,7 @@ impl JevScorer {
             endpoint: ENDPOINT.to_string(),
             api_key: api_key.into(),
             root: root.into(),
-            mode: &USEFUL_FOR,
+            mode: USEFUL_FOR.clone(),
             previews: true,
         })
     }
@@ -335,14 +437,27 @@ impl JevScorer {
     }
 
     /// Sends previews (or does not) with each link. Off is the control case for
-    /// the question of whether a preview earns its tokens.
+    /// the question of whether a preview earns its tokens — [`JevScorer::new`]
+    /// turns them on, and the query path never turns them off: the spike's
+    /// verdict is that the preview is the main ranking signal, so it is part of
+    /// the request rather than a caller's choice. See `docs/spike-notes.md`.
     pub fn with_previews(mut self, previews: bool) -> Self {
         self.previews = previews;
         self
     }
 
-    pub fn mode(&self) -> &'static Mode {
-        self.mode
+    /// Judges by `mode`'s criterion instead of [`USEFUL_FOR`].
+    ///
+    /// The criterion is picked before any request is built, because it is the
+    /// questions that carry it — and, the questions being part of what
+    /// [`Cacheable::key`] hashes, a criterion never reads another's answers.
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> &Mode {
+        &self.mode
     }
 
     /// Judges one file, keeping the accounting [`Scorer::score`] drops.
@@ -833,17 +948,129 @@ mod tests {
 
     // ------------------------------------------------------------ the tests
 
-    /// A second mode, for the cache tests that need the questions to differ.
-    /// #10 owns the real modes; this one only has to be different from
-    /// [`USEFUL_FOR`].
-    static OTHER_MODE: Mode = Mode {
-        name: "test-mode",
-        file_question: "How much of `file` answers `query`?",
-        file_levels: &["nothing", "some", "everything"],
-        link_question: "Does `links[{index}]` answer `query`?",
-        link_true: "It does.",
-        link_false: "It does not.",
-    };
+    /// One request per mode over the real builder, read off the wire: each mode
+    /// sends its own questions, and no two modes send the same ones. The
+    /// criterion is the mode's, all of it, so a request cannot carry one mode's
+    /// instructions and another's criteria.
+    #[tokio::test]
+    async fn every_mode_sends_its_own_instructions_and_criteria() {
+        let query = "how are payments settled";
+        let mut sent = Vec::new();
+        for mode in [ABOUT.clone(), USEFUL_FOR.clone(), ANSWERS.clone()] {
+            let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+            api.scorer()
+                .with_mode(mode.clone())
+                .judge(query, &fixture("index.md"))
+                .await
+                .expect("a judgment");
+            sent.push((mode, api.requests().remove(0)));
+        }
+
+        for (mode, request) in &sent {
+            let questions = request["questions"].as_object().expect("a question map");
+            let file = &questions[FILE_QUESTION];
+            assert_eq!(file["instructions"], mode.file_question.as_ref());
+            assert_eq!(file["criteria"], json!(mode.file_levels));
+            for index in 0..INDEX_TARGETS.len() {
+                let link = &questions[&link_question(index)];
+                assert_eq!(
+                    link["instructions"],
+                    mode.link_question.replace("{index}", &index.to_string()),
+                    "link {index} under {}",
+                    mode.name
+                );
+                assert_eq!(link["criteria"]["true"], mode.link_true);
+                assert_eq!(link["criteria"]["false"], mode.link_false);
+            }
+        }
+
+        // A mode is a criterion, not a different query: the query, the file and
+        // its links go in exactly as they are whatever mode asks about them.
+        for (mode, request) in &sent {
+            assert_eq!(
+                request["state"], sent[0].1["state"],
+                "{} changed the state, not just the questions",
+                mode.name
+            );
+        }
+
+        for (index, (mode, request)) in sent.iter().enumerate() {
+            for (other, other_request) in &sent[index + 1..] {
+                for question in [FILE_QUESTION, "link_0"] {
+                    assert_ne!(
+                        request["questions"][question]["instructions"],
+                        other_request["questions"][question]["instructions"],
+                        "{} and {} ask the same question",
+                        mode.name,
+                        other.name
+                    );
+                }
+                assert_ne!(
+                    request["questions"][FILE_QUESTION]["criteria"],
+                    other_request["questions"][FILE_QUESTION]["criteria"],
+                    "{} and {} score on the same ladder",
+                    mode.name,
+                    other.name
+                );
+                assert_ne!(
+                    request["questions"]["link_0"]["criteria"],
+                    other_request["questions"]["link_0"]["criteria"],
+                    "{} and {} call the same thing a yes",
+                    mode.name,
+                    other.name
+                );
+            }
+        }
+    }
+
+    /// A criterion of the caller's own replaces a mode's: the sentence reaches
+    /// both questions, the ladder is the criterion-independent one, and the
+    /// request is nothing like the default mode's.
+    #[tokio::test]
+    async fn a_criterion_from_a_file_replaces_the_modes_wording() {
+        let query = "how are payments settled";
+        let criterion = "The content states the cut-off that decides when a payout is sent.";
+        let mode = Mode::custom("criteria/payouts.md", criterion);
+
+        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+        api.scorer()
+            .with_mode(mode.clone())
+            .judge(query, &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        let questions = requests[0]["questions"]
+            .as_object()
+            .expect("a question map");
+        let file = &questions[FILE_QUESTION];
+        assert!(
+            file["instructions"]
+                .as_str()
+                .expect("instructions")
+                .contains(criterion),
+            "the file question judges by the caller's criterion: {file}"
+        );
+        assert_eq!(file["criteria"], json!(mode.file_levels));
+        assert_eq!(file["criteria"].as_array().expect("levels").len(), 4);
+        assert!(
+            questions["link_0"]["instructions"]
+                .as_str()
+                .expect("instructions")
+                .contains(criterion),
+            "and so does the link question"
+        );
+
+        assert_ne!(
+            file["instructions"],
+            json!(USEFUL_FOR.file_question.as_ref())
+        );
+        assert_ne!(
+            file["criteria"],
+            json!(USEFUL_FOR.file_levels),
+            "a caller's criterion gets the criterion-independent ladder"
+        );
+    }
 
     #[tokio::test]
     async fn one_request_carries_the_file_and_every_link() {
@@ -1262,15 +1489,23 @@ mod tests {
         let edited = key(&scorer, query, &page);
         assert_ne!(base, edited, "the content is in the key");
 
-        // A mode asks different questions of the same file. #10 owns the real
-        // modes, so the test brings its own; the point here is only that the
-        // questions are what the model answers.
-        let mut other_mode = JevScorer::new("test-key", dir.path()).expect("a client");
-        other_mode.mode = &OTHER_MODE;
+        // A mode asks different questions of the same file: the criterion is
+        // what the model answers, so it is what the answer depends on.
+        let mut by_about = JevScorer::new("test-key", dir.path()).expect("a client");
+        by_about.mode = ABOUT.clone();
         assert_ne!(
             edited,
-            key(&other_mode, query, &page),
+            key(&by_about, query, &page),
             "the mode's questions are in the key"
+        );
+
+        // And a criterion of the caller's own, which is no mode's wording.
+        let mut by_criteria = JevScorer::new("test-key", dir.path()).expect("a client");
+        by_criteria.mode = Mode::custom("criteria.md", "It states the settlement cut-off.");
+        assert_ne!(
+            edited,
+            key(&by_criteria, query, &page),
+            "a criteria file's criterion is in the key too"
         );
 
         // And where the request goes: a fake server is not the API, and its

@@ -8,20 +8,23 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: milestone 1.** The CLI walks a real wiki: `s1m "<query>" <entry>...` returns the
-> plan's reading list as JSON, with the plan's flags, defaults and exit codes. What it builds on
-> is in place too — the parser from
+> **Status: milestone 2, without the section line ranges yet.** The CLI walks a real wiki:
+> `s1m "<query>" <entry>...` returns the plan's reading list as JSON, with the plan's flags,
+> defaults and exit codes, and `--mode` / `--criteria` pick what relevance means. What it builds
+> on is in place too — the parser from
 > [#4](https://github.com/mikekelly/s1m/issues/4) (`s1m::parse` turns one markdown file into its
 > title, frontmatter, heading sections with line ranges, and outgoing links), the Jev judgment
 > from [#5](https://github.com/mikekelly/s1m/issues/5) (`s1m::jev` scores one file per request,
 > returning a relevance score for the file and a scent for each of its links), the walk from
 > [#6](https://github.com/mikekelly/s1m/issues/6) (`s1m::traverse` searches the link graph
-> best-first against an injected `s1m::scorer::Scorer`) and the cache from
+> best-first against an injected `s1m::scorer::Scorer`), the cache from
 > [#7](https://github.com/mikekelly/s1m/issues/7), which keeps those answers on disk so a repeat
-> run is identical and free. `s1m::cli` is the CLI's own half: the flags, the walk, the reading
-> list and the exit code, with the scorer injected so tests run it without a key or a network.
-> Section line ranges are [#9](https://github.com/mikekelly/s1m/issues/9); `--mode`, `--criteria`,
-> `--seed-grep` and the `md` and `tree` formats are later. The design lives in
+> run is identical and free, and the three relevance criteria from
+> [#10](https://github.com/mikekelly/s1m/issues/10) below. `s1m::cli` is the CLI's own half: the
+> flags, the walk, the reading list and the exit code, with the scorer injected so tests run it
+> without a key or a network.
+> Section line ranges are [#9](https://github.com/mikekelly/s1m/issues/9); `--seed-grep` and the
+> `md` and `tree` formats are later. The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
@@ -104,6 +107,8 @@ what a cold run costs — the same query again is answered from the cache and re
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
+| `--mode` | `useful-for` | What relevance means: `about`, `useful-for` or `answers` |
+| `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
 | `--max-files` | 25 | Files visited before the walk stops |
 | `--max-depth` | 6 | Link hops from an entry file |
 | `--threshold` | 0.6 | Least link scent that queues a target, 0 to 1 |
@@ -112,7 +117,64 @@ what a cold run costs — the same query again is answered from the cache and re
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | Only `json` exists so far; any other value exits 2 |
 
-Not implemented yet: `--mode`, `--criteria`, `--seed-grep`, and the `md` and `tree` formats.
+Not implemented yet: `--seed-grep`, and the `md` and `tree` formats.
+
+### Relevance modes
+
+The query goes into the request exactly as it was asked; the mode picks what the model is told
+to judge it by. Three are built in, and `--mode` chooses one:
+
+| Mode | The criterion the model judges by | Typical use |
+| --- | --- | --- |
+| `about` | Is the content on the subject of the query | Browsing, collecting everything on a subject |
+| `useful-for` (default) | Would the content help someone doing what the query describes | Agents with a task |
+| `answers` | Does the content contain the answer to the query | Question lookup |
+
+Each mode sends its own two questions: one Score for the file as a whole on a four-level ladder,
+and one Noul per outgoing link. The reading list reports which one judged the answers, so a
+store of results can say what they are relevant to:
+
+```bash
+s1m --mode answers "how long does an instant payout take to settle" wiki/index.md
+```
+
+The criterion is part of the cached request, so switching mode over the same files buys fresh
+answers rather than reading the previous mode's.
+
+### Custom criteria
+
+`--criteria FILE` replaces the mode with a criterion of your own. The file is plain text, and
+its whole content, trimmed, is the criterion — the sentence a mode would otherwise supply:
+
+```text
+The content states the cut-off that decides whether an instant payout can still be sent.
+```
+
+s1m puts that sentence into both questions and scores the file on a criterion-independent
+four-level ladder (unrelated, tangential, supporting, central), because a built-in ladder is
+written for its own criterion. `--criteria` overrides `--mode` rather than conflicting with it,
+and the reading list reports the file's path as `mode`, so a caller can tell which criterion
+judged the answers:
+
+```bash
+s1m --criteria criteria/payout-cutoffs.md "when is it too late to send" wiki/index.md
+```
+
+A criteria file that cannot be read, or that holds nothing, exits 2 naming it, before anything
+is bought.
+
+### What is sent about each link
+
+Every request carries, per outgoing link, its anchor, the sentence around it and its enclosing
+heading, plus a preview of the target read from disk: its title, its frontmatter and its first
+paragraph. Previews are always on for a query — the spike measured them as the signal that
+separates a page which says nothing from one whose own links point at the answer, at roughly
+250 input tokens a link, and a threshold tuned with previews is not valid without them
+([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
+caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
+is the part of a preview most likely to mislead; splitting it out is an experiment for the
+evaluation milestone ([#11](https://github.com/mikekelly/s1m/issues/11)), not a decision to make
+here.
 
 Exit codes:
 
@@ -120,7 +182,7 @@ Exit codes:
 | --- | --- |
 | 0 | The walk reached files beyond the entry files |
 | 1 | Nothing cleared the threshold: the model judged the entry files' links and none passed, so the list is the entry files and nothing more. The JSON is still on stdout, and one line on stderr says so |
-| 2 | Error: bad flags, a blank query, no entry file, an entry file that cannot be read, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
+| 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
 
 A file the walk *reached* but could not read is neither an error nor a silent omission: a link
 to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
@@ -172,7 +234,8 @@ cache in `calls` alone. Two `--no-cache` runs of one query keep the same ranking
 numbers underneath it, which is the difference the cache exists to remove.
 
 An answer is cached under a SHA-256 of the request that produced it: the endpoint, the model,
-the query, the mode's questions and criteria, the file's path, title and content, and each
+the query, the mode's questions and criteria (so a second run under `--mode` or `--criteria` is
+a different question and is bought), the file's path, title and content, and each
 link's target, anchor, sentence, heading and preview. Change any of those and it is a different
 question; a second identical run makes no API call at all.
 
@@ -202,7 +265,8 @@ the CLI, so they can be driven directly from tests:
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1) and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
-| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, holding the query, the file and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`; `judge` also returns the model, token counts and latency of the call |
+| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, holding the query, the file and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews; `judge` also returns the model, token counts and latency of the call |
+| `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the link question and what counts as yes and no. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused(judgment)`, and `calls()` and `hits()` count what reached the API and what came off the disk |
 | `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
@@ -229,9 +293,10 @@ and does not end the walk.
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
 `tests/traverse.rs` walks it with a fake scorer. `tests/fixtures/cli/` is a three-page chain
-with a broken link beside it, which `tests/cli.rs` runs the binary over: the API is a loopback
-server the test answers itself, pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON on
-stdout and the cache behaviour are checked end to end without a key or a network.
+with a broken link beside it, and `tests/fixtures/criteria/` is a criterion of a caller's own;
+`tests/cli.rs` runs the binary over both: the API is a loopback server the test answers itself,
+pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON on stdout, which criterion reached
+the request, and the cache behaviour are checked end to end without a key or a network.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
 `docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it
