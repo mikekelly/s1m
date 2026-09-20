@@ -4,6 +4,7 @@
 //! lands in later issues and calls into this crate rather than reimplementing
 //! any of it.
 
+pub mod jev;
 pub mod parse;
 pub mod scorer;
 pub mod traverse;
