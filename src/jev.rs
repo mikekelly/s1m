@@ -1,11 +1,17 @@
 //! One Jev request per file.
 //!
-//! The query, the file and everything known about its outgoing links go in as
-//! one `state`; the answers come back as one Score for the file and one Noul per
-//! link. Jev evaluates every question against the state in parallel, so a file
-//! costs one round trip however many links it has — the premise of the spike in
+//! The query, the file, its heading sections and everything known about its
+//! outgoing links go in as one `state`; the answers come back as one Score for
+//! the file, one Noul per section and one Noul per link. Jev evaluates every
+//! question against the state in parallel, so a file costs one round trip
+//! however many links it has — the premise of the spike in
 //! [#5](https://github.com/mikekelly/s1m/issues/5). What real runs produced is
 //! written up in `docs/spike-notes.md`.
+//!
+//! A file whose sections and links would not fit the API's state budget in one
+//! request is split across posts instead: every post carries the same file and
+//! its own share of the questions, and the answers merge into one judgment. See
+//! [`JevScorer::pack`].
 //!
 //! There is no Rust SDK, so this calls the HTTP API directly:
 //! <https://docs.typesafe.ai/api.md>. The wording of every question lives in
@@ -19,11 +25,12 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cacheable;
 use crate::parse::{self, FrontmatterField, Link, ParsedFile};
-use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
+use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
 
 /// The evaluation endpoint. One call, one shape; the SDKs wrap this.
 pub const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
@@ -54,6 +61,23 @@ const FILE_QUESTION: &str = "file_relevance";
 /// budget and leaves the link table most of the rest.
 const CONTENT_LIMIT: usize = 40_000;
 
+/// The tokens the API allows for `state` plus the longest question, from
+/// <https://docs.typesafe.ai/models> as read for `docs/spike-notes.md`. Past
+/// this the request is rejected, so a file whose sections and links do not fit
+/// alongside its content is split across posts ([`JevScorer::pack`]).
+const STATE_TOKENS: usize = 32_000;
+
+/// Four characters per token: the rule of thumb the caps in this file are set
+/// with, because nothing here tokenises. [`JevScorer::pack`] measures the same
+/// way and rounds the same way, up.
+const CHARS_PER_TOKEN: usize = 4;
+
+/// Room left over in a post for what holds it together — the braces, the
+/// commas between items, the `model` field, the escaping of a quote in the
+/// file's own text. A post is only split when the estimate crosses the budget
+/// with this margin, so the split errs towards an early one.
+const POST_MARGIN: usize = 1_024;
+
 /// A first paragraph cut to this many characters: the preview is a hint for the
 /// scent judgment, not the page.
 const PREVIEW_LIMIT: usize = 600;
@@ -72,7 +96,7 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 // ------------------------------------------------------------------- modes
 
 /// Everything that changes between relevance criteria: the name, and the
-/// wording of the two questions.
+/// wording of the three questions.
 ///
 /// The three modes the plan's Relevance modes table names are consts below, and
 /// [`Mode::custom`] builds one from a criterion of the caller's own. All of them
@@ -80,10 +104,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// is in the request's bytes, which is what makes one criterion's stored answers
 /// unusable for another's.
 ///
-/// Only the name and the two questions are [`Cow`]s, because a criteria file
+/// Only the name and the three questions are [`Cow`]s, because a criteria file
 /// supplies those in the caller's own words: its path names the mode and its
-/// criterion goes into both questions. The ladder and the yes/no wording are this
-/// module's and are static, which is why the criteria file borrows them.
+/// criterion goes into all three questions. The ladder and the yes/no wording
+/// are this module's and are static, which is why the criteria file borrows
+/// them.
 #[derive(Debug, Clone)]
 pub struct Mode {
     /// The mode's name, as `--mode` spells it; a criteria file's path, as
@@ -95,6 +120,14 @@ pub struct Mode {
     /// answer is the probability-weighted position over these levels, numbered
     /// from zero, so the last level is the top of the scale.
     pub file_levels: &'static [&'static str],
+    /// The question about one heading section. `{index}` is replaced with that
+    /// section's position in `state.sections`, which is how the instructions
+    /// point at it.
+    pub section_question: Cow<'static, str>,
+    /// What a yes means for that section.
+    pub section_true: &'static str,
+    /// What a no means for that section.
+    pub section_false: &'static str,
     /// The question about one link. `{index}` is replaced with that link's
     /// position in `state.links`, which is how the instructions point at it.
     pub link_question: Cow<'static, str>,
@@ -118,12 +151,12 @@ impl Mode {
 
     /// A criterion from a file of the caller's own, in place of a mode.
     ///
-    /// The criterion sentence is the caller's and goes into both questions; the
-    /// wording around it is this module's, because each built-in ladder is
-    /// written for its own criterion and a caller's sentence has no ladder to
-    /// match. The scale is therefore the criterion-independent one below, and
-    /// `name` is what the reading list reports as `mode` — `--criteria` passes
-    /// the path it was given.
+    /// The criterion sentence is the caller's and goes into all three
+    /// questions; the wording around it is this module's, because each built-in
+    /// ladder is written for its own criterion and a caller's sentence has no
+    /// ladder to match. The scale is therefore the criterion-independent one
+    /// below, and `name` is what the reading list reports as `mode` —
+    /// `--criteria` passes the path it was given.
     ///
     /// `criterion` is expected trimmed and non-empty; the CLI is where a file
     /// that holds nothing is the caller's mistake.
@@ -131,6 +164,10 @@ impl Mode {
         let mut file_question =
             String::from("How relevant is `file` for `query`, judged by this criterion: ");
         file_question.push_str(criterion);
+        let mut section_question = String::from(
+            "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — worth reading, judged by this criterion: ",
+        );
+        section_question.push_str(criterion);
         let mut link_question = String::from(
             "Is following `links[{index}]` likely to lead to content that meets this criterion: ",
         );
@@ -139,6 +176,9 @@ impl Mode {
             name: name.into(),
             file_question: Cow::Owned(file_question),
             file_levels: CRITERION_LEVELS,
+            section_question: Cow::Owned(section_question),
+            section_true: CRITERION_SECTION_TRUE,
+            section_false: CRITERION_SECTION_FALSE,
             link_question: Cow::Owned(link_question),
             link_true: CRITERION_LINK_TRUE,
             link_false: CRITERION_LINK_FALSE,
@@ -158,6 +198,11 @@ pub const ABOUT: Mode = Mode {
         "related — `file` is on a subject next to `query`, and covers part of it.",
         "on the subject — `file` is about the subject of `query`: the page to collect.",
     ],
+    section_question: Cow::Borrowed(
+        "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — on the subject of `query`?",
+    ),
+    section_true: "The text under that heading covers the subject, so reading those lines is worth the reader's next step.",
+    section_false: OFF_SUBJECT_SECTION,
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content on the subject of `query`?",
     ),
@@ -176,6 +221,11 @@ pub const USEFUL_FOR: Mode = Mode {
         "supporting — `file` holds context or part of what `query` needs, but is not where that person should start.",
         "central — `file` is about what `query` describes, or is the page to start from.",
     ],
+    section_question: Cow::Borrowed(
+        "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — useful for someone doing what `query` describes?",
+    ),
+    section_true: "The text under that heading is on the subject, or is where that person should look, so reading those lines is worth their next step.",
+    section_false: OFF_SUBJECT_SECTION,
     link_question: Cow::Borrowed(
         "Is following `links[{index}]` likely to lead to content useful for someone doing what `query` describes?",
     ),
@@ -195,6 +245,11 @@ pub const ANSWERS: Mode = Mode {
         "part of the answer — `file` answers part of `query`, or names where the answer is.",
         "the answer — `file` contains the answer to `query`.",
     ],
+    section_question: Cow::Borrowed(
+        "Does `sections[{index}]` — the part of `file` under that heading, at the lines given — contain the answer to `query`, or part of it?",
+    ),
+    section_true: "The text under that heading contains the answer or part of it, or names where the answer is.",
+    section_false: "The text under that heading does not answer `query`, or holds nothing to read: navigation, a bare list of links, boilerplate, or an empty stub.",
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content containing the answer to `query`?",
     ),
@@ -206,6 +261,11 @@ pub const ANSWERS: Mode = Mode {
 /// `useful-for` ask the same thing of a link here, so they say the same thing
 /// about one that leads nowhere.
 const OFF_SUBJECT: &str = "The target is off the subject, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
+
+/// What a section's no is when its text is not about the subject, or holds
+/// nothing: `about` and `useful-for` ask the same thing of a section here, so
+/// they say the same thing about one that leads nowhere.
+const OFF_SUBJECT_SECTION: &str = "The text under that heading is off the subject, or holds nothing to read: navigation, a bare list of links, boilerplate, an empty stub, or a heading whose section is somewhere else.";
 
 /// The ladder a criterion of the caller's own is scored on: the same four
 /// degrees for every criterion, because the criterion itself is in the
@@ -222,26 +282,56 @@ const CRITERION_LINK_TRUE: &str =
 
 const CRITERION_LINK_FALSE: &str = "The target does not meet the criterion, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
 
+const CRITERION_SECTION_TRUE: &str = "The text under that heading meets the criterion, so reading those lines is worth the reader's next step.";
+
+const CRITERION_SECTION_FALSE: &str = "The text under that heading does not meet the criterion, or holds nothing to read: navigation, a bare list of links, boilerplate, or an empty stub.";
+
 // ------------------------------------------------------------- the request
 
 /// The `state` of one request: the question, the file, and what is known about
-/// each way out of it.
+/// each way into it — its sections — and out of it — its links.
 #[derive(Debug, Serialize)]
 struct State {
     query: String,
     file: FileState,
+    /// The file's heading sections, in the parser's document order;
+    /// `sections[i]` is what question `section_i` asks about. A post carries
+    /// only its own share when the questions were split across posts.
+    sections: Vec<SectionState>,
     links: Vec<LinkState>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FileState {
     path: String,
     title: String,
     content: String,
 }
 
+/// One heading section, as the model sees it.
+///
+/// The section's text is not repeated here: it is already in
+/// [`FileState::content`], and a parent's text contains its subsections', so
+/// copying it per section would multiply the state by the nesting depth. The
+/// heading and the lines are what point at the part of the file the question is
+/// about — and, for a file long enough that its content was cut short, they are
+/// all the model has, the way a link with no readable target is judged from its
+/// anchor.
+///
+/// `level` is carried because duplicate headings are common ("See also"): the
+/// depth tells the model which of them it is being asked about.
+#[derive(Debug, Clone, Serialize)]
+struct SectionState {
+    /// `None` for the content before the first heading, as the parser spells
+    /// it.
+    heading: Option<String>,
+    level: u8,
+    /// `[first, last]` line, inclusive, as the parser gave them.
+    lines: [usize; 2],
+}
+
 /// One outgoing link, as the model sees it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct LinkState {
     anchor: String,
     sentence: String,
@@ -254,24 +344,99 @@ struct LinkState {
 
 /// What a target file looks like from here: what
 /// [`parse::preview`] can say about it without reading the whole page.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct PreviewState {
     title: String,
     frontmatter: Vec<FrontmatterField>,
     first_paragraph: Option<String>,
 }
 
-/// The request body, in the API's own shape.
+/// One file's request: the body to post, or the bodies when the file's sections
+/// and links do not fit the API's state budget in one.
 ///
 /// Public because it is what [`Cacheable`] hands the cache to key an answer on,
 /// and deliberately opaque — no fields, no accessors — so that nothing outside
 /// this module can be built against its shape. What the API sees is this
-/// module's business; what the cache needs is [`Cacheable::key`]'s bytes.
+/// module's business; what the cache needs is [`Cacheable::key`]'s bytes, and
+/// the whole split is part of them.
 #[derive(Debug, Serialize)]
 pub struct Request {
+    /// The posts to make, in order. One, unless the file had to be split: the
+    /// answers to all of them are one file's judgment.
+    posts: Vec<Post>,
+}
+
+/// One post to the API, and where its answers go.
+#[derive(Debug, Serialize)]
+struct Post {
+    /// What is sent, in the API's own shape.
+    body: Body,
+    /// The position in the file's sections of each entry of
+    /// [`State::sections`]: the API is told about a section's place in its own
+    /// post, and this is what knows where that came from. Not sent — the API
+    /// has no use for it, and a request is not a place to explain itself.
+    #[serde(skip_serializing)]
+    sections: Vec<usize>,
+    /// The position in the file's links of each entry of [`State::links`], the
+    /// same way.
+    #[serde(skip_serializing)]
+    links: Vec<usize>,
+}
+
+/// The body, in the API's own shape.
+#[derive(Debug, Serialize)]
+struct Body {
     state: State,
     model: &'static str,
     questions: BTreeMap<String, Question>,
+}
+
+/// One question waiting for a post to go in.
+#[derive(Debug, Clone, Copy)]
+enum Item {
+    /// The file's `index`-th section.
+    Section(usize),
+    /// The file's `index`-th link.
+    Link(usize),
+}
+
+/// One post's share of the file's questions: which of the file's sections and
+/// links it asks about, in the file's own order.
+///
+/// The API is told about positions inside the post — `sections[0]` is the first
+/// section that post asks about, whatever its place in the file — so this is
+/// what turns an answer back into the file's own section or link.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct Share {
+    sections: Vec<usize>,
+    links: Vec<usize>,
+}
+
+impl Share {
+    /// Whether this share has any question beyond the file's own.
+    fn is_empty(&self) -> bool {
+        self.sections.is_empty() && self.links.is_empty()
+    }
+}
+
+/// What one question adds to a post: its state entry, the comma after that
+/// entry, the quotes and colon around the id the question is filed under, and
+/// the question itself. Measured in characters, for [`JevScorer::shares`].
+fn item_cost<T: Serialize>(entry: &T, question: &Question, id: &str) -> usize {
+    json_len(entry) + 1 + json_len(question) + json_len(id) + 4
+}
+
+/// The characters one part of a post costs, measured as the JSON it is written
+/// as. This is how [`JevScorer::pack`] estimates a budget that is stated in
+/// tokens, without tokenising anything.
+///
+/// Nothing this file sends can fail to serialise — it is strings, numbers and
+/// options of both — so a failure here would be a bug in these types rather
+/// than a state of the world.
+fn json_len<T: Serialize + ?Sized>(part: &T) -> usize {
+    serde_json::to_string(part)
+        .expect("a request part is strings and numbers")
+        .len()
 }
 
 /// One typed question. `type` is the API's discriminator, so the fields that do
@@ -298,9 +463,15 @@ struct NoulCriteria {
 }
 
 /// The answer to link `index` comes back under this id, and the question asks
-/// about `links[index]`.
+/// about `links[index]` — the post's own `links`, not the file's.
 fn link_question(index: usize) -> String {
     format!("link_{index}")
+}
+
+/// The answer to section `index` comes back under this id, and the question
+/// asks about `sections[index]` — the post's own `sections`, not the file's.
+fn section_question(index: usize) -> String {
+    format!("section_{index}")
 }
 
 // ------------------------------------------------------------ the response
@@ -366,8 +537,13 @@ impl Answer {
 pub struct JevDetail {
     /// The versioned model that answered, as the API reported it.
     pub model: String,
-    /// How many questions the request carried: the file plus its links.
+    /// How many questions the request carried, over all its posts: the file,
+    /// its sections and its links.
     pub questions: usize,
+    /// How many requests the judgment took. One, unless the file's sections and
+    /// links did not fit the API's state budget in one: this module splits a
+    /// file into posts, and a post is a request.
+    pub requests: usize,
     /// The raw Score answer, 0 to the top level, before it became a relevance.
     pub relevance_level: f64,
     pub relevance_confidence: f64,
@@ -469,85 +645,256 @@ impl JevScorer {
     /// Sends one already-built request for `file`, keeping the accounting.
     ///
     /// The cache builds the request to key it, and this is the call that
-    /// follows a miss: the request that was hashed is the request that is sent.
+    /// follows a miss: the request that was hashed is the request that is sent,
+    /// every post of it.
     async fn judge_request(
         &self,
         request: &Request,
         file: &ParsedFile,
     ) -> Result<JevOutcome, ScorerError> {
         let started = Instant::now();
-        let response = self.send(request).await?;
+        let responses = join_all(request.posts.iter().map(|post| self.send(&post.body))).await;
         let latency = started.elapsed();
-        self.outcome(file, response, latency)
+        // A post that failed fails the file: one judgment needs all its
+        // answers, and the caller has no file to rank on half of them.
+        let responses = responses.into_iter().collect::<Result<Vec<_>, _>>()?;
+        self.outcome(file, request, responses, latency)
     }
 
-    /// One request for one file: its content, and a question per link.
+    /// One request for one file: its content, its sections, and a question per
+    /// section and per link.
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
         let content = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
             path: file.path.clone(),
             source,
         })?;
 
-        let state = State {
-            query: query.to_string(),
-            file: FileState {
-                path: file.path.display().to_string(),
-                title: file.title.clone(),
-                content: clamp(&content, CONTENT_LIMIT),
-            },
-            links: file
-                .links
-                .iter()
-                .map(|link| LinkState {
-                    anchor: link.anchor.clone(),
-                    sentence: link.sentence.clone(),
-                    heading: link.heading.clone(),
-                    target: link.target.display().to_string(),
-                    target_preview: self.preview(link),
-                })
-                .collect(),
+        let state = FileState {
+            path: file.path.display().to_string(),
+            title: file.title.clone(),
+            content: clamp(&content, CONTENT_LIMIT),
         };
+        let sections = file
+            .sections
+            .iter()
+            .map(|section| SectionState {
+                heading: section.heading.clone(),
+                level: section.level,
+                lines: section.lines,
+            })
+            .collect();
+        let links = file
+            .links
+            .iter()
+            .map(|link| LinkState {
+                anchor: link.anchor.clone(),
+                sentence: link.sentence.clone(),
+                heading: link.heading.clone(),
+                target: link.target.display().to_string(),
+                target_preview: self.preview(link),
+            })
+            .collect();
 
-        let mut questions = BTreeMap::new();
-        questions.insert(
-            FILE_QUESTION.to_string(),
-            Question::Score {
-                instructions: self.mode.file_question.to_string(),
-                criteria: self.mode.file_levels,
-            },
-        );
-        for index in 0..file.links.len() {
-            questions.insert(
-                link_question(index),
-                Question::Noul {
-                    instructions: self
-                        .mode
-                        .link_question
-                        .replace("{index}", &index.to_string()),
-                    criteria: NoulCriteria {
-                        yes: self.mode.link_true,
-                        no: self.mode.link_false,
-                    },
-                },
-            );
-        }
-
-        Ok(Request {
-            state,
-            model: MODEL,
-            questions,
-        })
+        Ok(self.pack(query, state, sections, links))
     }
 
-    /// Posts the request, retrying the two statuses the docs call retryable.
-    async fn send(&self, request: &Request) -> Result<Response, ScorerError> {
+    /// The file's questions, split across as many posts as the API's state
+    /// budget needs.
+    ///
+    /// One post is the normal case: every question of a request sees the same
+    /// state and is evaluated in parallel, so splitting gains latency nothing.
+    /// This is a size question. The docs allow 32k tokens for `state` plus the
+    /// longest question, and what can grow without bound is the file's content
+    /// — capped at [`CONTENT_LIMIT`], so about 10k tokens — and then its link
+    /// table, at about 250 tokens a link with previews (`docs/spike-notes.md`).
+    /// Only the questions are left to split, and the file goes in every post,
+    /// so each post is the file plus the sections and links that fit beside it.
+    ///
+    /// The questions are dealt out in the file's own order, sections first, so
+    /// the answers of the posts in order are the file's sections and links in
+    /// order. A post's cost is measured as the JSON of its parts at
+    /// [`CHARS_PER_TOKEN`], rounded up, with [`POST_MARGIN`] to spare: nothing
+    /// here tokenises, so the estimate is deliberately a conservative one.
+    fn pack(
+        &self,
+        query: &str,
+        file: FileState,
+        sections: Vec<SectionState>,
+        links: Vec<LinkState>,
+    ) -> Request {
+        // The file's Score is about the whole file, so it is asked once, in the
+        // first post, and every post pays for the file state it asks about.
+        let fixed = json_len(&query) + json_len(&file) + json_len(&self.score_question());
+        let shares = self.shares(&sections, &links, fixed);
+
+        Request {
+            posts: shares
+                .iter()
+                .enumerate()
+                .map(|(index, share)| {
+                    // The file's Score is about the whole file, so the first
+                    // post asks it and later ones do not: three posts would
+                    // otherwise buy three answers to one question.
+                    self.post(query, &file, &sections, &links, share, index == 0)
+                })
+                .collect(),
+        }
+    }
+
+    /// Deals the file's sections and links out into shares that each fit the
+    /// state budget beside the file.
+    ///
+    /// Always at least one share, even for a file with no sections and no
+    /// links: the file still has a Score to ask.
+    fn shares(&self, sections: &[SectionState], links: &[LinkState], fixed: usize) -> Vec<Share> {
+        // An item's cost is its state entry, the question, and the characters
+        // that hold them in the body: the comma between entries, and the quotes
+        // and colon around the id each question is filed under. The question is
+        // built with the item's position in the file, which is at least its
+        // position in the post that asks it, so the estimate never runs short
+        // of the text sent.
+        let costs = sections
+            .iter()
+            .enumerate()
+            .map(|(index, section)| {
+                (
+                    Item::Section(index),
+                    item_cost(
+                        section,
+                        &self.section_question(index),
+                        &section_question(index),
+                    ),
+                )
+            })
+            .chain(links.iter().enumerate().map(|(index, link)| {
+                (
+                    Item::Link(index),
+                    item_cost(link, &self.link_question(index), &link_question(index)),
+                )
+            }));
+
+        let mut shares = vec![Share::default()];
+        let mut used = 0;
+        for (item, cost) in costs {
+            let open = shares.last().expect("a share is always open");
+            // A share with something in it gives way to an item that would not
+            // fit; an empty one takes the item whatever it costs, so dealing
+            // always makes progress.
+            if !open.is_empty()
+                && (fixed + used + cost + POST_MARGIN).div_ceil(CHARS_PER_TOKEN) > STATE_TOKENS
+            {
+                shares.push(Share::default());
+                used = 0;
+            }
+            match item {
+                Item::Section(index) => shares
+                    .last_mut()
+                    .expect("a share is always open")
+                    .sections
+                    .push(index),
+                Item::Link(index) => {
+                    shares
+                        .last_mut()
+                        .expect("a share is always open")
+                        .links
+                        .push(index);
+                }
+            }
+            used += cost;
+        }
+        shares
+    }
+
+    /// One post: the file, its share of the sections and links, and where each
+    /// answer goes. `score` is whether this post asks the file's own question,
+    /// which is the first post's to ask.
+    fn post(
+        &self,
+        query: &str,
+        file: &FileState,
+        sections: &[SectionState],
+        links: &[LinkState],
+        share: &Share,
+        score: bool,
+    ) -> Post {
+        let mut questions = BTreeMap::new();
+        if score {
+            questions.insert(FILE_QUESTION.to_string(), self.score_question());
+        }
+
+        let mut state = State {
+            query: query.to_string(),
+            file: file.clone(),
+            sections: Vec::with_capacity(share.sections.len()),
+            links: Vec::with_capacity(share.links.len()),
+        };
+        for (position, &index) in share.sections.iter().enumerate() {
+            state.sections.push(sections[index].clone());
+            questions.insert(section_question(position), self.section_question(position));
+        }
+        for (position, &index) in share.links.iter().enumerate() {
+            state.links.push(links[index].clone());
+            questions.insert(link_question(position), self.link_question(position));
+        }
+
+        Post {
+            body: Body {
+                state,
+                model: MODEL,
+                questions,
+            },
+            sections: share.sections.clone(),
+            links: share.links.clone(),
+        }
+    }
+
+    /// The file's own Score question.
+    fn score_question(&self) -> Question {
+        Question::Score {
+            instructions: self.mode.file_question.to_string(),
+            criteria: self.mode.file_levels,
+        }
+    }
+
+    /// The Noul question about one section, named by its position in the post
+    /// that asks it.
+    fn section_question(&self, index: usize) -> Question {
+        Question::Noul {
+            instructions: self
+                .mode
+                .section_question
+                .replace("{index}", &index.to_string()),
+            criteria: NoulCriteria {
+                yes: self.mode.section_true,
+                no: self.mode.section_false,
+            },
+        }
+    }
+
+    /// The Noul question about one link, named by its position in the post that
+    /// asks it.
+    fn link_question(&self, index: usize) -> Question {
+        Question::Noul {
+            instructions: self
+                .mode
+                .link_question
+                .replace("{index}", &index.to_string()),
+            criteria: NoulCriteria {
+                yes: self.mode.link_true,
+                no: self.mode.link_false,
+            },
+        }
+    }
+
+    /// Posts the body, retrying the two statuses the docs call retryable.
+    async fn send(&self, body: &Body) -> Result<Response, ScorerError> {
         let mut attempt = 1;
         loop {
             let response = self
                 .client
                 .post(&self.endpoint)
                 .bearer_auth(&self.api_key)
-                .json(request)
+                .json(body)
                 .send()
                 .await
                 .map_err(|source| ScorerError::Transport {
@@ -590,46 +937,92 @@ impl JevScorer {
         }
     }
 
-    /// Reads the answers back onto the file, in the order the links came in.
+    /// Reads every post's answers back onto the file.
+    ///
+    /// `responses` are the answers to `request.posts`, in that order, which is
+    /// the order the questions were dealt out in: the file's sections in
+    /// document order, then its links in the order they appear. So the answers
+    /// of the posts in order are the file's sections and links in order.
     fn outcome(
         &self,
         file: &ParsedFile,
-        response: Response,
+        request: &Request,
+        responses: Vec<Response>,
         latency: Duration,
     ) -> Result<JevOutcome, ScorerError> {
-        let mut answers = response.answers;
-        let (level, confidence) = answers
-            .remove(FILE_QUESTION)
-            .ok_or_else(|| ScorerError::MissingAnswer {
-                id: FILE_QUESTION.to_string(),
-            })?
-            .score(FILE_QUESTION)?;
+        // Every post is answered by the same model alias; the first is the one
+        // to report, and a request always has at least one post.
+        let model = responses
+            .first()
+            .map(|response| response.model.clone())
+            .unwrap_or_default();
 
+        let mut level = None;
+        let mut questions = 0;
+        let mut input_tokens = 0;
+        let mut output_tokens = 0;
+        let mut sections = Vec::with_capacity(file.sections.len());
         let mut links = Vec::with_capacity(file.links.len());
-        for (index, link) in file.links.iter().enumerate() {
-            let id = link_question(index);
-            let scent = answers
-                .remove(&id)
-                .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
-                .noul(&id)?;
-            links.push(LinkJudgment {
-                target: link.target.clone(),
-                scent,
-            });
+
+        for (post, response) in request.posts.iter().zip(responses) {
+            let mut answers = response.answers;
+            questions += post.body.questions.len();
+            input_tokens += response.usage.input_tokens;
+            output_tokens += response.usage.output_tokens;
+
+            // Only the first post carries the file's Score; a later post's
+            // answers are all sections and links.
+            if let Some(answer) = answers.remove(FILE_QUESTION) {
+                level = Some(answer.score(FILE_QUESTION)?);
+            }
+
+            for (position, &index) in post.sections.iter().enumerate() {
+                let id = section_question(position);
+                let score = answers
+                    .remove(&id)
+                    .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
+                    .noul(&id)?;
+                let section = &file.sections[index];
+                sections.push(SectionJudgment {
+                    heading: section.heading.clone(),
+                    // The parser's own range, never a derived one: what the
+                    // caller reads is the section that was judged.
+                    lines: section.lines,
+                    score,
+                });
+            }
+
+            for (position, &index) in post.links.iter().enumerate() {
+                let id = link_question(position);
+                let scent = answers
+                    .remove(&id)
+                    .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
+                    .noul(&id)?;
+                links.push(LinkJudgment {
+                    target: file.links[index].target.clone(),
+                    scent,
+                });
+            }
         }
+
+        let (level, confidence) = level.ok_or_else(|| ScorerError::MissingAnswer {
+            id: FILE_QUESTION.to_string(),
+        })?;
 
         Ok(JevOutcome {
             judgment: FileJudgment {
                 relevance: (level / self.mode.top_level()).clamp(0.0, 1.0),
+                sections,
                 links,
             },
             detail: JevDetail {
-                model: response.model,
-                questions: file.links.len() + 1,
+                model,
+                questions,
+                requests: request.posts.len(),
                 relevance_level: level,
                 relevance_confidence: confidence,
-                input_tokens: response.usage.input_tokens,
-                output_tokens: response.usage.output_tokens,
+                input_tokens,
+                output_tokens,
                 latency,
             },
         })
@@ -676,7 +1069,8 @@ impl Cacheable for JevScorer {
     /// The endpoint as well as the body: a proxy and the API can answer one body
     /// differently, and a test's fake server must not read the entries a real
     /// run wrote. Everything else an answer depends on — the model, the mode's
-    /// wording and criteria, the questions, the file's content and path, each
+    /// wording and criteria, the questions, how they were split across posts,
+    /// the file's content and path, each section's heading and lines, each
     /// link's preview — is in the body.
     fn key(&self, request: &Request) -> Result<Vec<u8>, ScorerError> {
         serde_json::to_vec(&(&self.endpoint, request))
@@ -916,15 +1310,24 @@ mod tests {
         .to_string()
     }
 
-    /// A reply that answers every question a file with `links` links asks. Link
-    /// `i` gets a scent of `0.4 + i/100`, so an answer landing on the wrong
-    /// target is visible.
-    fn full_reply(links: usize, level: f64) -> String {
+    /// A reply that answers every question a file with `sections` sections and
+    /// `links` links asks. Section `i` gets `0.3 + i/100` and link `i` gets
+    /// `0.4 + i/100`, so an answer landing on the wrong section or target is
+    /// visible. A file asked in several posts is answered by
+    /// [`numbered_reply`] instead, which numbers answers by the state entry
+    /// each question names rather than by its place in the post.
+    fn full_reply(sections: usize, links: usize, level: f64) -> String {
         let mut answers = Map::new();
         answers.insert(
             FILE_QUESTION.to_string(),
             json!({"type": "score", "score": level, "confidence": 0.87, "legend": {}, "probabilities": {}}),
         );
+        for index in 0..sections {
+            answers.insert(
+                section_question(index),
+                json!({"type": "noul", "noul": 0.3 + index as f64 / 100.0}),
+            );
+        }
         for index in 0..links {
             answers.insert(
                 link_question(index),
@@ -932,6 +1335,56 @@ mod tests {
             );
         }
         reply(answers)
+    }
+
+    /// A reply that answers whatever the request asks, read off the request
+    /// itself: the file's Score is `level`, a section is scored from its own
+    /// first line, and a link from the number in its own target. So a request
+    /// split across posts is answered post by post, and every answer still
+    /// belongs to the section or link it names rather than to its place in the
+    /// post that asked.
+    fn numbered_reply(request: &Value, level: f64) -> String {
+        let mut answers = Map::new();
+        let state = &request["state"];
+        for id in request["questions"]
+            .as_object()
+            .expect("a question map")
+            .keys()
+        {
+            let answer = if id == FILE_QUESTION {
+                json!({"type": "score", "score": level, "confidence": 0.87})
+            } else if let Some(position) = id
+                .strip_prefix("section_")
+                .and_then(|position| position.parse::<usize>().ok())
+            {
+                let first = state["sections"][position]["lines"][0]
+                    .as_u64()
+                    .expect("a section's first line");
+                json!({"type": "noul", "noul": 0.3 + first as f64 / 1000.0})
+            } else {
+                let position = id
+                    .strip_prefix("link_")
+                    .and_then(|position| position.parse::<usize>().ok())
+                    .unwrap_or_else(|| panic!("an unknown question id: {id}"));
+                let target = state["links"][position]["target"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a target path in link {position}"));
+                json!({"type": "noul", "noul": 0.4 + page_number(target) as f64 / 1000.0})
+            };
+            answers.insert(id.clone(), answer);
+        }
+        reply(answers)
+    }
+
+    /// The number in a generated page's name: `page-042.md` is 42. The hub
+    /// fixture below names its pages this way so that an answer can be traced
+    /// back to the link it belongs to.
+    fn page_number(target: &str) -> u64 {
+        target
+            .trim_start_matches("page-")
+            .trim_end_matches(".md")
+            .parse()
+            .unwrap_or_else(|error| panic!("{target}: {error}"))
     }
 
     /// What the fixture's index page links to, in order.
@@ -949,15 +1402,16 @@ mod tests {
     // ------------------------------------------------------------ the tests
 
     /// One request per mode over the real builder, read off the wire: each mode
-    /// sends its own questions, and no two modes send the same ones. The
-    /// criterion is the mode's, all of it, so a request cannot carry one mode's
-    /// instructions and another's criteria.
+    /// sends its own questions — the file's, its sections' and its links' — and
+    /// no two modes send the same ones. The criterion is the mode's, all of it,
+    /// so a request cannot carry one mode's instructions and another's
+    /// criteria.
     #[tokio::test]
     async fn every_mode_sends_its_own_instructions_and_criteria() {
         let query = "how are payments settled";
         let mut sent = Vec::new();
         for mode in [ABOUT.clone(), USEFUL_FOR.clone(), ANSWERS.clone()] {
-            let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+            let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
             api.scorer()
                 .with_mode(mode.clone())
                 .judge(query, &fixture("index.md"))
@@ -971,6 +1425,17 @@ mod tests {
             let file = &questions[FILE_QUESTION];
             assert_eq!(file["instructions"], mode.file_question.as_ref());
             assert_eq!(file["criteria"], json!(mode.file_levels));
+            for index in 0..1 {
+                let section = &questions[&section_question(index)];
+                assert_eq!(
+                    section["instructions"],
+                    mode.section_question.replace("{index}", &index.to_string()),
+                    "section {index} under {}",
+                    mode.name
+                );
+                assert_eq!(section["criteria"]["true"], mode.section_true);
+                assert_eq!(section["criteria"]["false"], mode.section_false);
+            }
             for index in 0..INDEX_TARGETS.len() {
                 let link = &questions[&link_question(index)];
                 assert_eq!(
@@ -996,7 +1461,7 @@ mod tests {
 
         for (index, (mode, request)) in sent.iter().enumerate() {
             for (other, other_request) in &sent[index + 1..] {
-                for question in [FILE_QUESTION, "link_0"] {
+                for question in [FILE_QUESTION, "section_0", "link_0"] {
                     assert_ne!(
                         request["questions"][question]["instructions"],
                         other_request["questions"][question]["instructions"],
@@ -1012,27 +1477,29 @@ mod tests {
                     mode.name,
                     other.name
                 );
-                assert_ne!(
-                    request["questions"]["link_0"]["criteria"],
-                    other_request["questions"]["link_0"]["criteria"],
-                    "{} and {} call the same thing a yes",
-                    mode.name,
-                    other.name
-                );
+                for question in ["section_0", "link_0"] {
+                    assert_ne!(
+                        request["questions"][question]["criteria"],
+                        other_request["questions"][question]["criteria"],
+                        "{} and {} call the same thing a yes",
+                        mode.name,
+                        other.name
+                    );
+                }
             }
         }
     }
 
     /// A criterion of the caller's own replaces a mode's: the sentence reaches
-    /// both questions, the ladder is the criterion-independent one, and the
-    /// request is nothing like the default mode's.
+    /// all three questions, the ladder is the criterion-independent one, and
+    /// the request is nothing like the default mode's.
     #[tokio::test]
     async fn a_criterion_from_a_file_replaces_the_modes_wording() {
         let query = "how are payments settled";
         let criterion = "The content states the cut-off that decides when a payout is sent.";
         let mode = Mode::custom("criteria/payouts.md", criterion);
 
-        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .with_mode(mode.clone())
             .judge(query, &fixture("index.md"))
@@ -1053,12 +1520,18 @@ mod tests {
         );
         assert_eq!(file["criteria"], json!(mode.file_levels));
         assert_eq!(file["criteria"].as_array().expect("levels").len(), 4);
-        assert!(
-            questions["link_0"]["instructions"]
-                .as_str()
-                .expect("instructions")
-                .contains(criterion),
-            "and so does the link question"
+        for question in ["section_0", "link_0"] {
+            assert!(
+                questions[question]["instructions"]
+                    .as_str()
+                    .expect("instructions")
+                    .contains(criterion),
+                "and so does the {question} question"
+            );
+        }
+        assert_eq!(
+            questions["section_0"]["criteria"]["true"], mode.section_true,
+            "a caller's criterion gets this module's wording around it"
         );
 
         assert_ne!(
@@ -1073,8 +1546,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_request_carries_the_file_and_every_link() {
-        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.4)));
+    async fn one_request_carries_the_file_its_sections_and_every_link() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.4)));
         let file = fixture("index.md");
 
         api.scorer()
@@ -1086,7 +1559,7 @@ mod tests {
         assert_eq!(
             requests.len(),
             1,
-            "one request per file, however many links"
+            "one request per file, however many sections and links"
         );
 
         // The wire, not just the payload: the method, the path and the key are
@@ -1122,6 +1595,18 @@ mod tests {
             "the state carries the file itself, not only its title"
         );
 
+        // The sections are the parser's, heading, depth, lines and all: what
+        // the model is asked about is what the caller will be told to read.
+        assert_eq!(
+            state["sections"],
+            json!([{"heading": "Home", "level": 1, "lines": [6, 20]}]),
+            "the sections are the ones #4's parser reports"
+        );
+        assert_eq!(
+            state["sections"].as_array().expect("a section array").len(),
+            file.sections.len()
+        );
+
         let links = state["links"].as_array().expect("a link array");
         assert_eq!(links.len(), INDEX_TARGETS.len());
         assert_eq!(links[0]["target"], "payments/README.md");
@@ -1150,8 +1635,8 @@ mod tests {
         let questions = request["questions"].as_object().expect("a question map");
         assert_eq!(
             questions.len(),
-            INDEX_TARGETS.len() + 1,
-            "one Score for the file, one Noul per link"
+            file.sections.len() + INDEX_TARGETS.len() + 1,
+            "one Score for the file, one Noul per section and one per link"
         );
         let file_question = &questions[FILE_QUESTION];
         assert_eq!(file_question["type"], "score");
@@ -1166,6 +1651,20 @@ mod tests {
                 .contains("`query`"),
             "the file question points at the state it judges"
         );
+
+        for index in 0..file.sections.len() {
+            let question = &questions[&section_question(index)];
+            assert_eq!(question["type"], "noul");
+            assert!(
+                question["instructions"]
+                    .as_str()
+                    .expect("instructions")
+                    .contains(&format!("`sections[{index}]`")),
+                "section {index} is named in its own question"
+            );
+            assert_eq!(question["criteria"]["true"], USEFUL_FOR.section_true);
+            assert_eq!(question["criteria"]["false"], USEFUL_FOR.section_false);
+        }
 
         for index in 0..INDEX_TARGETS.len() {
             let question = &questions[&link_question(index)];
@@ -1184,13 +1683,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_link_answer_lands_on_its_own_target() {
-        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+    async fn every_section_and_link_answer_lands_on_its_own_entry() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        let file = fixture("index.md");
         let outcome = api
             .scorer()
-            .judge("how are payments settled", &fixture("index.md"))
+            .judge("how are payments settled", &file)
             .await
             .expect("a judgment");
+
+        // The sections come back in the parser's order, with the parser's
+        // ranges and the score of the question that named them.
+        assert_eq!(
+            outcome.judgment.sections,
+            [SectionJudgment {
+                heading: Some("Home".to_string()),
+                lines: [6, 20],
+                score: 0.3,
+            }]
+        );
+        for (index, section) in outcome.judgment.sections.iter().enumerate() {
+            assert_eq!(
+                section.lines, file.sections[index].lines,
+                "section {index} is the range the parser gave it"
+            );
+            assert!(
+                (section.score - (0.3 + index as f64 / 100.0)).abs() < 1e-9,
+                "section {index} got {}",
+                section.score
+            );
+        }
 
         let targets: Vec<String> = outcome
             .judgment
@@ -1208,7 +1730,11 @@ mod tests {
             );
         }
 
-        assert_eq!(outcome.detail.questions, INDEX_TARGETS.len() + 1);
+        assert_eq!(
+            outcome.detail.questions,
+            file.sections.len() + INDEX_TARGETS.len() + 1
+        );
+        assert_eq!(outcome.detail.requests, 1, "everything fits one request");
         assert_eq!(outcome.detail.model, "jev-1.13.0");
         assert_eq!(outcome.detail.input_tokens, 1234);
         assert_eq!(outcome.detail.output_tokens, 5);
@@ -1217,7 +1743,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_top_level_is_full_relevance_and_the_bottom_is_none() {
-        let api = FakeApi::new(|attempt, _| (200, full_reply(8, [3.0, 1.5, 0.0][attempt % 3])));
+        let api = FakeApi::new(|attempt, _| (200, full_reply(1, 8, [3.0, 1.5, 0.0][attempt % 3])));
         let scorer = api.scorer();
         let file = fixture("index.md");
 
@@ -1241,7 +1767,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_without_a_readable_target_is_judged_from_its_own_text() {
-        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .judge("how are payments settled", &fixture("index.md"))
             .await
@@ -1275,11 +1801,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_file_with_no_links_asks_only_the_file_question() {
-        let api = FakeApi::new(|_, _| (200, full_reply(0, 1.0)));
+    async fn a_file_with_no_links_asks_about_its_sections_and_nothing_else() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 0, 1.0)));
+        let file = fixture("notes/reading.md");
         let outcome = api
             .scorer()
-            .judge("what is there to read", &fixture("notes/reading.md"))
+            .judge("what is there to read", &file)
             .await
             .expect("a judgment");
 
@@ -1291,19 +1818,96 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
+            file.sections,
+            [parse::Section {
+                heading: Some("Reading".to_string()),
+                level: 1,
+                lines: [1, 3],
+            }]
+        );
+        assert_eq!(
+            requests[0]["questions"]
+                .as_object()
+                .expect("a question map")
+                .len(),
+            file.sections.len() + 1,
+            "the file's Score and one Noul per section"
+        );
+        assert!(outcome.judgment.links.is_empty());
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        assert_eq!(outcome.detail.questions, file.sections.len() + 1);
+    }
+
+    /// The content before a file's first heading is a section of its own: the
+    /// state carries it with no heading and the parser's lines, and the
+    /// judgment comes back with it in place, so the one range that covers that
+    /// text reaches the caller.
+    #[tokio::test]
+    async fn the_preamble_is_a_section_with_no_heading() {
+        let api = FakeApi::new(|_, _| (200, full_reply(2, 1, 2.0)));
+        let file = fixture("notes/scratch.md");
+        assert_eq!(file.sections[0].heading, None);
+
+        let outcome = api
+            .scorer()
+            .judge("what is there to read", &file)
+            .await
+            .expect("a judgment");
+
+        assert_eq!(
+            api.requests()[0]["state"]["sections"],
+            json!([
+                {"heading": null, "level": 0, "lines": [1, 2]},
+                {"heading": "Scratch", "level": 1, "lines": [3, 5]},
+            ])
+        );
+        assert!(
+            api.requests()[0]["questions"]
+                .get(section_question(0))
+                .is_some(),
+            "the preamble is asked about like any other section"
+        );
+        assert_eq!(outcome.judgment.sections[0].heading, None);
+        assert_eq!(outcome.judgment.sections[0].lines, [1, 2]);
+        assert_eq!(
+            outcome.judgment.sections[1].heading.as_deref(),
+            Some("Scratch")
+        );
+    }
+
+    /// A file with nothing in it has no sections either, so its one question is
+    /// the file's own — and it is still a request, not nothing.
+    #[tokio::test]
+    async fn a_file_with_no_sections_still_has_its_score_asked() {
+        let api = FakeApi::new(|_, _| (200, full_reply(0, 0, 2.0)));
+        let dir = TempDir::new("empty-page");
+        let path = dir.path().join("empty.md");
+        fs::write(&path, "").expect("an empty page");
+        let file = parse::parse(&path, dir.path()).expect("a parse");
+        assert!(file.sections.is_empty());
+
+        let outcome = api
+            .scorer()
+            .judge("what is there to read", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
             requests[0]["questions"]
                 .as_object()
                 .expect("a question map")
                 .len(),
             1
         );
-        assert!(outcome.judgment.links.is_empty());
+        assert!(outcome.judgment.sections.is_empty());
         assert_eq!(outcome.detail.questions, 1);
     }
 
     #[tokio::test]
     async fn previews_can_be_left_out_of_the_state() {
-        let api = FakeApi::new(|_, _| (200, full_reply(8, 2.0)));
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .with_previews(false)
             .judge("how are payments settled", &fixture("index.md"))
@@ -1331,6 +1935,7 @@ mod tests {
                 FILE_QUESTION.to_string(),
                 json!({"type": "score", "score": 2.0, "confidence": 0.9}),
             );
+            answers.insert(section_question(0), json!({"type": "noul", "noul": 0.5}));
             for index in 0..8 {
                 if index == 3 {
                     continue;
@@ -1351,6 +1956,69 @@ mod tests {
         );
     }
 
+    /// A section the response does not answer is a failed judgment, the same as
+    /// a missing link answer: half a file's sections would be a reading list
+    /// with a hole in it that the caller could not see.
+    #[tokio::test]
+    async fn a_section_answer_the_response_omits_is_an_error() {
+        let api = FakeApi::new(|_, _| {
+            let mut answers = Map::new();
+            answers.insert(
+                FILE_QUESTION.to_string(),
+                json!({"type": "score", "score": 2.0, "confidence": 0.9}),
+            );
+            for index in 0..8 {
+                answers.insert(link_question(index), json!({"type": "noul", "noul": 0.5}));
+            }
+            (200, reply(answers))
+        });
+
+        let error = api
+            .scorer()
+            .judge("query", &fixture("index.md"))
+            .await
+            .expect_err("section 0 has no answer");
+        assert!(
+            matches!(error, ScorerError::MissingAnswer { ref id } if id == "section_0"),
+            "{error}"
+        );
+    }
+
+    /// A section's answer of the wrong shape is an error too, and it names the
+    /// section rather than the file.
+    #[tokio::test]
+    async fn a_section_answered_with_a_score_is_an_error() {
+        let api = FakeApi::new(|_, _| {
+            let mut answers = Map::new();
+            answers.insert(
+                FILE_QUESTION.to_string(),
+                json!({"type": "score", "score": 2.0, "confidence": 0.9}),
+            );
+            answers.insert(
+                section_question(0),
+                json!({"type": "score", "score": 2.0, "confidence": 0.9}),
+            );
+            for index in 0..8 {
+                answers.insert(link_question(index), json!({"type": "noul", "noul": 0.5}));
+            }
+            (200, reply(answers))
+        });
+
+        let error = api
+            .scorer()
+            .judge("query", &fixture("index.md"))
+            .await
+            .expect_err("a score where a noul belongs");
+        assert!(
+            matches!(
+                error,
+                ScorerError::WrongAnswerType { ref id, expected, found }
+                    if id == "section_0" && expected == "noul" && found == "score"
+            ),
+            "{error}"
+        );
+    }
+
     #[tokio::test]
     async fn an_answer_of_the_wrong_shape_is_an_error() {
         let api = FakeApi::new(|_, _| {
@@ -1360,6 +2028,7 @@ mod tests {
                 FILE_QUESTION.to_string(),
                 json!({"type": "noul", "noul": 0.9}),
             );
+            answers.insert(section_question(0), json!({"type": "noul", "noul": 0.5}));
             for index in 0..8 {
                 answers.insert(link_question(index), json!({"type": "noul", "noul": 0.5}));
             }
@@ -1379,6 +2048,189 @@ mod tests {
             ),
             "{error}"
         );
+    }
+
+    // ----------------------------------------------------------- the posts
+
+    /// A generated page under `dir`: an H1, `headings` H2 sections of its own,
+    /// and `pages` links to pages it also writes, each named `page-NNN.md` and
+    /// each named in its own anchor, so a scent can be traced back to the link
+    /// it belongs to.
+    fn generated(dir: &TempDir, headings: usize, pages: usize) -> ParsedFile {
+        let mut source = String::from("# Hub\n\nThe generated hub page.\n\n");
+        for index in 0..headings {
+            source.push_str(&format!(
+                "## Heading {index}\n\nThe text under heading {index}.\n\n"
+            ));
+        }
+        for index in 0..pages {
+            let page = format!("page-{index:03}.md");
+            fs::write(
+                dir.path().join(&page),
+                format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
+            )
+            .expect("a generated page");
+            source.push_str(&format!(
+                "- [Page {index}]({page}) — step {index} of the runbook.\n"
+            ));
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &source).expect("a generated hub");
+        parse::parse(&path, dir.path()).expect("a parse")
+    }
+
+    /// What one post costs, as the characters the API receives: the estimate
+    /// [`JevScorer::shares`] works from is of these bytes, so a post over the
+    /// budget is a split that did not happen.
+    fn post_length(request: &Value) -> usize {
+        serde_json::to_string(request)
+            .expect("a request is strings and numbers")
+            .len()
+    }
+
+    /// The budget in characters, at the four-per-token rule the split uses.
+    const BUDGET_CHARS: usize = STATE_TOKENS * CHARS_PER_TOKEN;
+
+    /// A hub page whose links are too many for one post is asked in several:
+    /// every post inside the state budget, the file in every one, the file's
+    /// Score in the first, and every answer still on the link that named it.
+    #[tokio::test]
+    async fn a_hub_page_too_big_for_one_post_is_split_across_posts() {
+        let dir = TempDir::new("hub-posts");
+        let file = generated(&dir, 0, 300);
+        let content = fs::read_to_string(dir.path().join("hub.md")).expect("the hub");
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer()
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 1,
+            "{} links should not fit one post, got {:?} characters",
+            file.links.len(),
+            requests.iter().map(post_length).collect::<Vec<_>>()
+        );
+        for request in &requests {
+            assert!(
+                post_length(request) <= BUDGET_CHARS,
+                "a post of {} characters is over the budget",
+                post_length(request)
+            );
+            assert_eq!(
+                request["state"]["file"]["content"], content,
+                "every post carries the file itself"
+            );
+        }
+
+        // The file's Score is about the whole file, so it is asked once — and
+        // in the first post, which is also the one whose answers a caller
+        // reads first if the split ever has to be undone.
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["questions"].get(FILE_QUESTION).is_some())
+                .count(),
+            1
+        );
+        assert!(requests[0]["questions"].get(FILE_QUESTION).is_some());
+
+        // Between them the posts ask about the file exactly once over: no
+        // question is dropped in the split, and none is asked twice.
+        let asked: usize = requests
+            .iter()
+            .map(|request| {
+                request["questions"]
+                    .as_object()
+                    .expect("a question map")
+                    .len()
+            })
+            .sum();
+        assert_eq!(asked, file.sections.len() + file.links.len() + 1);
+
+        // And the answers of the posts in order are the file's sections and
+        // links in order, each on the entry whose own state named it.
+        assert_eq!(outcome.judgment.links.len(), file.links.len());
+        for (index, (judged, link)) in outcome.judgment.links.iter().zip(&file.links).enumerate() {
+            assert_eq!(judged.target, link.target, "link {index}");
+            let target = link.target.to_str().expect("a target path");
+            let expected = 0.4 + page_number(target) as f64 / 1000.0;
+            assert!(
+                (judged.scent - expected).abs() < 1e-9,
+                "link {index} got {}",
+                judged.scent
+            );
+        }
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        for (index, (judged, section)) in outcome
+            .judgment
+            .sections
+            .iter()
+            .zip(&file.sections)
+            .enumerate()
+        {
+            assert_eq!(judged.heading, section.heading, "section {index}");
+            assert_eq!(judged.lines, section.lines, "section {index}");
+        }
+        assert_eq!(outcome.detail.questions, asked);
+        assert_eq!(
+            outcome.detail.requests,
+            requests.len(),
+            "the accounting says how many requests the judgment took"
+        );
+    }
+
+    /// Sections split the same way, in the file's own order: a page with more
+    /// sections than fit one post comes back with every one of them, in
+    /// document order, the ranges the parser gave them.
+    #[tokio::test]
+    async fn a_page_with_more_sections_than_fit_one_post_splits_them() {
+        let dir = TempDir::new("section-posts");
+        let file = generated(&dir, 300, 0);
+        assert!(file.links.is_empty());
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer()
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 1,
+            "{} sections should not fit one post, got {:?} characters",
+            file.sections.len(),
+            requests.iter().map(post_length).collect::<Vec<_>>()
+        );
+        for request in &requests {
+            assert!(
+                post_length(request) <= BUDGET_CHARS,
+                "a post is over the budget"
+            );
+        }
+
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        for (index, (judged, section)) in outcome
+            .judgment
+            .sections
+            .iter()
+            .zip(&file.sections)
+            .enumerate()
+        {
+            assert_eq!(judged.heading, section.heading, "section {index}");
+            assert_eq!(judged.lines, section.lines, "section {index}");
+            let expected = 0.3 + section.lines[0] as f64 / 1000.0;
+            assert!(
+                (judged.score - expected).abs() < 1e-9,
+                "section {index} got {}",
+                judged.score
+            );
+        }
+        assert!(outcome.judgment.links.is_empty());
     }
 
     #[tokio::test]
@@ -1412,7 +2264,7 @@ mod tests {
             if attempt == 0 {
                 (429, r#"{"error":"rate limited"}"#.to_string())
             } else {
-                (200, full_reply(8, 2.0))
+                (200, full_reply(1, 8, 2.0))
             }
         });
 
@@ -1524,7 +2376,7 @@ mod tests {
     /// run is answered from disk, and an edit is not.
     #[tokio::test]
     async fn a_second_identical_run_makes_no_request() {
-        let api = FakeApi::new(|_, _| (200, full_reply(1, 2.0)));
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 1, 2.0)));
         let dir = TempDir::new("cached-run");
         let path = dir.path().join("page.md");
         fs::write(&path, "# Home\n\n[one](one.md)\n").expect("a page");

@@ -20,7 +20,7 @@ use s1m::cache::{CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
-use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError};
+use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 
 /// The plan's defaults for the budgets, and the seed count
 /// [#14](https://github.com/mikekelly/s1m/issues/14) asks for. They live on the
@@ -34,9 +34,11 @@ const SEED_COUNT: usize = 5;
 
 const AFTER_HELP: &str = "\
 The reading list goes to stdout as JSON: most relevant first, then by path, and
-every path in it spelled the way the entry files were. A result with a via path
-was reached along a link; one without is an entry file, and `seeded` says
-whether --seed-grep put it on the frontier.
+every path in it spelled the way the entry files were. Each result carries the
+ranges worth reading: one entry per heading section, with the lines to read, the
+score it was judged at, and the sections below --section-threshold left out. A
+result with a via path was reached along a link; one without is an entry file,
+and `seeded` says whether --seed-grep put it on the frontier.
 
 --mode picks the criterion Jev judges by (about, useful-for, answers); a
 --criteria FILE replaces it with a criterion of your own: the file's whole
@@ -52,8 +54,8 @@ Exit codes:
 Not implemented yet: the md and tree formats. json is the only format.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
-prints a file's relevance, what the call cost, and a scent per link (see
-docs/spike-notes.md).";
+prints a file's relevance, what the call cost, a score per section and a scent
+per link (see docs/spike-notes.md).";
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,6 +105,11 @@ struct Cli {
     /// Least link scent that queues a target, 0 to 1.
     #[arg(long, value_name = "SCENT", default_value_t = THRESHOLD, value_parser = threshold)]
     threshold: f64,
+
+    /// Least section score the reading list keeps, 0 to 1; a section below it is
+    /// left out. Defaults to --threshold.
+    #[arg(long, value_name = "SCORE", value_parser = threshold)]
+    section_threshold: Option<f64>,
 
     /// Frontier files expanded per round.
     #[arg(long, value_name = "N", default_value_t = FANOUT)]
@@ -159,10 +166,8 @@ impl ModeArg {
 
 /// The shape of the reading list on stdout.
 ///
-/// `json` is the only one so far: [#9] adds the section scores to this shape,
-/// and the human views after that.
-///
-/// [#9]: https://github.com/mikekelly/s1m/issues/9
+/// `json` is the only one so far; the `md` and `tree` views of the same
+/// reading list come after it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
     Json,
@@ -200,6 +205,10 @@ impl Cli {
     /// because the scorer is what carries the criterion; it is filled in once
     /// one has been built, from `--criteria`'s file when there is one and
     /// `--mode` otherwise.
+    ///
+    /// `--section-threshold` defaults to `--threshold`, which is the plan's
+    /// flag table and is resolved here because it is one flag's value standing
+    /// in for another's, not a constant.
     fn options(&self) -> Options {
         Options {
             query: self.query.clone().unwrap_or_default(),
@@ -208,6 +217,7 @@ impl Cli {
             max_files: self.max_files,
             max_depth: self.max_depth,
             threshold: self.threshold,
+            section_threshold: self.section_threshold.unwrap_or(self.threshold),
             fanout: self.fanout,
             seed_grep: self.seed_grep.then_some(self.seed_count),
             mode: String::new(),
@@ -411,6 +421,10 @@ fn report(
     // The two numbers the plan's output keeps apart: this command scores one
     // file, and `calls` is what that cost the API.
     field(&mut out, "files", "1");
+    // The cache's count, not the API's: a file whose sections and links did not
+    // fit one request is one judgment bought with several requests, and what
+    // this command reports as a call is the judgment. The `call` line below
+    // says how many requests it took.
     field(
         &mut out,
         "calls",
@@ -438,14 +452,55 @@ fn report(
             &mut out,
             "call",
             &format!(
-                "{}   {} questions   {} tokens in + {} out   {:.2}s   ${:.6}",
+                "{}   {} questions in {} request(s)   {} tokens in + {} out   {:.2}s   ${:.6}",
                 detail.model,
                 detail.questions,
+                detail.requests,
                 detail.input_tokens,
                 detail.output_tokens,
                 detail.latency.as_secs_f64(),
                 detail.cost_usd()
             ),
+        );
+    }
+    out.push('\n');
+
+    // Best score first, like the links below: the point of the table is which
+    // of the file's own ranges the model would have a reader open, and the
+    // range is the parser's, so a line here is a range to read.
+    let mut sections: Vec<(&parse::Section, &SectionJudgment)> =
+        file.sections.iter().zip(&judgment.sections).collect();
+    sections.sort_by(|a, b| {
+        b.1.score
+            .total_cmp(&a.1.score)
+            .then_with(|| a.0.lines[0].cmp(&b.0.lines[0]))
+    });
+
+    let ranges: Vec<String> = sections
+        .iter()
+        .map(|(section, _)| format!("{}-{}", section.lines[0], section.lines[1]))
+        .collect();
+    let range_width = ranges
+        .iter()
+        .map(|range| range.chars().count())
+        .chain(["lines".len()])
+        .max()
+        .unwrap_or_default();
+
+    let _ = writeln!(out, "score  {:<range_width$}  heading", "lines");
+    let _ = writeln!(
+        out,
+        "-----  {}  {}",
+        "-".repeat(range_width),
+        "-".repeat(30)
+    );
+    for ((section, judged), range) in sections.into_iter().zip(ranges) {
+        let heading = section.heading.as_deref().unwrap_or("(no heading)");
+        let _ = writeln!(
+            out,
+            "{:<5.2}  {range:<range_width$}  {}",
+            judged.score,
+            shorten(heading, 30)
         );
     }
     out.push('\n');

@@ -105,7 +105,7 @@ fn an_unknown_mode_exits_2_naming_it() {
 /// of mode buys fresh answers instead of reading the previous mode's.
 #[test]
 fn every_mode_sends_its_own_instructions_and_the_list_reports_it() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let mut reported = Vec::new();
@@ -143,7 +143,7 @@ fn every_mode_sends_its_own_instructions_and_the_list_reports_it() {
 /// because the plan's flag table says the file overrides it.
 #[test]
 fn a_criteria_file_sends_its_own_criterion_and_is_reported_as_the_mode() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = run_with(
@@ -179,7 +179,7 @@ fn a_criteria_file_sends_its_own_criterion_and_is_reported_as_the_mode() {
 /// stdout, one line on stderr naming the file.
 #[test]
 fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let missing = run_with(
@@ -219,8 +219,8 @@ fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
 }
 
 /// The one-shot HTTP reply the fake server sends, and the request bodies it
-/// saw, are enough to answer the two questions above; these read the wording
-/// out of one.
+/// saw, are enough to answer the questions above; these read the wording out of
+/// one.
 fn instructions(request: &Value, id: &str) -> String {
     request["questions"][id]["instructions"]
         .as_str()
@@ -310,14 +310,15 @@ struct FakeApi {
 }
 
 impl FakeApi {
-    /// A server that answers every file question with `score` and every link
-    /// question with `noul`.
+    /// A server that answers every file question with `score`, every section
+    /// question with `section` and every link question with `noul`.
     ///
     /// `score` is the file's own Score, on the mode's scale: 3 is the top of the
     /// four levels every mode has, which the scorer reports as a relevance of
     /// 1.0. `noul` is what every link's scent comes back as, and it is what a
-    /// test varies to put links above or below `--threshold`.
-    fn new(score: f64, noul: f64) -> FakeApi {
+    /// test varies to put links above or below `--threshold`; `section` does
+    /// the same for the sections `--section-threshold` keeps.
+    fn new(score: f64, noul: f64, section: f64) -> FakeApi {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("the bound address");
         let requests = Arc::new(Mutex::new(Vec::new()));
@@ -337,7 +338,7 @@ impl FakeApi {
                     .lock()
                     .expect("the lock is not poisoned")
                     .push(request.clone());
-                let body = reply(&request, score, noul);
+                let body = reply(&request, score, noul, section);
                 let _ = stream.write_all(response(&body).as_bytes());
             }
         });
@@ -426,10 +427,10 @@ fn content_length(head: &[u8]) -> usize {
 /// The API's answer to one request: `score` for the file question and `noul`
 /// for every link question.
 ///
-/// The ids are the request's own keys, so a file with any number of links is
-/// answered whole — the scorer treats one unanswered question as a failed
-/// judgment, which would be the test's bug and not the binary's.
-fn reply(request: &Value, score: f64, noul: f64) -> String {
+/// The ids are the request's own keys, so a file with any number of sections
+/// and links is answered whole — the scorer treats one unanswered question as a
+/// failed judgment, which would be the test's bug and not the binary's.
+fn reply(request: &Value, score: f64, noul: f64, section: f64) -> String {
     let questions = request["questions"]
         .as_object()
         .expect("a request should carry questions");
@@ -438,6 +439,8 @@ fn reply(request: &Value, score: f64, noul: f64) -> String {
         .map(|id| {
             let answer = if id == FILE_QUESTION {
                 json!({"type": "score", "score": score, "confidence": 0.9})
+            } else if id.starts_with("section_") {
+                json!({"type": "noul", "noul": section})
             } else {
                 json!({"type": "noul", "noul": noul})
             };
@@ -507,7 +510,7 @@ fn result<'a>(list: &'a Value, path: &str) -> &'a Value {
 /// reached.
 #[test]
 fn a_run_returns_the_reading_list_as_json_and_exits_0() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = run_with(&[QUERY, ENTRY], &api, &cache);
@@ -534,6 +537,11 @@ fn a_run_returns_the_reading_list_as_json_and_exits_0() {
     assert_eq!(entry["via"], json!([]));
     assert_eq!(entry["relevance"].as_f64(), Some(1.0));
     assert_eq!(
+        entry["sections"],
+        json!([{"heading": "Entry", "lines": [1, 4], "score": 0.7}]),
+        "the sections the caller reads from, on the parser's lines"
+    );
+    assert_eq!(
         entry["links"],
         json!([{"target": NEXT, "scent": 0.9, "followed": true}])
     );
@@ -551,7 +559,7 @@ fn a_run_returns_the_reading_list_as_json_and_exits_0() {
 /// list is the same and the bill is nothing.
 #[test]
 fn a_second_run_with_a_warm_cache_reports_no_calls() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
     let args = [QUERY, ENTRY];
 
@@ -570,13 +578,76 @@ fn a_second_run_with_a_warm_cache_reports_no_calls() {
     assert_eq!(api.answered(), 3, "the second run asked the API nothing");
 }
 
+/// `--section-threshold` drops the sections below it, and a repeat run with it
+/// still reads the same answer off the cache: the threshold is the caller's,
+/// applied to the answers, not something the model is asked again about.
+#[test]
+fn a_section_threshold_drops_the_sections_below_it() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let kept = json(&run_with(&[QUERY, ENTRY], &api, &cache));
+    assert_eq!(
+        result(&kept, ENTRY)["sections"],
+        json!([{"heading": "Entry", "lines": [1, 4], "score": 0.7}])
+    );
+
+    let dropped = json(&run_with(
+        &[QUERY, ENTRY, "--section-threshold", "0.8"],
+        &api,
+        &cache,
+    ));
+    assert_eq!(
+        result(&dropped, ENTRY)["sections"],
+        json!([]),
+        "the caller reads the ranges the list gives it, so a weak one is left out"
+    );
+    assert_eq!(
+        paths(&dropped),
+        paths(&kept),
+        "dropping sections does not change the walk"
+    );
+    assert_eq!(
+        api.answered(),
+        3,
+        "the second run was answered from the cache"
+    );
+}
+
+/// `--section-threshold` defaults to `--threshold`, the plan's flag table: the
+/// same sections come back under a `--threshold` of 0.5 and are dropped under
+/// the default 0.6, with no `--section-threshold` anywhere on the line.
+#[test]
+fn the_section_threshold_defaults_to_the_threshold() {
+    let api = FakeApi::new(3.0, 0.9, 0.55);
+    let cache = Cache::new();
+
+    let kept = json(&run_with(
+        &[QUERY, ENTRY, "--threshold", "0.5"],
+        &api,
+        &cache,
+    ));
+    assert_eq!(
+        result(&kept, ENTRY)["sections"],
+        json!([{"heading": "Entry", "lines": [1, 4], "score": 0.55}])
+    );
+
+    let dropped = json(&run_with(&[QUERY, ENTRY], &api, &cache));
+    assert_eq!(
+        result(&dropped, ENTRY)["sections"],
+        json!([]),
+        "0.55 is under the default threshold of 0.6"
+    );
+    assert_eq!(api.answered(), 3, "the cache answers both runs");
+}
+
 /// A run whose links all fell below the threshold is not an answer: the list is
 /// the entry files and nothing more, so the code says so on the way out and
 /// says why on stderr, without taking the list away from a caller that wants
 /// it.
 #[test]
 fn nothing_above_the_threshold_exits_1_with_the_entry_file() {
-    let api = FakeApi::new(3.0, 0.1);
+    let api = FakeApi::new(3.0, 0.1, 0.7);
     let cache = Cache::new();
 
     let output = run_with(&[QUERY, ENTRY], &api, &cache);
@@ -596,7 +667,7 @@ fn nothing_above_the_threshold_exits_1_with_the_entry_file() {
 /// one line naming the file.
 #[test]
 fn a_missing_entry_file_exits_2_naming_it() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = run_with(&[QUERY, GONE], &api, &cache);
@@ -618,7 +689,7 @@ fn a_missing_entry_file_exits_2_naming_it() {
 /// environment is wrong has no reading list to parse.
 #[test]
 fn a_missing_api_key_exits_2_saying_so() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = command(&api, &cache)
@@ -640,10 +711,30 @@ fn a_missing_api_key_exits_2_saying_so() {
 /// message says both the value and the range it is outside of.
 #[test]
 fn an_out_of_range_threshold_exits_2() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = run_with(&[QUERY, ENTRY, "--threshold", "2"], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains("2 is not between 0 and 1"),
+        "the message should name the value and the range it is outside of: {error}"
+    );
+    assert_eq!(api.answered(), 0);
+}
+
+/// A section threshold outside 0 to 1 is no more meaningful than a scent
+/// outside it: the flag is rejected where it is parsed, naming the value and
+/// the range.
+#[test]
+fn an_out_of_range_section_threshold_exits_2() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--section-threshold", "2"], &api, &cache);
 
     assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
@@ -660,7 +751,7 @@ fn an_out_of_range_threshold_exits_2() {
 /// is built — the key is missing here and the arguments are what get reported.
 #[test]
 fn a_root_without_an_entry_file_exits_2_saying_so() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = command(&api, &cache)
@@ -685,7 +776,7 @@ fn a_root_without_an_entry_file_exits_2_saying_so() {
 /// an entry file, marked as a seed, beside the pages a link reached.
 #[test]
 fn seed_grep_reaches_a_page_no_link_points_to() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cold = Cache::new();
 
     let without = run_with(&[SEED_QUERY, SEED_ENTRY], &api, &cold);
@@ -736,7 +827,7 @@ fn seed_grep_reaches_a_page_no_link_points_to() {
 /// bought.
 #[test]
 fn a_seed_count_without_seed_grep_exits_2() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let output = run_with(&[SEED_QUERY, SEED_ENTRY, "--seed-count", "1"], &api, &cache);
@@ -754,7 +845,7 @@ fn a_seed_count_without_seed_grep_exits_2() {
 /// well.
 #[test]
 fn seed_count_says_how_many_hits_are_used() {
-    let api = FakeApi::new(3.0, 0.9);
+    let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
 
     let one = run_with(

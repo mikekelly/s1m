@@ -116,9 +116,30 @@ pub struct VisitedFile {
     /// file the caller named or along a link. A reached file with an empty
     /// `via` is always a seed or an entry file, and this is which.
     pub seeded: bool,
+    /// This file's heading sections, in the order the file has them, each with
+    /// the lines the parser gave it and the score the scorer gave it.
+    ///
+    /// In document order, not by score: the judgment pairs with the file the
+    /// way [`FileJudgment::sections`] does, and the reading list is what ranks
+    /// them.
+    pub sections: Vec<JudgedSection>,
     /// This file's outgoing links, in the order they appear, one per target,
     /// each with the scent it was judged at.
     pub links: Vec<JudgedLink>,
+}
+
+/// One heading section of a visited file, as it was judged.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JudgedSection {
+    /// Heading text, `None` for content before the first heading.
+    pub heading: Option<String>,
+    /// `[first, last]` line, inclusive, exactly as
+    /// [`crate::parse::Section::lines`] gave it: the range that was judged, not
+    /// one derived from the score.
+    pub lines: [usize; 2],
+    /// The score the scorer gave it, 0 to 1.
+    pub score: f64,
 }
 
 /// One outgoing link of a visited file.
@@ -397,6 +418,7 @@ impl<'a> Search<'a> {
             depth,
             via,
             seeded,
+            sections: judged_sections(&file, &judgment),
             links,
         });
     }
@@ -427,6 +449,26 @@ fn by_relevance(a: &VisitedFile, b: &VisitedFile) -> Ordering {
     b.relevance
         .total_cmp(&a.relevance)
         .then_with(|| a.path.cmp(&b.path))
+}
+
+/// A visited file's heading sections in the order the file has them: the
+/// parser's heading and lines, paired by index with the score the scorer gave
+/// that section.
+///
+/// The range is the parser's and never the judgment's, for the reason the links
+/// above are the file's: a range the scorer named would be a range the parser
+/// never produced, and what the caller reads has to be the text that was
+/// judged. Only sections the scorer answered for are reported.
+fn judged_sections(file: &ParsedFile, judgment: &FileJudgment) -> Vec<JudgedSection> {
+    file.sections
+        .iter()
+        .zip(&judgment.sections)
+        .map(|(section, judged)| JudgedSection {
+            heading: section.heading.clone(),
+            lines: section.lines,
+            score: judged.score,
+        })
+        .collect()
 }
 
 /// A visited file's outgoing links in the order they appear in the file, one

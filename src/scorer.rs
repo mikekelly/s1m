@@ -1,5 +1,6 @@
 //! The judgment interface the rest of s1m is built on: one parsed file in, a
-//! relevance score for the file and a scent for each of its outgoing links out.
+//! relevance score for the file, a score for each of its heading sections and a
+//! scent for each of its outgoing links out.
 //!
 //! The trait is deliberately narrow, and deliberately async. Ranking a file is
 //! a single model call, and traversal scores a whole frontier round at once, so
@@ -29,12 +30,36 @@ pub struct LinkJudgment {
     pub scent: f64,
 }
 
-/// What one file is worth, and what each of its links is worth.
+/// What one heading section is worth: whether its lines are worth reading for
+/// the query.
+///
+/// The range is [`crate::parse::Section::lines`] as the parser gave it — this
+/// type carries a judgment, never a re-derived range — so a section here and
+/// the section it judges always name the same lines.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SectionJudgment {
+    /// Heading text, `None` for content before the first heading, as the parser
+    /// spelled it.
+    pub heading: Option<String>,
+    /// `[first, last]` line, inclusive, 1-based, counted in the file as
+    /// written.
+    pub lines: [usize; 2],
+    /// The model's answer, 0 to 1: near 1 means the section is worth reading,
+    /// near 0.5 means the model is unsure rather than that the section is
+    /// middling, which is why callers threshold above 0.5.
+    pub score: f64,
+}
+
+/// What one file is worth: the file, its sections, and each of its links.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileJudgment {
     /// How useful the file is for the query, 0 to 1, where 1 means the file is
     /// central to it. Ordered, so it can rank a reading list directly.
     pub relevance: f64,
+    /// One entry per [`ParsedFile::sections`], in the same order — the parser's
+    /// document order, so a judgment pairs with the section it judges by index.
+    /// A parent section's range contains its subsections'.
+    pub sections: Vec<SectionJudgment>,
     /// One entry per [`ParsedFile::links`], in the same order.
     pub links: Vec<LinkJudgment>,
 }
@@ -116,9 +141,10 @@ pub enum ScorerError {
 pub trait Scorer: Send + Sync {
     /// Judges `file` as a source of material about `query`.
     ///
-    /// Implementations must return one [`LinkJudgment`] per
-    /// [`ParsedFile::links`] entry, in that order, so the caller can pair them
-    /// by index. `file.links` that point outside the root are still judged: the
-    /// caller decides whether to follow them.
+    /// Implementations must return one [`SectionJudgment`] per
+    /// [`ParsedFile::sections`] entry and one [`LinkJudgment`] per
+    /// [`ParsedFile::links`] entry, each in that order, so the caller can pair
+    /// them by index. `file.links` that point outside the root are still
+    /// judged: the caller decides whether to follow them.
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError>;
 }
