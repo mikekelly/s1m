@@ -1,0 +1,4 @@
+Reading list
+============
+
+Books are listed in the [ledger](ledger.md).
