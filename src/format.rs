@@ -150,21 +150,30 @@ fn tree(list: &ReadingList) -> String {
     roots.sort_by(|a, b| a.path.cmp(&b.path));
 
     for root in roots {
-        let entry = if root.seeded {
-            "keyword seed"
-        } else {
-            "entry file"
-        };
-        node(
-            &mut out,
-            root,
-            0,
-            &format!("{entry}; relevance {:.2}", root.relevance),
-            &index,
-        );
+        node(&mut out, root, 0, &root_line(root), &index);
     }
 
     out
+}
+
+/// What a root's line says about it: an entry file the caller named or a
+/// `--seed-grep` keyword seed, for the files no link reached.
+///
+/// A result whose `via` names a file this list does not have is a root too —
+/// [`parent`] has no link to nest it under — and saying it was an entry file
+/// would be a provenance it does not have. It gets the line [`md`] prints for
+/// the same file instead: the relevance, the scent of the link that reached it
+/// and the path it came along.
+fn root_line(root: &RankedFile) -> String {
+    if !root.via.is_empty() {
+        return reached(root);
+    }
+    let entry = if root.seeded {
+        "keyword seed"
+    } else {
+        "entry file"
+    };
+    format!("{entry}; relevance {:.2}", root.relevance)
 }
 
 /// One file's line, then the links it judged: a link this file followed to a
@@ -577,7 +586,9 @@ wiki/index.md  entry file; relevance 0.62
     /// `--seed-grep` hits, by path — the order the frontier holds them, all at
     /// path score 1. A result whose `via` names no visited file is printed as a
     /// root rather than dropped, which is what keeps the tree total for a
-    /// reading list a caller assembled itself.
+    /// reading list a caller assembled itself — and it keeps the `via` and the
+    /// scent it does have, the way `md` prints them, rather than claiming a
+    /// provenance it does not.
     #[test]
     fn tree_starts_from_every_file_no_link_reached() {
         let list = list(vec![
@@ -596,7 +607,7 @@ wiki/index.md  entry file; relevance 0.62
 settlement timing (useful-for); 3 files visited, 3 calls
 
 wiki/index.md  keyword seed; relevance 0.62
-wiki/notes/scratch.md  entry file; relevance 0.44
+wiki/notes/scratch.md  relevance 0.44; scent 0.90; via `wiki/absent.md`
   wiki/notes/ledger.md  pruned; scent 0.31
 wiki/payments/README.md  entry file; relevance 0.81
 "
