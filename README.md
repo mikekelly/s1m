@@ -8,18 +8,20 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: scaffold.** The CLI does not run a query yet; the budgets, the output formats and
-> the wiring that puts the cache and the walk behind one command are still to come. What
-> exists is the project skeleton from
-> [#3](https://github.com/mikekelly/s1m/issues/3), the parser from
-> [#4](https://github.com/mikekelly/s1m/issues/4) — `s1m::parse` turns one markdown file into
-> its title, frontmatter, heading sections with line ranges, and outgoing links — the Jev
-> judgment from [#5](https://github.com/mikekelly/s1m/issues/5) — `s1m::jev` scores one file
-> per request, returning a relevance score for the file and a scent for each of its links —
-> the cache from [#7](https://github.com/mikekelly/s1m/issues/7), which keeps those answers
-> on disk so a repeat run is identical and free — and the walk from
-> [#6](https://github.com/mikekelly/s1m/issues/6): `s1m::traverse` searches the link graph
-> best-first against an injected `s1m::scorer::Scorer`. The design lives in
+> **Status: milestone 1.** The CLI walks a real wiki: `s1m "<query>" <entry>...` returns the
+> plan's reading list as JSON, with the plan's flags, defaults and exit codes. What it builds on
+> is in place too — the parser from
+> [#4](https://github.com/mikekelly/s1m/issues/4) (`s1m::parse` turns one markdown file into its
+> title, frontmatter, heading sections with line ranges, and outgoing links), the Jev judgment
+> from [#5](https://github.com/mikekelly/s1m/issues/5) (`s1m::jev` scores one file per request,
+> returning a relevance score for the file and a scent for each of its links), the walk from
+> [#6](https://github.com/mikekelly/s1m/issues/6) (`s1m::traverse` searches the link graph
+> best-first against an injected `s1m::scorer::Scorer`) and the cache from
+> [#7](https://github.com/mikekelly/s1m/issues/7), which keeps those answers on disk so a repeat
+> run is identical and free. `s1m::cli` is the CLI's own half: the flags, the walk, the reading
+> list and the exit code, with the scorer injected so tests run it without a key or a network.
+> Section line ranges are [#9](https://github.com/mikekelly/s1m/issues/9); `--mode`, `--criteria`,
+> `--seed-grep` and the `md` and `tree` formats are later. The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
@@ -42,41 +44,118 @@ cargo build --release     # target/release/s1m
 ## Use
 
 ```bash
-cargo run -- --help
+cargo build --release     # target/release/s1m
+
+s1m "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
 ```
 
-The stub implements `-h`/`--help` and `-V`/`--version` only: usage or version on stdout, exit 0.
-No arguments, an unknown flag or one of the planned flags prints usage on stderr and exits 2 —
-running `s1m` with no arguments is missing its query and entry files, not a reading list.
+A query and one or more entry files. The reading list goes to stdout as JSON: the query, the
+criterion the answers were judged against, how many files were visited and how many calls that
+cost, then one entry per visited file, most relevant first and ties broken by path. Each entry
+carries the relevance the model gave it, the scent of the link that reached it, the path that
+got there, and its outgoing links as they were judged — `followed` says whether a link queued
+its target, so the caller can see what was passed over and why. `scent` is `null` for an entry
+file, which no link reached, and a link whose target resolves outside `--root` is never
+followed, whatever its scent. Line ranges and per-section scores are
+[#9](https://github.com/mikekelly/s1m/issues/9).
 
-One hidden command works, and it is the spike's debug view rather than the interface:
+Every path is spelled the way the entry files were given: `--root wiki` with `wiki/index.md`
+gives `wiki/payments/cutoffs.md`, not `payments/cutoffs.md`, and those are the paths a caller
+hands back to its editor. An absolute `--root` gives absolute paths.
+
+This is a real run, first result and all (the other two results are elided, and the numbers are
+what a cold run costs — the same query again is answered from the cache and reports
+`"calls": 0`):
+
+```json
+{
+  "query": "how do I cut a release and publish the package",
+  "mode": "useful-for",
+  "visited": 3,
+  "calls": 3,
+  "results": [
+    {
+      "path": "eval/wikis/llm-wiki-manager/wiki/concepts/release.md",
+      "relevance": 0.8133333333333334,
+      "scent": 0.87,
+      "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
+      "links": [
+        {
+          "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
+          "scent": 0.38,
+          "followed": false
+        },
+        {
+          "target": "eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md",
+          "scent": 0.17,
+          "followed": false
+        },
+        {
+          "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
+          "scent": 0.15,
+          "followed": false
+        }
+      ]
+    }
+  ]
+}
+```
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--max-files` | 25 | Files visited before the walk stops |
+| `--max-depth` | 6 | Link hops from an entry file |
+| `--threshold` | 0.6 | Least link scent that queues a target, 0 to 1 |
+| `--fanout` | 8 | Frontier files expanded per round |
+| `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
+| `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
+| `--format` | `json` | Only `json` exists so far; any other value exits 2 |
+
+Not implemented yet: `--mode`, `--criteria`, `--seed-grep`, and the `md` and `tree` formats.
+
+Exit codes:
+
+| Code | Meaning |
+| --- | --- |
+| 0 | The walk reached files beyond the entry files |
+| 1 | Nothing cleared the threshold: the model judged the entry files' links and none passed, so the list is the entry files and nothing more. The JSON is still on stdout, and one line on stderr says so |
+| 2 | Error: bad flags, a blank query, no entry file, an entry file that cannot be read, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
+
+A file the walk *reached* but could not read is neither an error nor a silent omission: a link
+to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
+walk carries on. A *judgment* that fails is an error, because a reading list with a hole in its
+ranking is a different answer.
+
+### Environment
+
+| Variable | Meaning |
+| --- | --- |
+| `TYPESAFE_API_KEY` | Required. The key the scoring calls are made with; without it s1m exits 2 saying so |
+| `S1M_CACHE_DIR` | Where stored answers live, else `$XDG_CACHE_HOME/s1m`, else `~/.cache/s1m` |
+| `S1M_ENDPOINT` | Ask this endpoint instead of `https://api.typesafe.ai/v1/systemone` — a proxy, or a test's fake server. It is part of the cache key, so one endpoint's answers are never served for another's |
+
+### Debug view of one file
+
+`s1m score-file <query> <file>` is hidden, and it is the spike's debug view rather than the
+interface. It parses one file, sends one Jev request, and prints the file's relevance, the
+call's model, token count, latency and cost, then one row per link, best scent first.
 
 ```bash
-cargo run -- score-file "how do I cut a release and publish the package" \
+s1m score-file "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
-cargo run -- score-file --no-previews "how does s1m decide which links to follow" \
+s1m score-file --no-previews "how does s1m decide which links to follow" \
   docs/initial-plan.md
 ```
 
-It parses one file, sends one Jev request, and prints the file's relevance, the call's model,
-token count, latency and cost, then one row per link, best scent first. `--root DIR` sets the
-directory links resolve against (the file's own directory by default). It needs
-`TYPESAFE_API_KEY` and exits 2, with the reason on stderr, when the key is missing or the API
-refuses the request.
+`--root DIR` sets the directory links resolve against (the file's own directory by default), and
+`--no-previews` leaves the target's title, frontmatter and first paragraph out of the request,
+which is the control case for whether a preview earns its tokens.
 
 Answers are cached (see [Cache](#cache)), so it also prints `cache hit`, `miss` or `off` with
 the directory the entries are in, and `files` and `calls` on separate lines — one file scored,
 and how many real API calls that took, which is zero on a hit. `--no-cache` calls Jev even for
 a request already answered, which is what the spike's numbers come from.
-
-The plan's interface, once implemented:
-
-```bash
-s1m "how do we handle settlement timing for instant payouts" wiki/index.md
-s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md
-```
-
-Exit codes: `0` reading list returned, `1` nothing cleared the threshold, `2` error.
 
 ## Cache
 
@@ -84,6 +163,13 @@ Jev is stable but not bit-for-bit deterministic: the same request sent three tim
 same top links and moved the numbers underneath them
 ([docs/spike-notes.md](docs/spike-notes.md)). Repeat runs are therefore identical — and close to
 free — only because s1m keeps the answers.
+
+That is where the reading list's `calls` comes from. It counts what the API was asked, not what
+the walk visited: a cold run over three files reports `3`, the same run again reports `0` with
+`visited` unchanged, and `--no-cache` reports a call per file every time. Two runs that read the
+same stored answers are byte-identical, and a warm run differs from the cold one that filled the
+cache in `calls` alone. Two `--no-cache` runs of one query keep the same ranking and move the
+numbers underneath it, which is the difference the cache exists to remove.
 
 An answer is cached under a SHA-256 of the request that produced it: the endpoint, the model,
 the query, the mode's questions and criteria, the file's path, title and content, and each
@@ -120,6 +206,10 @@ the CLI, so they can be driven directly from tests:
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused(judgment)`, and `calls()` and `hits()` count what reached the API and what came off the disk |
 | `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
+| `cli::Options` | One run's flags — the query, the entry files, the root and the budgets — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
+| `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
+| `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
+| `cli::ReadingList` | The plan's JSON shape, `exit_code()` for the 0/1 decision, and `to_json()` for stdout |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
@@ -128,16 +218,20 @@ followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wik
 
 Traversal takes its `entries` against the same base as `parse`, and every path it returns —
 `path`, `via` and link targets — is spelled relative to `root`, so `root.join(path)` is the
-file to read. The walk is async because the scorer is: a round joins one future per file, and
-the caller brings the runtime. Ties on path score are broken by path, the round's answers are
-collected in the order they were asked for however they come back, and the reading list is
-sorted by relevance: the same query on the same files gives the same result, whatever the
-answers' latency. A file that cannot be parsed or scored is reported in `failed` and does not
-end the walk.
+file to read. `cli::run` joins the root back on, which is why the reading list spells paths the
+way the entry files were given. The walk is async because the scorer is: a round joins one
+future per file, and the caller brings the runtime. Ties on path score are broken by path, the
+round's answers are collected in the order they were asked for however they come back, and the
+reading list is sorted by relevance: the same query on the same files gives the same result,
+whatever the answers' latency. A file that cannot be parsed or scored is reported in `failed`
+and does not end the walk.
 
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
-`tests/traverse.rs` walks it with a fake scorer.
+`tests/traverse.rs` walks it with a fake scorer. `tests/fixtures/cli/` is a three-page chain
+with a broken link beside it, which `tests/cli.rs` runs the binary over: the API is a loopback
+server the test answers itself, pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON on
+stdout and the cache behaviour are checked end to end without a key or a network.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
 `docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it
@@ -148,7 +242,7 @@ still judged, from the text the caller wrote about it.
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit, parser, cache, Jev client, traversal and CLI tests; the live tests skip without `TYPESAFE_API_KEY` |
+| `cargo test` | Unit, parser, cache, Jev client, traversal and CLI tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
@@ -156,8 +250,9 @@ still judged, from the text the caller wrote about it.
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and
 `cargo build` on the stable toolchain, then a smoke test on the built binary: `--help` prints
 usage, no arguments exits 2 with usage on stderr, an unknown flag exits 2
-([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the same binary,
-so the usage text, the streams and the exit codes above are what CI exercises.
+([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the same binary
+and covers the rest of the interface: the exit codes, the JSON on stdout, the streams, and a
+run whose API is a loopback server the test answers.
 
 `tests/jev_live.rs` is the only test that leaves the machine. It calls the real API for
 `TYPESAFE_API_KEY`, and skips itself when the variable is unset, so CI stays offline and free;

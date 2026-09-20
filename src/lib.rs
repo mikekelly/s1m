@@ -5,6 +5,7 @@
 //! any of it.
 
 pub mod cache;
+pub mod cli;
 pub mod jev;
 pub mod parse;
 pub mod scorer;
