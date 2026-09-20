@@ -19,7 +19,8 @@
 //!
 //! Scents are probabilities, so a path score never rises along a path. That is
 //! what makes the first pop of a file its best path, and what lets a file that
-//! has been visited stay settled rather than be re-opened.
+//! has been visited stay settled rather than be re-opened. A scent outside 0 to
+//! 1 is not followed: scoring junk is not allowed to break that ordering.
 //!
 //! Every path in the result — `path`, `via`, link targets — is spelled the way
 //! [`parse`] spells link targets: normalised and relative to the root, so
@@ -154,7 +155,7 @@ pub fn traverse(config: &Config<'_>, scorer: &dyn Scorer) -> Result<Traversal, T
 }
 
 /// The frontier: a file to visit, with the best path found to it so far.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Frontier {
     path: PathBuf,
     score: f64,
@@ -192,9 +193,9 @@ struct Search<'a> {
     config: &'a Config<'a>,
     scorer: &'a dyn Scorer,
     frontier: BinaryHeap<Frontier>,
-    /// Best path score found for each file, so a worse path never queues and a
-    /// file's record keeps its best path.
-    best: HashMap<PathBuf, f64>,
+    /// Best path found for each file, so a worse path never queues and a file
+    /// keeps the best path it was reached by.
+    best: HashMap<PathBuf, Frontier>,
     /// Files already dealt with — visited, or failed and not retried.
     settled: HashSet<PathBuf>,
     results: Vec<VisitedFile>,
@@ -284,7 +285,7 @@ impl<'a> Search<'a> {
             if self
                 .best
                 .get(&entry.path)
-                .is_some_and(|best| *best > entry.score)
+                .is_some_and(|best| best.score > entry.score)
             {
                 continue;
             }
@@ -326,34 +327,34 @@ impl<'a> Search<'a> {
     /// Records one answered file and queues its links.
     fn record(&mut self, entry: Frontier, outcome: Result<(ParsedFile, FileJudgment), Failure>) {
         self.settled.insert(entry.path.clone());
-        let (file, judgment) = match outcome {
-            Ok(answered) => answered,
-            Err(failure) => {
-                self.failed.push(FailedFile {
-                    path: entry.path,
-                    failure,
-                });
-                return;
-            }
-        };
-
+        // The record and the expansion use the best path found to the file, not
+        // the one it was popped at: an earlier file of this round can have
+        // queued a better path to it while the round was being recorded.
         let Frontier {
             path,
             score,
             depth,
             scent,
             via,
-        } = entry;
+        } = self.best.remove(&entry.path).unwrap_or(entry);
+        let (file, judgment) = match outcome {
+            Ok(answered) => answered,
+            Err(failure) => {
+                self.failed.push(FailedFile { path, failure });
+                return;
+            }
+        };
+
         let mut links = judged_links(&file, &judgment);
         for link in &mut links {
             // A link the scorer named no scent for, a scent that is not a
-            // usable number, one below the threshold, one out of the root or
-            // one past the depth budget all queue nothing.
+            // probability, one below the threshold, one out of the root or one
+            // past the depth budget all queue nothing.
             let Some(link_scent) = link.scent else {
                 continue;
             };
             if !link.in_root
-                || !link_scent.is_finite()
+                || !(0.0..=1.0).contains(&link_scent)
                 || link_scent < self.config.threshold
                 || depth + 1 > self.config.max_depth
             {
@@ -391,11 +392,11 @@ impl<'a> Search<'a> {
         if self
             .best
             .get(&entry.path)
-            .is_some_and(|best| *best >= entry.score)
+            .is_some_and(|best| best.score >= entry.score)
         {
             return false;
         }
-        self.best.insert(entry.path.clone(), entry.score);
+        self.best.insert(entry.path.clone(), entry.clone());
         self.frontier.push(entry);
         true
     }

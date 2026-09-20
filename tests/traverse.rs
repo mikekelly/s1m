@@ -439,22 +439,79 @@ fn links_below_the_threshold_are_not_followed() {
 }
 
 #[test]
-fn a_scent_that_is_not_a_usable_number_is_not_followed() {
+fn a_scent_that_is_not_a_probability_is_not_followed() {
     let scorer = Fake::new(&[
         (
             "index.md",
-            Entry::new(0.9, &[("payments/README.md", f64::NAN)]),
+            Entry::new(
+                0.9,
+                &[("payments/README.md", f64::NAN), ("notes/ledger.md", 1.5)],
+            ),
         ),
         ("payments/README.md", Entry::new(1.0, &[])),
+        ("notes/ledger.md", Entry::new(1.0, &[])),
     ]);
 
     let found = Settings::new(&["index.md"]).run(&scorer);
 
-    // Not above the threshold, and not given a priority that would put it
-    // first: the link is reported and the walk stays where it was.
+    // Neither is above the threshold, and neither is given a priority that
+    // would put it first: both links are reported and the walk stays where it
+    // was.
     assert_eq!(paths(&found), ["index.md"]);
     assert_eq!(scorer.called(), ["index.md"]);
     assert!(!followed(visited(&found, "index.md"), "payments/README.md"));
+    assert!(!followed(visited(&found, "index.md"), "notes/ledger.md"));
+}
+
+#[test]
+fn a_file_keeps_the_best_path_found_by_a_file_of_its_own_round() {
+    // The index queues the cutoffs page at 0.25, then the README — popped
+    // first, so recorded first — finds a better path to it at 0.375. The
+    // cutoffs page is popped in the same round as the README, so the round's
+    // order must not decide which path it keeps.
+    let table: &[(&str, Entry)] = &[
+        (
+            "index.md",
+            Entry::new(
+                0.4,
+                &[("payments/README.md", 0.5), ("payments/cutoffs.md", 0.25)],
+            ),
+        ),
+        (
+            "payments/README.md",
+            Entry::new(0.6, &[("payments/cutoffs.md", 0.75)]),
+        ),
+        ("payments/cutoffs.md", Entry::new(0.7, &[])),
+    ];
+
+    let scorer = Fake::new(table);
+    let together = Settings::new(&["index.md"])
+        .threshold(0.2)
+        .fanout(2)
+        .run(&scorer);
+    let scorer = Fake::new(table);
+    let one_at_a_time = Settings::new(&["index.md"])
+        .threshold(0.2)
+        .fanout(1)
+        .run(&scorer);
+
+    let cutoffs = visited(&together, "payments/cutoffs.md");
+    assert_eq!(cutoffs.path_score, 0.375);
+    assert_eq!(cutoffs.depth, 2);
+    assert_eq!(cutoffs.scent, Some(0.75));
+    assert_eq!(
+        cutoffs.via,
+        [
+            PathBuf::from("index.md"),
+            PathBuf::from("payments/README.md")
+        ]
+    );
+    // Fanout is latency only: one round or two, the same records come back.
+    assert_eq!(paths(&together), paths(&one_at_a_time));
+    assert_eq!(
+        visited(&one_at_a_time, "payments/cutoffs.md").path_score,
+        0.375
+    );
 }
 
 #[test]
