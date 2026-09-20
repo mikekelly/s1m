@@ -307,13 +307,18 @@ async fn a_second_identical_run_is_answered_from_the_cache() {
         "the first run has to call"
     );
     assert!(
-        matches!(second, Scored::Reused(_)),
+        matches!(second, Scored::Reused { .. }),
         "the second run must not"
     );
     assert_eq!(
         first.judgment(),
         second.judgment(),
         "the answer is the same, bit for bit"
+    );
+    assert_eq!(
+        first.detail(),
+        second.detail(),
+        "and so is what the call that produced it cost"
     );
     assert_eq!(cached.calls(), 1, "one call for two runs");
     assert_eq!(cached.hits(), 1);

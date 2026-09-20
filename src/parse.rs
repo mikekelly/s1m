@@ -683,12 +683,13 @@ fn destination(dest: &str) -> Option<&Path> {
 
 /// Every `.md`/`.txt` file under the root, relative to it and sorted.
 ///
-/// The pages a root holds, which is what both name lookup and keyword seeding
-/// need. Hidden directories are not descended, unreadable directories and
+/// The pages a root holds, which is what name lookup and keyword seeding need,
+/// and what the evaluation harness counts a whole corpus in.
+/// Hidden directories are not descended, unreadable directories and
 /// entries whose kind cannot be read are skipped, and a directory reached
 /// through a symlink is not a directory here — the kind is read without
 /// following the link — so the listing never loops.
-pub(crate) fn pages(root: &Path) -> Vec<PathBuf> {
+pub fn pages(root: &Path) -> Vec<PathBuf> {
     let mut pages = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {

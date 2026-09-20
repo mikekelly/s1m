@@ -8,7 +8,7 @@ reading list with paths, line ranges and scores. The alternatives each miss some
 matches wording and ignores the link structure, embedding search needs an index kept in sync,
 and letting the agent browse burns context on what is a string of quick relevance calls.
 
-> **Status: milestone 2, underway.** The CLI walks a real wiki: `s1m "<query>" <entry>...`
+> **Status: milestones 2 and 3.** The CLI walks a real wiki: `s1m "<query>" <entry>...`
 > returns the plan's reading list as JSON — every result carrying the line ranges worth reading —
 > with the plan's flags, defaults and exit codes, and `--mode` / `--criteria` pick what relevance
 > means. What it builds on is in place too — the parser from
@@ -31,7 +31,9 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > pages under the root and put on the frontier as extra entry files, so a page nothing links to
 > is still reached. `--format` prints that reading list as the JSON above, as `md` — the same
 > list to read or paste — or as `tree`, the walk's annotated link tree
-> ([#13](https://github.com/mikekelly/s1m/issues/13)). The design lives in
+> ([#13](https://github.com/mikekelly/s1m/issues/13)). Milestone 3's numbers are in
+> [`eval/REPORT.md`](eval/REPORT.md), which `cargo run --release --bin eval` reproduced on a
+> vendored wiki and reruns on any other. The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
@@ -399,7 +401,9 @@ the query, the mode's questions and criteria (so a second run under `--mode` or 
 a different question and is bought), the file's path, title and content, each section's heading,
 depth and lines, and each link's target, anchor, sentence, heading and preview. Change any of
 those and it is a different question; a second identical run makes no API call at all. An entry
-is one file's judgment, whether the API needed one request or several for it — and the
+is one file's judgment, and what that judgment cost when it was bought — the model, the request
+count, the tokens and the latency — so a run whose answers all came off the disk can still say
+what they cost, which is what [`eval/REPORT.md`](eval/REPORT.md) does. The
 thresholds are the caller's, applied to the answers, so changing `--threshold` or
 `--section-threshold` between runs buys nothing.
 
@@ -419,6 +423,35 @@ per section and a scent per link, so a few kilobytes for a link-heavy page and a
 megabytes for a few thousand of them. Delete the directory to reclaim the space, or point
 `S1M_CACHE_DIR` at a scratch directory per run.
 
+## Evaluation
+
+What the ranking is worth, measured rather than asserted: [`eval/REPORT.md`](eval/REPORT.md) is
+what s1m found and what it cost over 20 labelled queries on the vendored
+[`llm-wiki-manager`](eval/wikis/llm-wiki-manager/SOURCE.md) vault, with the gold set in
+[`eval/gold/llm-wiki-manager.json`](eval/gold/llm-wiki-manager.json).
+
+```bash
+cargo run --release --bin eval -- \
+  --wiki eval/wikis/llm-wiki-manager/wiki \
+  --gold eval/gold/llm-wiki-manager.json \
+  --cache eval/cache \
+  --out eval/REPORT.md
+```
+
+The harness walks each query at `--max-files` 10 and 25 and reports, per query and in total:
+recall and precision against the gold set, the tokens an agent would read (the returned ranges,
+the same files whole, and the whole corpus), what the API was asked and what it cost, the same
+numbers for the keyword ranker `--seed-grep` uses, the same again with seeding on, the
+calibration curve of a link's scent against what following it reached, a `--threshold` sweep,
+and the preview experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred —
+previews off, previews without frontmatter, previews as they ship.
+
+Nothing about a wiki or a gold set is in the harness: both are paths, so the same command
+measures a private wiki, and the gold set's paths are relative to `--wiki`. The report is
+reproducible rather than merely repeated — a cache entry stores what its call cost, and no
+number in the report is a wall clock — so with `eval/cache` committed the command above prints
+the same bytes with no key at all, and `--no-cache` with a key buys every judgment again.
+
 ## Library
 
 The parser and the Jev judgment later stages build on live in `src/` and are reachable without
@@ -429,10 +462,10 @@ the CLI, so they can be driven directly from tests:
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1), one `SectionJudgment` (`heading`, `lines` as the parser gave them, `score` 0 to 1) per section and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, each in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
-| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's sections and links would not fit the API's 32k state budget in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews; `judge` also returns the model, token counts, request count and latency of the call |
+| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's sections and links would not fit the API's 32k state budget in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
-| `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request |
-| `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused(judgment)`, and `calls()` and `hits()` count what reached the API and what came off the disk |
+| `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
+| `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
 | `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, whether they were a keyword seed, their sections (the parser's ranges, in document order) and the outgoing links it judged |
 | `seed::seed(root, query, count, skip)` | In-process keyword match, no ripgrep: the best `count` pages under `root` for `query`'s keywords, spelled the way `traverse` wants its entry files, with `skip` — the caller's entry files — left out. Whole words of three characters or more, ranked by terms matched, then hits, then path |
 | `cli::Options` | One run's flags — the query, the entry files, the root, the budgets and how many keyword hits to seed — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
@@ -472,7 +505,9 @@ the chain it links to, a page in a hidden directory, and a page nothing links to
 `src/seed.rs` measures the keyword match against and `tests/cli.rs` walks both ways.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
-`docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it
+`docs/spike-notes.md` was measured on. `eval/gold/` labels it for the evaluation harness, and
+`eval/cache/` holds the answers [`eval/REPORT.md`](eval/REPORT.md) was written from, which is
+what lets that report be checked without a key. `src/jev.rs` tags each answer with the question id it
 came back under, so answers land on their own section and their own link; a link whose target
 cannot be read is still judged, from the text the caller wrote about it, and a section of a file
 long enough to be truncated is judged from its heading and lines, the same way.
@@ -481,7 +516,12 @@ long enough to be truncated is judged from its heading and lines, the same way.
 
 | Command | What it does |
 | --- | --- |
+<<<<<<< HEAD
 | `cargo test` | Unit, parser, cache, Jev client, traversal, format and CLI tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
+=======
+| `cargo test` | Unit, parser, cache, Jev client, traversal, CLI and eval-harness tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
+| `cargo run --release --bin eval -- --wiki <dir> --gold <file>` | The evaluation harness: see [Evaluation](#evaluation), and [`eval/REPORT.md`](eval/REPORT.md) for what it last said |
+>>>>>>> bb11bc7 (Evaluation: gold set and eval harness on a real wiki (#11))
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |

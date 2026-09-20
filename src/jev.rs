@@ -347,7 +347,12 @@ struct LinkState {
 #[derive(Debug, Clone, Serialize)]
 struct PreviewState {
     title: String,
-    frontmatter: Vec<FrontmatterField>,
+    /// `None` when the run leaves the frontmatter out
+    /// ([`JevScorer::with_preview_frontmatter`]), and when the target has none:
+    /// both mean the model is shown no frontmatter, so the state carries no
+    /// key for it either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frontmatter: Option<Vec<FrontmatterField>>,
     first_paragraph: Option<String>,
 }
 
@@ -533,7 +538,11 @@ impl Answer {
 
 /// What one call cost, and which model answered it. Not part of the [`Scorer`]
 /// contract: this is the accounting the spike notes and `s1m score-file` need.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize`/`Deserialize` are for the cache, which stores it with the answer
+/// it came with ([`crate::cache`]): a run whose answers were all bought earlier
+/// can still say what they cost.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JevDetail {
     /// The versioned model that answered, as the API reported it.
     pub model: String,
@@ -577,6 +586,7 @@ pub struct JevScorer {
     root: PathBuf,
     mode: Mode,
     previews: bool,
+    preview_frontmatter: bool,
 }
 
 impl JevScorer {
@@ -593,6 +603,7 @@ impl JevScorer {
             root: root.into(),
             mode: USEFUL_FOR.clone(),
             previews: true,
+            preview_frontmatter: true,
         })
     }
 
@@ -619,6 +630,23 @@ impl JevScorer {
     /// the request rather than a caller's choice. See `docs/spike-notes.md`.
     pub fn with_previews(mut self, previews: bool) -> Self {
         self.previews = previews;
+        self
+    }
+
+    /// Sends each target's frontmatter with its preview, or leaves it out.
+    ///
+    /// On by default, and the query path never turns it off. Off is the
+    /// experiment [#10] deferred: the frontmatter is the part of a preview most
+    /// likely to mislead — `related:` and `tags` make every page look connected
+    /// to every other — and the spike varied the whole preview as one knob, so
+    /// it could not say which part did the work. The evaluation harness runs
+    /// both ways and reports what it found ([#11]); this is that knob, not a
+    /// caller's choice.
+    ///
+    /// [#10]: https://github.com/mikekelly/s1m/issues/10
+    /// [#11]: https://github.com/mikekelly/s1m/issues/11
+    pub fn with_preview_frontmatter(mut self, frontmatter: bool) -> Self {
+        self.preview_frontmatter = frontmatter;
         self
     }
 
@@ -1033,7 +1061,9 @@ impl JevScorer {
     /// Nothing when previews are off, when the link leaves the root — that
     /// content is outside what the caller asked s1m to look at — or when the
     /// target cannot be read, which is the normal state of a broken link. Those
-    /// links are still judged, from their anchor, sentence and heading.
+    /// links are still judged, from their anchor, sentence and heading. The
+    /// frontmatter is the one part that can be dropped on its own
+    /// ([`JevScorer::with_preview_frontmatter`]).
     fn preview(&self, link: &Link) -> Option<PreviewState> {
         if !self.previews || !link.in_root {
             return None;
@@ -1041,7 +1071,10 @@ impl JevScorer {
         let preview = parse::preview(self.root.join(&link.target)).ok()?;
         Some(PreviewState {
             title: preview.title,
-            frontmatter: preview.frontmatter,
+            frontmatter: self
+                .preview_frontmatter
+                .then_some(preview.frontmatter)
+                .filter(|frontmatter| !frontmatter.is_empty()),
             first_paragraph: preview
                 .first_paragraph
                 .map(|paragraph| clamp(&paragraph, PREVIEW_LIMIT)),
@@ -1925,6 +1958,40 @@ mod tests {
         assert_eq!(links[0]["anchor"], "payments");
         assert!(links[0]["sentence"].is_string());
         assert!(requests[0]["questions"].get("link_7").is_some());
+    }
+
+    /// The experiment #10 deferred: the frontmatter is the one part of a
+    /// preview that can be dropped on its own. The title and the first
+    /// paragraph are still there, so the link is judged on the same text minus
+    /// the part most likely to be about the wiki's plumbing rather than the
+    /// subject.
+    #[tokio::test]
+    async fn previews_can_carry_no_frontmatter() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_preview_frontmatter(false)
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        let links = requests[0]["state"]["links"]
+            .as_array()
+            .expect("a link array");
+        assert!(
+            links
+                .iter()
+                .all(|link| link["target_preview"].get("frontmatter").is_none()),
+            "no link's preview carries frontmatter"
+        );
+        assert_eq!(
+            links[2]["target_preview"]["title"],
+            "Instant payout settlement"
+        );
+        assert!(
+            links[2]["target_preview"]["first_paragraph"].is_string(),
+            "the paragraph is still read: only the frontmatter is dropped"
+        );
     }
 
     #[tokio::test]

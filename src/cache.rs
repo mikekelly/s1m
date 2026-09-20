@@ -17,6 +17,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -33,10 +34,12 @@ const ENTRIES: &str = "judgments";
 
 /// The shape of a stored entry. An entry written by another format is a miss
 /// rather than a wrong answer, which is what makes it safe to change
-/// [`FileJudgment`] later. 2 is the shape with section scores in it
-/// ([#9](https://github.com/mikekelly/s1m/issues/9)); 1 had the file and its
-/// links only, and an entry of that shape cannot answer for a file's sections.
-const FORMAT: u32 = 2;
+/// [`FileJudgment`] later. 3 is the shape that also stores what the call cost
+/// ([#11](https://github.com/mikekelly/s1m/issues/11)); 2 is the shape with
+/// section scores in it ([#9](https://github.com/mikekelly/s1m/issues/9)); 1 had
+/// the file and its links only, and an entry of that shape cannot answer for a
+/// file's sections.
+const FORMAT: u32 = 3;
 
 // ------------------------------------------------------------------ caching
 
@@ -53,8 +56,10 @@ pub trait Cacheable: Scorer {
     type Request: Send;
 
     /// What a real call cost. [`Scorer::score`] drops this; the cache keeps it
-    /// for callers that report on what they spent, as `s1m score-file` does.
-    type Detail: Send + Sync;
+    /// for callers that report on what they spent, as `s1m score-file` does —
+    /// and, stored beside the answer, for a caller that reports on a run whose
+    /// answers were bought earlier, as `src/bin/eval.rs` does.
+    type Detail: Send + Sync + Serialize + DeserializeOwned;
 
     /// Builds the request for one file: the query, the file and its links.
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Self::Request, ScorerError>;
@@ -73,10 +78,17 @@ pub trait Cacheable: Scorer {
 }
 
 /// One file's answer, and whether the API was called for it.
+///
+/// Both sides carry the accounting, so that a caller reporting on a run — what
+/// a query cost, what it took — reads the same numbers whether the answers came
+/// off the disk or were bought just now. What separates the two is whether a
+/// call was made, which is what [`CachedScorer::calls`] counts and what
+/// `s1m score-file` reports as a hit or a miss.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scored<D> {
-    /// The answer was on disk: no call, so no tokens, latency or cost.
-    Reused(FileJudgment),
+    /// The answer was on disk: no call was made, and `detail` is what the call
+    /// that stored it cost at the time.
+    Reused { judgment: FileJudgment, detail: D },
     /// The answer came from a call made now, which cost `detail`.
     Called { judgment: FileJudgment, detail: D },
 }
@@ -85,23 +97,42 @@ impl<D> Scored<D> {
     /// The judgment, whichever side it came from.
     pub fn judgment(&self) -> &FileJudgment {
         match self {
-            Scored::Reused(judgment) | Scored::Called { judgment, .. } => judgment,
+            Scored::Reused { judgment, .. } | Scored::Called { judgment, .. } => judgment,
         }
+    }
+
+    /// The accounting that came with the judgment: what this answer cost, when
+    /// it was bought.
+    pub fn detail(&self) -> &D {
+        match self {
+            Scored::Reused { detail, .. } | Scored::Called { detail, .. } => detail,
+        }
+    }
+
+    /// Whether the API was called for this answer.
+    pub fn called(&self) -> bool {
+        matches!(self, Scored::Called { .. })
     }
 
     /// The judgment, leaving the accounting behind.
     pub fn into_judgment(self) -> FileJudgment {
         match self {
-            Scored::Reused(judgment) | Scored::Called { judgment, .. } => judgment,
+            Scored::Reused { judgment, .. } | Scored::Called { judgment, .. } => judgment,
         }
     }
 }
 
 /// One stored answer, in the shape it is written in.
+///
+/// `detail` is what the call that produced `judgment` cost. It is stored, not
+/// derived, because it cannot be derived: it is what the API reported, and a
+/// caller that reports on a run of stored answers would otherwise have nothing
+/// to report.
 #[derive(Debug, Serialize, Deserialize)]
-struct Entry {
+struct Entry<D> {
     format: u32,
     judgment: FileJudgment,
+    detail: D,
 }
 
 /// Wraps a scorer, keeping its answers in files under a cache directory.
@@ -172,8 +203,8 @@ impl<S: Cacheable> CachedScorer<S> {
     }
 
     /// Judges one file, reusing the answer to a request that has been made
-    /// before. [`Scorer::score`] with where the answer came from, and — on a
-    /// call — what it cost.
+    /// before. [`Scorer::score`] with where the answer came from, and what it
+    /// cost — now, or when it was bought.
     pub async fn judge(
         &self,
         query: &str,
@@ -182,14 +213,14 @@ impl<S: Cacheable> CachedScorer<S> {
         let request = self.inner.request(query, file)?;
         let key = self.key(&request)?;
 
-        if let Some(judgment) = self.load(&key) {
+        if let Some((judgment, detail)) = self.load(&key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
-            return Ok(Scored::Reused(judgment));
+            return Ok(Scored::Reused { judgment, detail });
         }
 
         let (judgment, detail) = self.inner.call(&request, file).await?;
         self.calls.fetch_add(1, Ordering::Relaxed);
-        self.store(&key, &judgment);
+        self.store(&key, &judgment, &detail);
         Ok(Scored::Called { judgment, detail })
     }
 
@@ -201,19 +232,20 @@ impl<S: Cacheable> CachedScorer<S> {
     /// The stored answer for `key`, or `None` for anything this version cannot
     /// read: no entry, an unreadable one, a truncated one, one from another
     /// format.
-    fn load(&self, key: &str) -> Option<FileJudgment> {
+    fn load(&self, key: &str) -> Option<(FileJudgment, S::Detail)> {
         let bytes = fs::read(self.entry(key)).ok()?;
-        let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-        (entry.format == FORMAT).then_some(entry.judgment)
+        let entry: Entry<S::Detail> = serde_json::from_slice(&bytes).ok()?;
+        (entry.format == FORMAT).then_some((entry.judgment, entry.detail))
     }
 
-    /// Stores one answer, and says nothing when it cannot: two tasks racing the
-    /// same miss both write, one wins, and a half-written entry is recomputed
-    /// rather than read.
-    fn store(&self, key: &str, judgment: &FileJudgment) {
+    /// Stores one answer and what it cost, and says nothing when it cannot: two
+    /// tasks racing the same miss both write, one wins, and a half-written entry
+    /// is recomputed rather than read.
+    fn store(&self, key: &str, judgment: &FileJudgment, detail: &S::Detail) {
         let entry = Entry {
             format: FORMAT,
             judgment: judgment.clone(),
+            detail,
         };
         if let Ok(bytes) = serde_json::to_vec(&entry) {
             let _ = fs::write(self.entry(key), bytes);
@@ -325,7 +357,11 @@ mod tests {
     #[async_trait]
     impl Cacheable for Fake {
         type Request = String;
-        type Detail = ();
+        /// What a call cost, in the accounting the tests can check is carried
+        /// through the cache: a real scorer reports what the API charged, and
+        /// the fake reports the length of the request it answered, which is
+        /// predictable from the same bytes the key is made of.
+        type Detail = u64;
 
         fn request(&self, query: &str, file: &ParsedFile) -> Result<String, ScorerError> {
             let content = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
@@ -343,9 +379,9 @@ mod tests {
             &self,
             request: &String,
             _file: &ParsedFile,
-        ) -> Result<(FileJudgment, ()), ScorerError> {
+        ) -> Result<(FileJudgment, u64), ScorerError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            Ok((answer(request), ()))
+            Ok((answer(request), request.len() as u64))
         }
     }
 
@@ -360,6 +396,10 @@ mod tests {
     // ------------------------------------------------------------ the tests
 
     /// The acceptance criterion: a second identical run makes no call.
+    ///
+    /// And the accounting comes with it: what the answer cost is stored beside
+    /// it, so a run that made no call still knows what was paid. That is what
+    /// lets a committed cache reproduce a report's cost column.
     #[tokio::test]
     async fn a_second_identical_run_does_not_call_the_scorer_again() {
         let dir = TempDir::new("cache-repeat");
@@ -376,10 +416,16 @@ mod tests {
             "the stored answer is the answer"
         );
         assert!(
-            matches!(second, Scored::Reused(_)),
+            matches!(second, Scored::Reused { .. }),
             "the second run made no call"
         );
         assert!(matches!(first, Scored::Called { .. }), "the first run did");
+        assert!(!second.called(), "and says so");
+        assert_eq!(
+            first.detail(),
+            second.detail(),
+            "a stored answer keeps what the call cost"
+        );
         assert_eq!(calls.load(Ordering::Relaxed), 1, "two runs, one call");
         assert_eq!(cached.calls(), 1, "and the counter reports it");
         assert_eq!(cached.hits(), 1);
@@ -447,6 +493,7 @@ mod tests {
         let stale = serde_json::to_string(&Entry {
             format: FORMAT + 1,
             judgment: answer("stale"),
+            detail: 0u64,
         })
         .expect("an entry");
 
@@ -472,7 +519,7 @@ mod tests {
         // served from disk again.
         assert!(matches!(
             cached.judge("query", &file).await.expect("an answer"),
-            Scored::Reused(_)
+            Scored::Reused { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 3);
     }

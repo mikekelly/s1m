@@ -399,7 +399,7 @@ async fn score_file(
         let dir = cached.dir().to_path_buf();
         match cached.judge(query, &parsed).await? {
             Scored::Called { judgment, detail } => (judgment, Source::Call { dir, detail }),
-            Scored::Reused(judgment) => (judgment, Source::Entry(dir)),
+            Scored::Reused { judgment, .. } => (judgment, Source::Entry(dir)),
         }
     };
 
@@ -410,8 +410,9 @@ async fn score_file(
     Ok(())
 }
 
-/// Where the answer came from, which is what the debug view is for: a cached
-/// answer has no model, tokens or latency of its own to report.
+/// Where the answer came from, which is what the debug view is for: this is
+/// what the run in front of the caller did, so a cached answer reports the hit
+/// and no call of its own, however much the call that stored it cost.
 enum Source {
     /// Read from the entry under this directory.
     Entry(PathBuf),
