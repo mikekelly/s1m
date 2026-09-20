@@ -12,6 +12,7 @@
 //! [#5]: https://github.com/mikekelly/s1m/issues/5
 
 use std::fmt::{Display, Write as _};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -32,14 +33,19 @@ const AFTER_HELP: &str = "\
 The reading list goes to stdout as JSON: most relevant first, then by path, and
 every path in it spelled the way the entry files were.
 
+--mode picks the criterion Jev judges by (about, useful-for, answers); a
+--criteria FILE replaces it with a criterion of your own: the file's whole
+content, trimmed. --criteria wins when both are given, and the reading list
+reports the path as `mode`.
+
 Exit codes:
   0  the walk reached files beyond the entry files
   1  nothing cleared the threshold: only the entry files were reached
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
 
-Not implemented yet: --mode, --criteria, --seed-grep, and the md and tree
-formats. json is the only format.
+Not implemented yet: --seed-grep, and the md and tree formats. json is the only
+format.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, and a scent per link (see
@@ -64,6 +70,18 @@ struct Cli {
     /// followed.
     #[arg(value_name = "ENTRY", num_args = 1..)]
     entries: Vec<PathBuf>,
+
+    /// How relevance is judged: `about` collects everything on a subject,
+    /// `useful-for` finds what helps someone doing what the query describes,
+    /// `answers` finds the page that answers the question.
+    #[arg(long, value_name = "MODE", value_enum, default_value_t = ModeArg::UsefulFor)]
+    mode: ModeArg,
+
+    /// A file holding a criterion of your own: its whole content, trimmed,
+    /// replaces the criterion `--mode` would judge by, and the reading list
+    /// reports the path as `mode`.
+    #[arg(long, value_name = "FILE")]
+    criteria: Option<PathBuf>,
 
     /// The directory that bounds the walk; a link resolving outside it is not
     /// followed. Defaults to the first entry file's directory.
@@ -96,6 +114,28 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// The criterion `--mode` picks, spelled as the plan's Relevance modes table
+/// names it. The wording each one sends lives in [`s1m::jev`], one const per
+/// mode; this is only the flag's vocabulary, and clap rejects anything else
+/// with the usage message, exit 2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ModeArg {
+    About,
+    UsefulFor,
+    Answers,
+}
+
+impl ModeArg {
+    /// The mode itself: the questions and the criteria this run asks.
+    fn mode(self) -> Mode {
+        match self {
+            ModeArg::About => jev::ABOUT.clone(),
+            ModeArg::UsefulFor => jev::USEFUL_FOR.clone(),
+            ModeArg::Answers => jev::ANSWERS.clone(),
+        }
+    }
 }
 
 /// The shape of the reading list on stdout.
@@ -139,7 +179,8 @@ enum Command {
 impl Cli {
     /// The flags as the run wants them. The mode is the scorer's to name,
     /// because the scorer is what carries the criterion; it is filled in once
-    /// one has been built.
+    /// one has been built, from `--criteria`'s file when there is one and
+    /// `--mode` otherwise.
     fn options(&self) -> Options {
         Options {
             query: self.query.clone().unwrap_or_default(),
@@ -187,16 +228,19 @@ async fn main() {
 
 /// One query: walk, rank, print, and say which code the run earned.
 ///
-/// The scorer is built before anything is read, so a missing `TYPESAFE_API_KEY`
-/// costs no file reads at all, and it is what names the criterion the reading
-/// list reports.
+/// The criterion is resolved, and the scorer built, before anything is read: a
+/// missing `TYPESAFE_API_KEY`, a mode that is not one of the three, and a
+/// `--criteria` file that cannot be read or holds nothing each cost no file
+/// reads at all. The scorer is what names the criterion the reading list
+/// reports, because it is what carries the questions.
 async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     let mut options = cli.options();
     let Some(root) = options.root() else {
         return Err(cli::Error::MissingArguments);
     };
 
-    let jev = scorer(&root)?;
+    let mode = criterion(cli.mode, cli.criteria.as_deref()).unwrap_or_else(|message| fail(message));
+    let jev = scorer(&root)?.with_mode(mode);
     options.mode = jev.mode().name.to_string();
 
     let judge: Box<dyn Judge> = if cli.no_cache {
@@ -210,6 +254,28 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
         Format::Json => println!("{}", list.to_json()),
     }
     Ok(list.exit_code())
+}
+
+/// The criterion this run judges by: the `--criteria` file's when there is one,
+/// else `--mode`'s.
+///
+/// The file's whole content is the criterion, trimmed, because a criterion is a
+/// sentence about what makes content relevant and that is what a caller has to
+/// write. It overrides `--mode` rather than conflicting with it, the way the
+/// plan's flag table says. A file that cannot be read, or that holds nothing, is
+/// the caller's mistake: the message names the path and the run exits 2 before
+/// anything is bought.
+fn criterion(mode: ModeArg, criteria: Option<&Path>) -> Result<Mode, String> {
+    let Some(path) = criteria else {
+        return Ok(mode.mode());
+    };
+    let text = fs::read_to_string(path)
+        .map_err(|source| format!("failed to read criteria file {}: {source}", path.display()))?;
+    let criterion = text.trim();
+    if criterion.is_empty() {
+        return Err(format!("criteria file {} holds nothing", path.display()));
+    }
+    Ok(Mode::custom(path.display().to_string(), criterion))
 }
 
 /// The Jev scorer this run asks, pointed at `S1M_ENDPOINT` when something else
@@ -270,7 +336,7 @@ async fn score_file(
 
     let parsed = parse::parse(file, &root)?;
     let jev = scorer(&root)?.with_previews(previews);
-    let mode = jev.mode();
+    let mode = jev.mode().clone();
 
     let (judgment, source) = if no_cache {
         let outcome = jev.judge(query, &parsed).await?;
@@ -286,7 +352,7 @@ async fn score_file(
 
     print!(
         "{}",
-        report(query, &parsed, &judgment, mode, previews, &source)
+        report(query, &parsed, &judgment, &mode, previews, &source)
     );
     Ok(())
 }
@@ -315,7 +381,7 @@ fn report(
     field(&mut out, "query", query);
     field(&mut out, "file", &file.path.display().to_string());
     field(&mut out, "title", &file.title);
-    field(&mut out, "mode", mode.name);
+    field(&mut out, "mode", &mode.name);
     field(&mut out, "previews", if previews { "on" } else { "off" });
     match source {
         Source::Entry(dir) => field(&mut out, "cache", &format!("hit   {}", dir.display())),

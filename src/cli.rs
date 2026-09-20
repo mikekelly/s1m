@@ -71,9 +71,10 @@ pub struct Options {
     /// Frontier files expanded per round.
     pub fanout: usize,
     /// The criterion the answers were judged against, as the reading list
-    /// reports it. The scorer is what carries the criterion, because it is
-    /// built with the questions, so the CLI takes the name from there: #10's
-    /// `--mode` will pick the flag and the scorer together.
+    /// reports it: the mode's name (`about`, `useful-for`, `answers`), or the
+    /// criteria file's path when `--criteria` named one. The scorer is what
+    /// carries the criterion, because it is built with the questions, so the
+    /// CLI takes the name from there.
     pub mode: String,
 }
 
