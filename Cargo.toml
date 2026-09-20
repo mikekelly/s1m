@@ -7,4 +7,8 @@ description = "Finds the parts of a markdown knowledge base relevant to a query 
 publish = false
 
 [dependencies]
+anyhow = "1.0.104"
 clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"

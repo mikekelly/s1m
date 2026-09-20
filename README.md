@@ -58,6 +58,7 @@ Exit codes: `0` reading list returned, `1` nothing cleared the threshold, `2` er
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and
-`cargo build` on the stable toolchain
-([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the built binary,
+`cargo build` on the stable toolchain, then a smoke test on the built binary: `--help` prints
+usage, no arguments exits 2 with usage on stderr, an unknown flag exits 2
+([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the same binary,
 so the usage text, the streams and the exit codes above are what CI exercises.
