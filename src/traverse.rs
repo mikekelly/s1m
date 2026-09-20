@@ -2,18 +2,22 @@
 //! visited set.
 //!
 //! Entry files start on a frontier at path score 1. Each round pops the best
-//! `fanout` files, scores them at the same time, and queues the links that
-//! clear the threshold. A link's scent multiplies into the path score, so an
-//! entry's priority is the score of the best path found to it: long chains of
-//! weak links sink, and a file reached twice keeps its best path and is visited
+//! `fanout` files, scores them together, and queues the links that clear the
+//! threshold. A link's scent multiplies into the path score, so an entry's
+//! priority is the score of the best path found to it: long chains of weak
+//! links sink, and a file reached twice keeps its best path and is visited
 //! once.
+//!
+//! The walk is async because the scorer is: a round joins one future per file,
+//! so a round costs one round trip rather than one per file, and the caller
+//! supplies the runtime.
 //!
 //! Determinism is a contract, not a property of the machine that ran it:
 //!
 //! - Ties on path score are broken by path, so the queue order is a function of
 //!   the input alone.
-//! - A round scores its files concurrently and records them in the order it
-//!   popped them, so the result does not depend on which answer arrives first.
+//! - A round's answers are collected in the order the batch was popped, so the
+//!   result does not depend on which answer arrives first.
 //! - Nothing is pruned by a file's own relevance: an unhelpful index page still
 //!   passes its links on.
 //!
@@ -30,6 +34,7 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use futures_util::future::join_all;
 use serde::Serialize;
 
 use crate::parse::{ParseError, ParsedFile, parse, relative_to_root};
@@ -150,8 +155,11 @@ pub enum TraverseError {
 /// comes first. A file that cannot be parsed or scored is recorded in
 /// [`Traversal::failed`] and the walk continues, so one broken link does not
 /// cost the reading list.
-pub fn traverse(config: &Config<'_>, scorer: &dyn Scorer) -> Result<Traversal, TraverseError> {
-    Search::new(config, scorer).run()
+pub async fn traverse(
+    config: &Config<'_>,
+    scorer: &dyn Scorer,
+) -> Result<Traversal, TraverseError> {
+    Search::new(config, scorer).run().await
 }
 
 /// The frontier: a file to visit, with the best path found to it so far.
@@ -217,14 +225,14 @@ impl<'a> Search<'a> {
         }
     }
 
-    fn run(mut self) -> Result<Traversal, TraverseError> {
+    async fn run(mut self) -> Result<Traversal, TraverseError> {
         self.seed()?;
         while self.results.len() < self.config.max_files {
             let batch = self.next_batch();
             if batch.is_empty() {
                 break;
             }
-            let outcomes = self.score(&batch);
+            let outcomes = self.score(&batch).await;
             // A file that failed to parse never reached the scorer, so it was
             // no call; a call that failed still was one.
             self.calls += outcomes
@@ -294,34 +302,19 @@ impl<'a> Search<'a> {
         batch
     }
 
-    /// Scores one round: one thread per file, so a round costs one round trip
-    /// rather than one per file. Answers come back in the order the batch was
-    /// popped, whatever order the threads finish in.
-    fn score(&self, batch: &[Frontier]) -> Vec<Result<(ParsedFile, FileJudgment), Failure>> {
+    /// Scores one round: one future per file, polled together, so a round costs
+    /// one round trip rather than one per file. Answers come back in the order
+    /// the batch was popped, whatever order they are ready in.
+    async fn score(&self, batch: &[Frontier]) -> Vec<Result<(ParsedFile, FileJudgment), Failure>> {
         let root = self.config.root;
         let query = self.config.query;
         let scorer = self.scorer;
-        std::thread::scope(|scope| {
-            let workers: Vec<_> = batch
-                .iter()
-                .map(|entry| {
-                    let path = root.join(&entry.path);
-                    scope.spawn(move || {
-                        let file = parse(path, root)?;
-                        let judgment = scorer.score(query, &file)?;
-                        Ok((file, judgment))
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|worker| {
-                    worker
-                        .join()
-                        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
-                })
-                .collect()
-        })
+        join_all(batch.iter().map(|entry| async move {
+            let file = parse(root.join(&entry.path), root)?;
+            let judgment = scorer.score(query, &file).await?;
+            Ok((file, judgment))
+        }))
+        .await
     }
 
     /// Records one answered file and queues its links.

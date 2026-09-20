@@ -12,19 +12,21 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::time::sleep;
+
 use s1m::parse::{ParsedFile, relative_to_root};
 use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
 use s1m::traverse::{Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
 
 const QUERY: &str = "settlement timing for instant payouts";
 
-/// The fake's delay per answer: long enough that two threads of one round
-/// really do overlap, short enough that the suite stays quick.
+/// The fake's delay per answer: long enough that two futures of one round
+/// really do interleave, short enough that the suite stays quick.
 const DELAY_MS: u64 = 20;
 const DELAY_SPREAD_MS: u64 = 20;
 
 /// One row of the fake's table: what it answers for a file, and how often it
-/// was asked about it. A file is scored by one thread at a time, so counters
+/// was asked about it. A file is scored by one future at a time, so counters
 /// are all the bookkeeping a shared fake needs.
 struct Entry {
     relevance: f64,
@@ -111,20 +113,21 @@ impl Fake {
     }
 }
 
+#[async_trait::async_trait]
 impl Scorer for Fake {
-    fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         assert_eq!(query, QUERY, "the traversal's query reaches the scorer");
         let path = relative_to_root(&self.root, &file.path);
         let name = path.to_string_lossy().into_owned();
         let Some(entry) = self.table.get(name.as_str()) else {
-            return Err(ScorerError::new(format!("no judgment for {name}")));
+            return Err(ScorerError::MissingAnswer { id: name });
         };
         entry.calls.fetch_add(1, Ordering::SeqCst);
 
         let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(in_flight, Ordering::SeqCst);
         if self.jitter {
-            std::thread::sleep(Duration::from_millis(delay(&self.seed)));
+            sleep(Duration::from_millis(delay(&self.seed))).await;
         }
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
 
@@ -143,8 +146,8 @@ impl Scorer for Fake {
 }
 
 /// A different delay per call, mixed from a counter seeded off the clock so no
-/// two runs see the same order. It only shuffles thread completion: nothing in
-/// a result may depend on it.
+/// two runs see the same order. It only shuffles when answers become ready:
+/// nothing in a result may depend on it.
 fn delay(seed: &AtomicUsize) -> u64 {
     let mut value = seed.fetch_add(1, Ordering::SeqCst) as u64 | 1;
     value ^= value >> 30;
@@ -200,7 +203,7 @@ impl Settings {
         self
     }
 
-    fn run(&self, scorer: &dyn Scorer) -> Traversal {
+    async fn run(&self, scorer: &dyn Scorer) -> Traversal {
         let config = Config {
             query: QUERY,
             entries: &self.entries,
@@ -210,7 +213,9 @@ impl Settings {
             fanout: self.fanout,
             threshold: self.threshold,
         };
-        traverse(&config, scorer).expect("traversal should run")
+        traverse(&config, scorer)
+            .await
+            .expect("traversal should run")
     }
 }
 
@@ -289,8 +294,8 @@ fn failures(traversal: &Traversal) -> Vec<(String, String)> {
         .collect()
 }
 
-#[test]
-fn a_hub_page_with_low_relevance_still_has_its_links_followed() {
+#[tokio::test]
+async fn a_hub_page_with_low_relevance_still_has_its_links_followed() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -311,7 +316,7 @@ fn a_hub_page_with_low_relevance_still_has_its_links_followed() {
         ("notes/scratch.md", Entry::new(1.0, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     // The index is nearly irrelevant and its links were still queued, which is
     // the point of keeping relevance and scent apart.
@@ -337,11 +342,11 @@ fn a_hub_page_with_low_relevance_still_has_its_links_followed() {
     );
 }
 
-#[test]
-fn entry_files_are_visited_at_depth_zero_with_no_scent() {
+#[tokio::test]
+async fn entry_files_are_visited_at_depth_zero_with_no_scent() {
     let scorer = Fake::new(&[("index.md", Entry::new(0.5, &[("payments/README.md", 0.9)]))]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     let index = visited(&found, "index.md");
     assert_eq!(index.scent, None);
@@ -350,8 +355,8 @@ fn entry_files_are_visited_at_depth_zero_with_no_scent() {
     assert!(index.via.is_empty());
 }
 
-#[test]
-fn the_frontier_stops_at_the_file_budget() {
+#[tokio::test]
+async fn the_frontier_stops_at_the_file_budget() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -367,7 +372,7 @@ fn the_frontier_stops_at_the_file_budget() {
         ("notes/ledger.md", Entry::new(0.9, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).max_files(2).run(&scorer);
+    let found = Settings::new(&["index.md"]).max_files(2).run(&scorer).await;
 
     assert_eq!(paths(&found), ["index.md", "payments/README.md"]);
     assert_eq!(found.calls, 2);
@@ -380,8 +385,8 @@ fn the_frontier_stops_at_the_file_budget() {
     assert_eq!(scorer.called(), ["index.md", "payments/README.md"]);
 }
 
-#[test]
-fn the_walk_stops_at_the_depth_budget() {
+#[tokio::test]
+async fn the_walk_stops_at_the_depth_budget() {
     let table: &[(&str, Entry)] = &[
         ("index.md", Entry::new(0.5, &[("payments/README.md", 0.9)])),
         (
@@ -393,7 +398,7 @@ fn the_walk_stops_at_the_depth_budget() {
 
     // One hop: the README is in, the file it links to is not.
     let scorer = Fake::new(table);
-    let found = Settings::new(&["index.md"]).max_depth(1).run(&scorer);
+    let found = Settings::new(&["index.md"]).max_depth(1).run(&scorer).await;
     assert_eq!(paths(&found), ["payments/README.md", "index.md"]);
     assert_eq!(visited(&found, "payments/README.md").depth, 1);
     assert_eq!(
@@ -404,13 +409,13 @@ fn the_walk_stops_at_the_depth_budget() {
 
     // No hops: the entry files are the whole reading list.
     let scorer = Fake::new(table);
-    let found = Settings::new(&["index.md"]).max_depth(0).run(&scorer);
+    let found = Settings::new(&["index.md"]).max_depth(0).run(&scorer).await;
     assert_eq!(paths(&found), ["index.md"]);
     assert_eq!(found.calls, 1);
 }
 
-#[test]
-fn links_below_the_threshold_are_not_followed() {
+#[tokio::test]
+async fn links_below_the_threshold_are_not_followed() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -423,7 +428,10 @@ fn links_below_the_threshold_are_not_followed() {
         ("notes/ledger.md", Entry::new(0.9, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).threshold(0.75).run(&scorer);
+    let found = Settings::new(&["index.md"])
+        .threshold(0.75)
+        .run(&scorer)
+        .await;
 
     assert_eq!(paths(&found), ["index.md", "payments/README.md"]);
     // A scent exactly at the threshold queues; a hair below it does not, and
@@ -438,8 +446,8 @@ fn links_below_the_threshold_are_not_followed() {
     assert_eq!(scorer.called(), ["index.md", "payments/README.md"]);
 }
 
-#[test]
-fn a_scent_that_is_not_a_probability_is_not_followed() {
+#[tokio::test]
+async fn a_scent_that_is_not_a_probability_is_not_followed() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -452,7 +460,7 @@ fn a_scent_that_is_not_a_probability_is_not_followed() {
         ("notes/ledger.md", Entry::new(1.0, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     // Neither is above the threshold, and neither is given a priority that
     // would put it first: both links are reported and the walk stays where it
@@ -463,8 +471,8 @@ fn a_scent_that_is_not_a_probability_is_not_followed() {
     assert!(!followed(visited(&found, "index.md"), "notes/ledger.md"));
 }
 
-#[test]
-fn a_file_keeps_the_best_path_found_by_a_file_of_its_own_round() {
+#[tokio::test]
+async fn a_file_keeps_the_best_path_found_by_a_file_of_its_own_round() {
     // The index queues the cutoffs page at 0.25, then the README — popped
     // first, so recorded first — finds a better path to it at 0.375. The
     // cutoffs page is popped in the same round as the README, so the round's
@@ -488,12 +496,14 @@ fn a_file_keeps_the_best_path_found_by_a_file_of_its_own_round() {
     let together = Settings::new(&["index.md"])
         .threshold(0.2)
         .fanout(2)
-        .run(&scorer);
+        .run(&scorer)
+        .await;
     let scorer = Fake::new(table);
     let one_at_a_time = Settings::new(&["index.md"])
         .threshold(0.2)
         .fanout(1)
-        .run(&scorer);
+        .run(&scorer)
+        .await;
 
     let cutoffs = visited(&together, "payments/cutoffs.md");
     assert_eq!(cutoffs.path_score, 0.375);
@@ -514,8 +524,8 @@ fn a_file_keeps_the_best_path_found_by_a_file_of_its_own_round() {
     );
 }
 
-#[test]
-fn the_best_path_to_a_file_wins() {
+#[tokio::test]
+async fn the_best_path_to_a_file_wins() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -531,7 +541,7 @@ fn the_best_path_to_a_file_wins() {
         ("payments/settlement.md", Entry::new(0.95, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     // Settlement is one hop from the index at scent 0.9; the README's longer,
     // weaker path to it was found in the same round and queued nothing.
@@ -556,8 +566,8 @@ fn the_best_path_to_a_file_wins() {
     );
 }
 
-#[test]
-fn a_link_out_of_the_root_is_reported_but_never_followed() {
+#[tokio::test]
+async fn a_link_out_of_the_root_is_reported_but_never_followed() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -569,7 +579,7 @@ fn a_link_out_of_the_root_is_reported_but_never_followed() {
         ("../outside.md", Entry::new(1.0, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     assert_eq!(
         judged(visited(&found, "index.md")),
@@ -583,8 +593,8 @@ fn a_link_out_of_the_root_is_reported_but_never_followed() {
     assert_eq!(scorer.called(), ["index.md", "payments/README.md"]);
 }
 
-#[test]
-fn a_broken_link_is_reported_and_the_walk_continues() {
+#[tokio::test]
+async fn a_broken_link_is_reported_and_the_walk_continues() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -596,7 +606,7 @@ fn a_broken_link_is_reported_and_the_walk_continues() {
         ("payments/cutoffs.md", Entry::new(0.7, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     assert_eq!(paths(&found), ["index.md", "payments/cutoffs.md"]);
     assert_eq!(found.calls, 2);
@@ -610,8 +620,8 @@ fn a_broken_link_is_reported_and_the_walk_continues() {
     assert!(missing.1.starts_with("failed to read"));
 }
 
-#[test]
-fn a_scorer_that_fails_is_reported_and_the_walk_continues() {
+#[tokio::test]
+async fn a_scorer_that_fails_is_reported_and_the_walk_continues() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -624,19 +634,19 @@ fn a_scorer_that_fails_is_reported_and_the_walk_continues() {
         ("payments/cutoffs.md", Entry::new(0.7, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     assert_eq!(paths(&found), ["index.md", "payments/cutoffs.md"]);
     // A failed call was still a call.
     assert_eq!(found.calls, 3);
     assert!(matches!(
         &found.failed[0].failure,
-        Failure::Score(error) if error.to_string() == "no judgment for notes/ledger.md"
+        Failure::Score(ScorerError::MissingAnswer { id }) if id.as_str() == "notes/ledger.md"
     ));
 }
 
-#[test]
-fn a_tie_on_path_score_is_broken_by_path() {
+#[tokio::test]
+async fn a_tie_on_path_score_is_broken_by_path() {
     let scorer = Fake::new(&[
         ("index.md", Entry::new(0.9, &[])),
         ("notes/scratch.md", Entry::new(0.9, &[])),
@@ -646,14 +656,15 @@ fn a_tie_on_path_score_is_broken_by_path() {
     // the tie to the path rather than to the order the entries were given in.
     let found = Settings::new(&["notes/scratch.md", "index.md"])
         .max_files(1)
-        .run(&scorer);
+        .run(&scorer)
+        .await;
 
     assert_eq!(paths(&found), ["index.md"]);
     assert_eq!(scorer.called(), ["index.md"]);
 }
 
-#[test]
-fn an_entry_is_spelled_the_way_the_links_that_reach_it_are() {
+#[tokio::test]
+async fn an_entry_is_spelled_the_way_the_links_that_reach_it_are() {
     let scorer = Fake::new(&[
         ("notes/ledger.md", Entry::new(0.9, &[])),
         (
@@ -670,7 +681,8 @@ fn an_entry_is_spelled_the_way_the_links_that_reach_it_are() {
         "notes/scratch.md/../ledger.md",
         "notes/scratch.md",
     ])
-    .run(&scorer);
+    .run(&scorer)
+    .await;
 
     assert_eq!(scorer.called(), ["notes/ledger.md", "notes/scratch.md"]);
     assert_eq!(paths(&found), ["notes/ledger.md", "notes/scratch.md"]);
@@ -685,8 +697,8 @@ fn an_entry_is_spelled_the_way_the_links_that_reach_it_are() {
     );
 }
 
-#[test]
-fn results_are_ordered_by_relevance_then_path() {
+#[tokio::test]
+async fn results_are_ordered_by_relevance_then_path() {
     let scorer = Fake::new(&[
         (
             "index.md",
@@ -706,7 +718,7 @@ fn results_are_ordered_by_relevance_then_path() {
         ("notes/ledger.md", Entry::new(0.5, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).run(&scorer);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
 
     assert_eq!(
         paths(&found),
@@ -720,8 +732,8 @@ fn results_are_ordered_by_relevance_then_path() {
     );
 }
 
-#[test]
-fn a_round_scores_at_most_fanout_files_at_once() {
+#[tokio::test]
+async fn a_round_scores_at_most_fanout_files_at_once() {
     let table: &[(&str, Entry)] = &[
         ("index.md", Entry::new(0.9, &[])),
         ("notes/scratch.md", Entry::new(0.8, &[])),
@@ -729,14 +741,16 @@ fn a_round_scores_at_most_fanout_files_at_once() {
     ];
     let entries = ["index.md", "notes/scratch.md", "notes/reading.md"];
 
+    // A round that awaited its files in turn would never have two answers in
+    // flight at once.
     let scorer = Fake::new(table).jittered();
-    let found = Settings::new(&entries).fanout(2).run(&scorer);
+    let found = Settings::new(&entries).fanout(2).run(&scorer).await;
     assert_eq!(scorer.peak(), 2);
 
     // Fanout is latency, not the reading list: the same three files come back,
     // one at a time.
     let scorer = Fake::new(table).jittered();
-    let one_at_a_time = Settings::new(&entries).fanout(1).run(&scorer);
+    let one_at_a_time = Settings::new(&entries).fanout(1).run(&scorer).await;
     assert_eq!(scorer.peak(), 1);
     assert_eq!(paths(&found), paths(&one_at_a_time));
     assert_eq!(
@@ -800,8 +814,8 @@ struct Run {
     called: Vec<String>,
 }
 
-fn run(settings: &Settings, scorer: Fake) -> Run {
-    let found = settings.run(&scorer);
+async fn run(settings: &Settings, scorer: Fake) -> Run {
+    let found = settings.run(&scorer).await;
     Run {
         calls: found.calls,
         failed: failures(&found),
@@ -810,10 +824,10 @@ fn run(settings: &Settings, scorer: Fake) -> Run {
     }
 }
 
-#[test]
-fn the_same_input_gives_the_same_output_with_random_latency() {
+#[tokio::test]
+async fn the_same_input_gives_the_same_output_with_random_latency() {
     let settings = Settings::new(&["index.md", "payments/README.md", "notes/scratch.md"]).fanout(3);
-    let first = run(&settings, mixed_graph());
+    let first = run(&settings, mixed_graph()).await;
     assert!(first.results.len() >= 4, "the graph should span rounds");
     assert_eq!(first.failed.len(), 1, "one link of the graph is broken");
     assert_eq!(first.calls, 6);
@@ -850,15 +864,15 @@ fn the_same_input_gives_the_same_output_with_random_latency() {
 
     for attempt in 1..=10 {
         assert_eq!(
-            run(&settings, mixed_graph().jittered()),
+            run(&settings, mixed_graph().jittered()).await,
             first,
             "run {attempt} differed from the first"
         );
     }
 }
 
-#[test]
-fn entries_must_be_given_against_the_same_base_as_the_root() {
+#[tokio::test]
+async fn entries_must_be_given_against_the_same_base_as_the_root() {
     let scorer = Fake::new(&[]);
     let root = root();
     let entries = [PathBuf::from("tests/fixtures/wiki/index.md")];
@@ -873,7 +887,7 @@ fn entries_must_be_given_against_the_same_base_as_the_root() {
     };
 
     assert!(matches!(
-        traverse(&config, &scorer),
+        traverse(&config, &scorer).await,
         Err(TraverseError::BaseMismatch { .. })
     ));
 }

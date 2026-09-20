@@ -61,8 +61,8 @@ it can be driven directly from tests:
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
-| `traverse::traverse(config, scorer)` | Best-first walk of the link graph: a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
-| `scorer::Scorer` | The judgment seam, called once per visited file: a file's relevance plus a scent per outgoing link. [#5](https://github.com/mikekelly/s1m/issues/5) implements it against Jev; tests use a fake |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
+| `scorer::Scorer` | The judgment seam, called once per visited file: a file's relevance plus a scent per outgoing link. `async fn` behind `#[async_trait]`, so a caller can join a round's calls; [#5](https://github.com/mikekelly/s1m/issues/5) implements it against Jev, tests use a fake |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
@@ -71,11 +71,12 @@ followed; a target that is not `.md`/`.txt`, or an external URL, is dropped. Wik
 
 Traversal takes its `entries` against the same base as `parse`, and every path it returns —
 `path`, `via` and link targets — is spelled relative to `root`, so `root.join(path)` is the
-file to read. Ties on path score are broken by path, a round's files are scored concurrently
-but recorded in the order they were popped, and the reading list comes back sorted by
-relevance: the same query on the same files gives the same result, whatever the answers'
-latency. A file that cannot be parsed or scored is reported in `failed` and does not end the
-walk.
+file to read. The walk is async because the scorer is: a round joins one future per file, and
+the caller brings the runtime. Ties on path score are broken by path, the round's answers are
+collected in the order they were asked for however they come back, and the reading list is
+sorted by relevance: the same query on the same files gives the same result, whatever the
+answers' latency. A file that cannot be parsed or scored is reported in `failed` and does not
+end the walk.
 
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
