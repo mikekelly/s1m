@@ -29,7 +29,9 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > key or a network. `s1m::seed` is `--seed-grep`
 > ([#14](https://github.com/mikekelly/s1m/issues/14)): the query's keywords matched against the
 > pages under the root and put on the frontier as extra entry files, so a page nothing links to
-> is still reached. The `md` and `tree` formats are later. The design lives in
+> is still reached. `--format` prints that reading list as the JSON above, as `md` — the same
+> list to read or paste — or as `tree`, the walk's annotated link tree
+> ([#13](https://github.com/mikekelly/s1m/issues/13)). The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
 
@@ -145,11 +147,109 @@ of the page is a "See also" list, which the model scored 0.14 and the threshold 
 | `--fanout` | 8 | Frontier files expanded per round |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
-| `--format` | `json` | Only `json` exists so far; any other value exits 2 |
+| `--format` | `json` | `json` (the list above), `md` (a reading list to paste) or `tree` (the walk's link tree) |
 | `--seed-grep` | off | Add the top keyword hits under the root as extra entry files |
 | `--seed-count` | 5 | How many hits `--seed-grep` adds; needs `--seed-grep` |
 
-Not implemented yet: the `md` and `tree` formats.
+### Output formats
+
+`--format` picks the view of that reading list. `json` is the default and the one to parse;
+`md` and `tree` are for a person, or for an agent that will paste the result into its own task.
+
+`md` is the list to act on: the same files in the same order, each with the lines worth reading
+and the score that put it there, one line per section.
+
+```bash
+s1m --format md "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+```
+
+```markdown
+# Reading list: how do I cut a release and publish the package
+
+Criterion: useful-for; 5 files visited, 0 calls
+
+## 1. `eval/wikis/llm-wiki-manager/wiki/concepts/release.md`
+
+relevance 0.77; scent 0.86; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- lines 12-26, score 0.74, Release
+
+## 2. `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+relevance 0.74; entry file
+
+- lines 22-35, score 0.60, Concepts
+
+## 3. `eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md`
+
+relevance 0.62; scent 0.87; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- lines 32-41, score 0.65, README vs wiki
+
+## 4. `eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md`
+
+relevance 0.55; scent 0.84; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- nothing above --section-threshold
+
+## 5. `eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md`
+
+relevance 0.27; scent 0.63; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- nothing above --section-threshold
+```
+
+This is that query from the cache, so it reports no calls and its digits are the stored answers
+rather than the JSON sample's above; `md` is the same reading list either way. A file whose
+sections all fell below `--section-threshold` says so in place of a section line, and a section
+with no heading of its own — the text before a file's first heading — reads `(preamble)` where
+the heading would be.
+
+`tree` is the walk as it happened: every file it visited, and beneath each one every link the
+model judged, in the order the frontier would have taken them — highest scent first, ties broken
+by path. Each link line carries the scent it was given and what the walk did about it:
+`followed` when it queued the link's target, `pruned` when it did not, which is a scent below
+`--threshold`, a target outside `--root`, one past `--max-depth`, or one already reached.
+
+```bash
+s1m --format tree "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+```
+
+```text
+how do I cut a release and publish the package (useful-for); 5 files visited, 0 calls
+
+eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.74
+  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.87; relevance 0.62
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.89
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.25
+    ...
+  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.86; relevance 0.77
+    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.31
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.18
+  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.84; relevance 0.55
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.90
+    ...
+  eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md  followed; scent 0.63; relevance 0.27
+    ...
+  ...
+```
+
+The `...` lines are links the walk passed over, elided here; the run prints every one of them.
+The tree is where the walk's own answers show. `release.md` is the best page in the list and the
+entry follows the link at 0.86; `dogfooding.md`'s stronger-looking link to it, at 0.89, is
+`pruned`, because the file had already been reached and a file is visited once, along the best
+path found to it. The other pruned lines are links the model scored below `--threshold`, which
+is why five files are where the walk spent its calls. Roots are the files no link reached: the
+entry files the caller named, and any `--seed-grep` hit, marked `keyword seed`. A link whose
+target the model never judged prints `scent unknown` — such a link can never be followed, and a
+0.00 would read as a judgment when none was made.
+
+Both views round scores to two decimals, because they are for reading: `json` is where the
+model's own number lives. Both are rendered from the reading list alone, so either can be
+printed from any list a caller has — including one it assembled itself — and neither can
+disagree with the JSON about a file, a range or a link.
 
 ### Relevance modes
 
@@ -338,7 +438,8 @@ the CLI, so they can be driven directly from tests:
 | `cli::Options` | One run's flags — the query, the entry files, the root, the budgets and how many keyword hits to seed — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
-| `cli::ReadingList` | The plan's JSON shape, `exit_code()` for the 0/1 decision, and `to_json()` for stdout |
+| `cli::ReadingList` | The plan's shape, `exit_code()` for the 0/1 decision, and `to_json()` for the JSON view — the other two views are `format::Format::render` |
+| `format::Format` | How a reading list is printed: `Json` as above, `Md` — the same files with the lines worth reading, to read or paste — and `Tree` — the walk's files with every link it judged, each link's scent and whether it was followed. `render(&ReadingList) -> String` is what stdout gets, and both reading views are drawn from the list alone, so a caller can print one it built itself |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
@@ -358,12 +459,15 @@ and does not end the walk.
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
 `tests/traverse.rs` walks it with a fake scorer and holds the result's sections to those same
-ranges. `tests/fixtures/cli/` is a three-page chain with a broken link beside it alongside pages
-whose sections nest and a page with no heading at the top, and `tests/fixtures/criteria/` is a
+ranges. `tests/formats.rs` walks it too, renders the `md` and `tree` views of that run and
+holds each to the byte against the snapshots committed under `tests/snapshots/`, which
+`S1M_UPDATE_SNAPSHOTS=1 cargo test --test formats` rewrites when a view changes on purpose.
+`tests/fixtures/cli/` is a three-page chain with a broken link beside it alongside pages whose
+sections nest and a page with no heading at the top, and `tests/fixtures/criteria/` is a
 criterion of a caller's own; `tests/cli.rs` runs the binary over both: the API is a loopback
-server the test answers itself, pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON on
-stdout, which criterion reached the request, and the cache behaviour are checked end to end
-without a key or a network. `tests/fixtures/seed/` is the `--seed-grep` tree — an entry page,
+server the test answers itself, pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON and
+the two reading views on stdout, which criterion reached the request, and the cache behaviour
+are checked end to end without a key or a network. `tests/fixtures/seed/` is the `--seed-grep` tree — an entry page,
 the chain it links to, a page in a hidden directory, and a page nothing links to — which
 `src/seed.rs` measures the keyword match against and `tests/cli.rs` walks both ways.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
@@ -377,7 +481,7 @@ long enough to be truncated is judged from its heading and lines, the same way.
 
 | Command | What it does |
 | --- | --- |
-| `cargo test` | Unit, parser, cache, Jev client, traversal and CLI tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
+| `cargo test` | Unit, parser, cache, Jev client, traversal, format and CLI tests, including the end-to-end CLI tests that answer the API themselves; the live tests skip without `TYPESAFE_API_KEY` |
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
@@ -386,8 +490,8 @@ CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo
 `cargo build` on the stable toolchain, then a smoke test on the built binary: `--help` prints
 usage, no arguments exits 2 with usage on stderr, an unknown flag exits 2
 ([.github/workflows/ci.yml](.github/workflows/ci.yml)). `tests/cli.rs` spawns the same binary
-and covers the rest of the interface: the exit codes, the JSON on stdout, the streams, and a
-run whose API is a loopback server the test answers.
+and covers the rest of the interface: the exit codes, the reading list on stdout in each
+`--format`, the streams, and a run whose API is a loopback server the test answers.
 
 `tests/jev_live.rs` is the only test that leaves the machine. It calls the real API for
 `TYPESAFE_API_KEY`, and skips itself when the variable is unset, so CI stays offline and free;

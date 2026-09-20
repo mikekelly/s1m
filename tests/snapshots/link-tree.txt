@@ -1,0 +1,19 @@
+settlement timing for instant payouts (useful-for); 8 files visited, 8 calls
+
+tests/fixtures/wiki/index.md  entry file; relevance 0.62
+  tests/fixtures/wiki/payments/README.md  followed; scent 0.86; relevance 0.81
+    tests/fixtures/wiki/payments/settlement.md  followed; scent 0.94; relevance 0.94
+      tests/fixtures/wiki/payments/cutoffs.md  followed; scent 0.86; relevance 0.71
+        tests/fixtures/wiki/payments/settlement.md  pruned; scent 0.58
+    tests/fixtures/wiki/notes/ledger.md  followed; scent 0.72; relevance 0.55
+      tests/fixtures/wiki/notes/weekly review.md  followed; scent 0.83; relevance 0.52
+      tests/fixtures/wiki/notes/reading.txt  followed; scent 0.77; relevance 0.30
+        tests/fixtures/wiki/notes/ledger.md  pruned; scent 0.35
+      tests/fixtures/wiki/notes/reading.md  followed; scent 0.71; relevance 0.48
+      tests/fixtures/wiki/payments/settlement.md  pruned; scent 0.44
+    tests/fixtures/wiki/payments/cutoffs.md  pruned; scent 0.40
+  tests/fixtures/outside.md  pruned; scent 0.74
+  tests/fixtures/wiki/payments/cutoffs.md  pruned; scent 0.41
+  tests/fixtures/wiki/payments/settlement.md  pruned; scent 0.33
+  tests/fixtures/wiki/notes/ledger.md  pruned; scent 0.28
+  tests/fixtures/wiki/payments/missing.md  pruned; scent 0.19

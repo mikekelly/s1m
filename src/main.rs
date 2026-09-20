@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand, ValueEnum};
 use s1m::cache::{CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
+use s1m::format::Format;
 use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
@@ -33,12 +34,21 @@ const FANOUT: usize = 8;
 const SEED_COUNT: usize = 5;
 
 const AFTER_HELP: &str = "\
-The reading list goes to stdout as JSON: most relevant first, then by path, and
-every path in it spelled the way the entry files were. Each result carries the
-ranges worth reading: one entry per heading section, with the lines to read, the
-score it was judged at, and the sections below --section-threshold left out. A
-result with a via path was reached along a link; one without is an entry file,
-and `seeded` says whether --seed-grep put it on the frontier.
+The reading list goes to stdout as JSON by default: most relevant first, then
+by path, and every path in it spelled the way the entry files were. Each result
+carries the ranges worth reading: one entry per heading section, with the lines
+to read, the score it was judged at, and the sections below
+--section-threshold left out. A result with a via path was reached along a
+link; one without is an entry file, and `seeded` says whether --seed-grep put
+it on the frontier.
+
+--format picks how that list is printed. json is the plan's shape, for a caller
+that parses it. md is the same list to read or paste: each file with the lines
+worth reading, the heading to look for and the scores, most relevant first.
+tree is the walk's link tree: every file it visited with every link it judged
+beneath it, each link with the scent the model gave it and whether the walk
+followed it, so it is plain to see what was passed over and how narrowly.
+Scores print at two decimals in md and tree; json keeps the model's own numbers.
 
 --mode picks the criterion Jev judges by (about, useful-for, answers); a
 --criteria FILE replaces it with a criterion of your own: the file's whole
@@ -50,8 +60,6 @@ Exit codes:
   1  nothing cleared the threshold: only the entry files were reached
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
-
-Not implemented yet: the md and tree formats. json is the only format.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, a score per section and a scent
@@ -134,9 +142,10 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// The shape of the reading list on stdout.
-    #[arg(long, value_name = "FORMAT", value_enum, default_value_t = Format::Json)]
-    format: Format,
+    /// How the reading list is printed: `json` for a caller that parses it,
+    /// `md` for a reading list to paste, `tree` for the walk's link tree.
+    #[arg(long, value_name = "FORMAT", value_enum, default_value_t = FormatArg::Json)]
+    format: FormatArg,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -164,13 +173,29 @@ impl ModeArg {
     }
 }
 
-/// The shape of the reading list on stdout.
-///
-/// `json` is the only one so far; the `md` and `tree` views of the same
-/// reading list come after it.
+/// The shape of the reading list on stdout: the plan's `--format` flag, spelled
+/// as [`s1m::format`] names its views. This is only the flag's vocabulary; what
+/// each view prints lives in that module, so it is testable without a CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum Format {
+enum FormatArg {
+    /// The plan's `Output` section: what a caller parses.
     Json,
+    /// A reading list to paste: each file with the lines worth reading.
+    Md,
+    /// The walk's link tree: every judged link, with its scent and whether the
+    /// walk followed it.
+    Tree,
+}
+
+impl FormatArg {
+    /// The view itself.
+    fn format(self) -> Format {
+        match self {
+            FormatArg::Json => Format::Json,
+            FormatArg::Md => Format::Md,
+            FormatArg::Tree => Format::Tree,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -280,9 +305,7 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     };
 
     let list = cli::run(&options, judge.as_ref()).await?;
-    match cli.format {
-        Format::Json => println!("{}", list.to_json()),
-    }
+    print!("{}", cli.format.format().render(&list));
     Ok(list.exit_code())
 }
 
