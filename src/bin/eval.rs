@@ -413,10 +413,11 @@ impl Spent {
         self.models.extend(other.models.iter().cloned());
     }
 
-    /// What these answers cost at the list price: input tokens only, output is
-    /// free. Every answer served, whether it was bought now or earlier, which is
-    /// what a configuration's cost is: what its answers cost when they were
-    /// bought.
+    /// What these answers cost at the list price ([`jev::PRICE_PER_MTOK`]):
+    /// input tokens only, output is free. Every answer served, whether it was
+    /// bought now or earlier — which is a configuration's cost — priced from the
+    /// stored tokens at render time, so the report's cost columns follow that
+    /// constant rather than the rate charged on the day.
     fn cost_usd(&self) -> f64 {
         dollars(self.input_tokens)
     }
@@ -770,12 +771,23 @@ impl Env<'_> {
 
     /// The scorer one query needs: its mode's questions, the preview policy,
     /// and the cache or none.
+    ///
+    /// [`jev::ENDPOINT_VAR`] points the calls somewhere else, the way it does
+    /// for the CLI — a proxy, or a fake server. The endpoint is part of the
+    /// cache key, so a harness run against a proxy never reads the answers a run
+    /// against the API stored, and the other way round.
     fn scorer(&self, query: &Query, preview: Preview) -> Result<Metered, String> {
-        let jev = JevScorer::new(self.key.clone(), self.root)
+        let mut jev = JevScorer::new(self.key.clone(), self.root)
             .map_err(|error| format!("{}: {error}", query.id))?
             .with_mode(query.mode()?)
             .with_previews(preview.previews)
             .with_preview_frontmatter(preview.frontmatter);
+        if let Some(endpoint) = std::env::var(jev::ENDPOINT_VAR)
+            .ok()
+            .filter(|endpoint| !endpoint.trim().is_empty())
+        {
+            jev = jev.with_endpoint(endpoint);
+        }
         Ok(match self.cache {
             Cache::Off => Metered::new(jev),
             Cache::Dir(dir) => Metered::new(
@@ -1001,7 +1013,8 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         .queries
         .first()
         .map(|query| (query.id.clone(), query.entry()));
-    let scents = scents(&env, &gold).await?;
+    let (scents, scents_spent) = scents(&env, &gold).await?;
+    total.merge(&scents_spent);
 
     // What this run paid, which is not what the report says: the report's cost
     // columns are what the answers cost, so that a second run against the same
@@ -1036,11 +1049,17 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     .render())
 }
 
-/// One query's entry page, judged under each preview policy, and the scent each
-/// policy gave each of its links.
-async fn scents(env: &Env<'_>, gold: &Gold) -> Result<Vec<(Preview, Vec<(PathBuf, f64)>)>, String> {
+/// One query's entry page, judged under each preview policy, the scent each
+/// policy gave each of its links, and what judging it cost — the one place the
+/// harness scores a file outside a walk, and so the one place that has to report
+/// what it spent by hand.
+async fn scents(
+    env: &Env<'_>,
+    gold: &Gold,
+) -> Result<(Vec<(Preview, Vec<(PathBuf, f64)>)>, Spent), String> {
+    let mut spent = Spent::default();
     let Some(query) = gold.queries.first() else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), spent));
     };
     let page = parse::parse(env.root.join(query.entry()), env.root)
         .map_err(|error| format!("{}: {error}", query.entry))?;
@@ -1050,6 +1069,7 @@ async fn scents(env: &Env<'_>, gold: &Gold) -> Result<Vec<(Preview, Vec<(PathBuf
         let judgment = Scorer::score(&meter, &query.query, &page)
             .await
             .map_err(|error| format!("{}: {error}", query.id))?;
+        spent.merge(&meter.take());
         table.push((
             preview,
             judgment
@@ -1059,7 +1079,7 @@ async fn scents(env: &Env<'_>, gold: &Gold) -> Result<Vec<(Preview, Vec<(PathBuf
                 .collect(),
         ));
     }
-    Ok(table)
+    Ok((table, spent))
 }
 
 // ----------------------------------------------------------------- the report
@@ -1151,12 +1171,19 @@ impl Findings {
              sections and links did not fit one post |",
             self.total.requests
         );
+        let budgets = match tight == wide {
+            true => format!("`--max-files {tight}`"),
+            false => format!(
+                "`--max-files {tight}`, {} at `--max-files {wide}`",
+                usd(sum_cost(wider))
+            ),
+        };
         let _ = writeln!(
             out,
-            "| Cost | {} for the gold set at `--max-files {tight}`, {} at `--max-files {wide}`; \
-             every answer this report used, at the price it was bought for, {} |",
+            "| Cost | {} for the gold set at {}; every answer this report used, at the list price \
+             above, {} |",
             usd(sum_cost(s1m)),
-            usd(sum_cost(wider)),
+            budgets,
             usd(self.total.cost_usd()),
         );
         let _ = writeln!(out);
@@ -1170,18 +1197,25 @@ impl Findings {
         let _ = writeln!(
             out,
             "- **Recall and precision at `--max-files {tight}`**: mean recall {}, mean precision {} \
-             — {} of the {} wanted pages, over {} files returned. The budget is not what binds: the \
-             walk runs out of links above `--threshold` first, returning {:.1} files a query, and \
-             `--max-files {wide}` returns {} files for the same mean recall ({}) — so everything \
-             below is a statement about the link graph and the threshold, not about the budget.",
+             — {} of the {} wanted pages, over {} files returned, {:.1} a query. {}",
             ratio(mean_recall(s1m)),
             ratio(mean_precision(s1m)),
             sum(s1m, |run| run.score.found),
             wanted,
             sum(s1m, |run| run.score.returned),
             sum(s1m, |run| run.score.returned) as f64 / s1m.len() as f64,
-            sum(wider, |run| run.score.returned),
-            ratio(mean_recall(wider)),
+            match tight == wide {
+                true => "One budget was measured, so nothing here says whether a different one                          would return more."
+                    .to_string(),
+                false => format!(
+                    "The budget is not what binds: the walk runs out of links above `--threshold` \
+                     first, and `--max-files {wide}` returns {} files for the same mean recall ({}), \
+                     so everything below is a statement about the link graph and the threshold, not \
+                     about the budget.",
+                    sum(wider, |run| run.score.returned),
+                    ratio(mean_recall(wider)),
+                ),
+            },
         );
         let _ = writeln!(
             out,
@@ -1228,32 +1262,42 @@ impl Findings {
         let _ = writeln!(
             out,
             "- **What it costs**: {} for the gold set at `--max-files {tight}` — {} a query, at {} \
-             an answer — and {} at `--max-files {wide}`. Every answer the report used, at the price \
-             each was bought for, {}; a second run against the committed cache is free.",
+             an answer{}; every answer this report used, at the price above, {}. The figures are the \
+             input tokens the answers spent, priced at the list rate in the header: the cache fixes \
+             the tokens, and a rate change re-prices every row, so a rerun reproduces them only \
+             while that constant stands.",
             usd(sum_cost(s1m)),
             usd(sum_cost(s1m) / s1m.len() as f64),
             human_duration(mean_run_latency(s1m)),
-            usd(sum_cost(wider)),
+            match tight == wide {
+                true => String::new(),
+                false => format!(", {} at `--max-files {wide}`", usd(sum_cost(wider))),
+            },
             usd(self.total.cost_usd()),
         );
         let _ = writeln!(
             out,
-            "- **Where the default threshold sits**: dropping it to 0.5 buys {} of recall and reads \
-             {}; raising it to 0.7 loses {} of recall and reads {}. 0.6 sits at that knee, and the \
-             calibration says the same from the other side — the links it followed reach a wanted \
-             page {} of the time, the ones it passed over {}.",
-            ratio(mean_recall(self.sweep_runs(0.5)) - mean_recall(s1m)),
-            delta(
-                sum(self.sweep_runs(0.5), |run| run.score.read_tokens) as u64,
-                sum(s1m, |run| run.score.read_tokens) as u64
-            ),
-            ratio(mean_recall(s1m) - mean_recall(self.sweep_runs(0.7))),
-            delta(
-                sum(self.sweep_runs(0.7), |run| run.score.read_tokens) as u64,
-                sum(s1m, |run| run.score.read_tokens) as u64
-            ),
-            ratio(self.decision().0),
-            ratio(self.decision().1),
+            "- **Where `--threshold` sits**: this report walked at {}. Against that walk, the swept \
+             thresholds move recall and reading by: {}. The calibration says the same from the other \
+             side — the links the walk followed reach a wanted page {} of the time, the ones it \
+             passed over {}, and {} links clear the threshold and are still not followed.",
+            self.threshold,
+            self.sweep
+                .iter()
+                .map(|(threshold, runs)| format!(
+                    "{}: recall {} and reading {}",
+                    threshold,
+                    signed(mean_recall(runs) - mean_recall(s1m)),
+                    delta(
+                        sum(runs, |run| run.score.read_tokens) as u64,
+                        sum(s1m, |run| run.score.read_tokens) as u64
+                    )
+                ))
+                .collect::<Vec<_>>()
+                .join("; "),
+            ratio(self.decision().followed),
+            ratio(self.decision().passed),
+            self.decision().cleared,
         );
         let _ = writeln!(
             out,
@@ -1285,17 +1329,19 @@ impl Findings {
         if let Some(flag) = &self.cache_flag {
             let _ = writeln!(out, "{flag}");
         }
-        let _ = writeln!(out, "  --out eval/REPORT.md");
+        let _ = writeln!(out, "  --out REPORT.md");
         let _ = writeln!(out, "```");
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "Every judgment is cached on the request that produced it, and the cache stores what \
-             each call cost beside its answer, so the cache committed under that directory \
-             reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all: the cost and \
-             token columns are what the calls cost when they were bought. `--no-cache` with a key \
-             buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki \
-             needs, and nothing about either is committed here."
+            "This report goes to stdout without `--out`, and `--out <path>` writes it to a file \
+             instead. Every judgment is cached on the request that produced it, and the cache \
+             stores the tokens each call spent beside its answer, so the cache committed under that \
+             directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The \
+             cost columns are those stored tokens at the list rate in the header — the cache fixes \
+             the tokens, not the rate — and `--no-cache` with a key buys every judgment again. \
+             `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about \
+             either is committed here."
         );
         let _ = writeln!(out);
     }
@@ -1731,37 +1777,39 @@ impl Findings {
         }
         let _ = writeln!(out);
 
-        let followed = judged.iter().filter(|(_, _, followed)| *followed).count();
-        let passed = judged.len() - followed;
-        let (followed_rate, passed_rate) = self.decision();
+        let decision = self.decision();
         head(out, &["Decision", "Links", "Wanted"]);
         row(
             out,
             &[
-                format!("followed (scent ≥ {})", self.threshold),
-                followed.to_string(),
-                ratio(followed_rate),
+                "followed".to_string(),
+                (judged.len() - decision.passed_links()).to_string(),
+                ratio(decision.followed),
             ],
         );
         row(
             out,
             &[
-                format!("passed over (scent < {})", self.threshold),
-                passed.to_string(),
-                ratio(passed_rate),
+                "passed over".to_string(),
+                decision.passed_links().to_string(),
+                ratio(decision.passed),
             ],
         );
         let _ = writeln!(out);
         let _ = writeln!(
             out,
             "The walk's own decision, in the same terms: the links it followed reach a wanted \
-             page {} of the time, the ones it passed over {}. A gold set is not the whole of what \
-             is useful — a link can lead to a page worth reading for the query without being one of \
-             the pages that query was labelled with — so both numbers are lower than they would be \
-             against a label of *relevant*, and it is the gap between them that says where the \
-             threshold belongs.",
-            ratio(followed_rate),
-            ratio(passed_rate),
+             page {} of the time, the ones it passed over {}. These two rows split on whether the \
+             walk followed a link, not on scent, which is why they do not partition the bins above \
+             the same way: {} links clear `--threshold` and were still passed over, for want of \
+             depth or because their target had already been reached by a better path. A gold set \
+             is not the whole of what is useful — a link can lead to a page worth reading for the \
+             query without being one of the pages that query was labelled with — so both numbers \
+             are lower than they would be against a label of *relevant*, and it is the gap between \
+             them that says where the threshold belongs.",
+            ratio(decision.followed),
+            ratio(decision.passed),
+            decision.cleared,
         );
         let _ = writeln!(out);
     }
@@ -2012,47 +2060,70 @@ impl Findings {
         *self.budgets.last().expect("a budget")
     }
 
-    /// The runs a sweep threshold produced.
-    fn sweep_runs(&self, threshold: f64) -> &[Run] {
-        &self
-            .sweep
-            .iter()
-            .find(|(at, _)| *at == threshold)
-            .expect("a swept threshold")
-            .1
-    }
-
-    /// The share of judged links whose target is wanted, for the links the walk
-    /// followed and the ones it passed over — the decision, over every link the
-    /// widest budget's walk judged.
-    ///
-    /// The split is the walk's own `followed` flag rather than a bare scent
-    /// comparison, because those are not the same set: a link can clear the
-    /// threshold and still not be followed for want of depth, or because the
-    /// target was already reached by a better path. Every link's target is a
-    /// page of the wiki, so the gold set can say whether it was wanted whether
-    /// or not the walk went there.
-    fn decision(&self) -> (f64, f64) {
+    /// The walk's follow decision over every link the widest budget judged,
+    /// with each link's target checked against its query's gold set.
+    fn decision(&self) -> Decision {
         let wide = self.widest();
         let (_, runs) = self.at_budget(wide);
-        let mut followed = (0usize, 0usize);
-        let mut passed = (0usize, 0usize);
+        let mut links = Vec::new();
         for run in runs {
             let expected = self.query(&run.id).map(Query::expected).unwrap_or_default();
             for link in &run.judged {
-                if !self.corpus.has(&link.target) {
-                    continue;
+                // A target outside the wiki has no label: nothing can say
+                // whether following it would have been worth it.
+                if self.corpus.has(&link.target) {
+                    links.push((link.scent, link.followed, expected.contains(&link.target)));
                 }
-                let wanted = usize::from(expected.contains(&link.target));
-                let tally = match link.followed {
-                    true => &mut followed,
-                    false => &mut passed,
-                };
-                tally.0 += wanted;
-                tally.1 += 1;
             }
         }
-        (rate(followed), rate(passed))
+        decide(&links, self.threshold)
+    }
+}
+
+/// What a budget's judged links say about the walk's follow decision.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Decision {
+    /// The share of the links the walk followed whose target was wanted.
+    followed: f64,
+    /// The same for the links it passed over.
+    passed: f64,
+    /// How many of those passed over cleared `threshold`: the walk's decision is
+    /// not a scent comparison, because a link above the threshold can still be
+    /// refused for want of depth, or because its target was already reached by a
+    /// better path.
+    cleared: usize,
+    /// How many links the walk passed over, wanted or not.
+    passed_count: usize,
+}
+
+impl Decision {
+    /// How many links the walk passed over.
+    fn passed_links(&self) -> usize {
+        self.passed_count
+    }
+}
+
+/// `decide` over `(scent, followed, wanted)` per link.
+fn decide(links: &[(f64, bool, bool)], threshold: f64) -> Decision {
+    let mut followed = (0usize, 0usize);
+    let mut passed = (0usize, 0usize);
+    let mut cleared = 0usize;
+    for (scent, was_followed, wanted) in links {
+        let tally = match was_followed {
+            true => &mut followed,
+            false => {
+                cleared += usize::from(*scent >= threshold);
+                &mut passed
+            }
+        };
+        tally.0 += usize::from(*wanted);
+        tally.1 += 1;
+    }
+    Decision {
+        followed: rate(followed),
+        passed: rate(passed),
+        cleared,
+        passed_count: passed.1,
     }
 }
 
@@ -2107,6 +2178,11 @@ fn head(out: &mut String, cells: &[&str]) {
 
 fn ratio(value: f64) -> String {
     format!("{value:.2}")
+}
+
+/// A ratio with its sign, for a difference between two runs.
+fn signed(value: f64) -> String {
+    format!("{value:+.2}")
 }
 
 fn usd(value: f64) -> String {
@@ -2212,6 +2288,19 @@ mod tests {
             relevance: Some(0.5),
             scent: None,
             lines: lines.to_vec(),
+        }
+    }
+
+    fn detail(model: &str, tokens: u64, requests: usize, latency_ms: u64) -> JevDetail {
+        JevDetail {
+            model: model.to_string(),
+            questions: 3,
+            requests,
+            relevance_level: 2.0,
+            relevance_confidence: 0.8,
+            input_tokens: tokens,
+            output_tokens: 10,
+            latency: Duration::from_millis(latency_ms),
         }
     }
 
@@ -2355,6 +2444,77 @@ mod tests {
             assert!(error.contains('q'), "{label}: {error}");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the report's cost columns are made of: an answer read from the cache
+    /// was not spent on now, and its tokens still count towards what the
+    /// configuration cost when it was bought.
+    #[test]
+    fn the_accounting_separates_what_was_served_from_what_was_spent() {
+        let mut spent = Spent::default();
+        spent.add(&detail("jev-1.13.0", 1_000, 1, 200), true);
+        spent.add(&detail("jev-1.13.0", 3_000, 2, 400), false);
+
+        assert_eq!(spent.served, 2);
+        assert_eq!(spent.bought, 1, "one of the two was already on disk");
+        assert_eq!(spent.requests, 3, "the second answer took two requests");
+        assert_eq!(spent.input_tokens, 4_000, "both answers' tokens");
+        assert_eq!(spent.bought_tokens, 1_000, "only the one that was paid for");
+        assert_eq!(
+            spent.cost_usd(),
+            dollars(4_000),
+            "a configuration's cost is all of its answers, priced"
+        );
+        assert_eq!(
+            spent.spent_usd(),
+            dollars(1_000),
+            "what the run put on the wire"
+        );
+        assert_eq!(
+            spent.mean_latency(),
+            Duration::from_millis(300),
+            "one answer's latency, not the sum"
+        );
+        assert_eq!(spent.models.len(), 1);
+    }
+
+    /// The walk's follow decision is not a scent comparison, and the report has
+    /// to say which one it counted: a link above the threshold can still be
+    /// passed over for want of depth, or because its target was already reached
+    /// by a better path.
+    #[test]
+    fn the_decision_splits_on_what_the_walk_did() {
+        // (scent, followed, wanted)
+        let links = [
+            (0.90, true, true),
+            (0.80, true, false),
+            (0.70, false, true),
+            (0.65, false, false),
+            (0.20, false, false),
+        ];
+
+        let decision = decide(&links, 0.6);
+        assert_eq!(decision.followed, 0.5, "one of the two followed was wanted");
+        assert_eq!(decision.passed, 1.0 / 3.0, "one of the three passed was");
+        assert_eq!(decision.passed_links(), 3);
+        assert_eq!(
+            decision.cleared, 2,
+            "0.70 and 0.65 clear the threshold and were still passed over"
+        );
+    }
+
+    /// The differences the headline quotes are signed — a saving must not read
+    /// like a cost — and a reading of nothing is not a division by zero.
+    #[test]
+    fn differences_carry_their_sign() {
+        assert_eq!(delta(139, 100), "+39%");
+        assert_eq!(delta(74, 100), "-26%");
+        assert_eq!(delta(1, 0), "—");
+        assert_eq!(times(243_070, 35_245), "6.9×");
+        assert_eq!(times(1, 0), "—");
+        assert_eq!(share(1, 4), 25.0);
+        assert_eq!(signed(0.06), "+0.06");
+        assert_eq!(signed(-0.14), "-0.14");
     }
 
     /// The bins cover the whole range and never index past the last one.

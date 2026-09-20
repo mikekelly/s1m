@@ -10,16 +10,16 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 | Price | $0.042 per million input tokens, output free |
 | Walk | `--threshold` 0.6, `--max-depth` 6, `--fanout` 8 |
 | Answers | `eval/cache` |
-| Requests | 876 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
-| Cost | $0.018798 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the price it was bought for, $0.196718 |
+| Requests | 879 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
+| Cost | $0.018798 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.197416 |
 
 ## Headline
 
-- **Recall and precision at `--max-files 10`**: mean recall 0.67, mean precision 0.27 — 23 of the 39 wanted pages, over 83 files returned. The budget is not what binds: the walk runs out of links above `--threshold` first, returning 4.2 files a query, and `--max-files 25` returns 87 files for the same mean recall (0.67) — so everything below is a statement about the link graph and the threshold, not about the budget.
+- **Recall and precision at `--max-files 10`**: mean recall 0.67, mean precision 0.27 — 23 of the 39 wanted pages, over 83 files returned, 4.2 a query. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` returns 87 files for the same mean recall (0.67), so everything below is a statement about the link graph and the threshold, not about the budget.
 - **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.67, at 243070 tokens against 35245 — 6.9× the reading for 0.27 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader; `--seed-grep 5` on top of the walk is the middle, at recall 0.89 and 94790 tokens.
 - **What an agent reads**: 35245 tokens for the returned ranges, against 72795 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 21% of the corpus's text; the section scores take 52% off that, and the ranking 90% off reading everything.
-- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s an answer — and $0.019640 at `--max-files 25`. Every answer the report used, at the price each was bought for, $0.196718; a second run against the committed cache is free.
-- **Where the default threshold sits**: dropping it to 0.5 buys 0.06 of recall and reads +39%; raising it to 0.7 loses 0.14 of recall and reads -26%. 0.6 sits at that knee, and the calibration says the same from the other side — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11.
+- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.197416. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
+- **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.06 and reading +39%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.14 and reading -26%; 0.8: recall -0.31 and reading -69%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.37 of the time, the ones it passed over 0.11, and 69 links clear the threshold and are still not followed.
 - **The frontmatter earns its tokens**: dropping it from the preview costs 0.21 of recall (0.67 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.28. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
 
 ## How to reproduce
@@ -29,10 +29,10 @@ cargo run --release --bin eval -- \
   --wiki eval/wikis/llm-wiki-manager/wiki \
   --gold eval/gold/llm-wiki-manager.json \
   --cache eval/cache \
-  --out eval/REPORT.md
+  --out REPORT.md
 ```
 
-Every judgment is cached on the request that produced it, and the cache stores what each call cost beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all: the cost and token columns are what the calls cost when they were bought. `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
+This report goes to stdout without `--out`, and `--out <path>` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
 
 ## The gold set
 
@@ -190,10 +190,10 @@ Every link the walk judged whose target is a page of this wiki (568; 0 more left
 
 | Decision | Links | Wanted |
 | --- | --- | --- |
-| followed (scent ≥ 0.6) | 70 | 0.37 |
-| passed over (scent < 0.6) | 498 | 0.11 |
+| followed | 70 | 0.37 |
+| passed over | 498 | 0.11 |
 
-The walk's own decision, in the same terms: the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11. A gold set is not the whole of what is useful — a link can lead to a page worth reading for the query without being one of the pages that query was labelled with — so both numbers are lower than they would be against a label of *relevant*, and it is the gap between them that says where the threshold belongs.
+The walk's own decision, in the same terms: the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11. These two rows split on whether the walk followed a link, not on scent, which is why they do not partition the bins above the same way: 69 links clear `--threshold` and were still passed over, for want of depth or because their target had already been reached by a better path. A gold set is not the whole of what is useful — a link can lead to a page worth reading for the query without being one of the pages that query was labelled with — so both numbers are lower than they would be against a label of *relevant*, and it is the gap between them that says where the threshold belongs.
 
 ## The default threshold
 
