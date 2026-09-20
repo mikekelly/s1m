@@ -683,8 +683,9 @@ fn destination(dest: &str) -> Option<&Path> {
 
 /// Every `.md`/`.txt` file under the root, relative to it and sorted.
 ///
-/// The pages a root holds, which is what name lookup and keyword seeding need,
-/// and what the evaluation harness counts a whole corpus in.
+/// The pages a root holds, which is what name lookup and the evaluation
+/// harness's keyword ranker need, and what the harness counts a whole corpus
+/// in.
 /// Hidden directories are not descended, unreadable directories and
 /// entries whose kind cannot be read are skipped, and a directory reached
 /// through a symlink is not a directory here — the kind is read without

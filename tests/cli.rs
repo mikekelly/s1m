@@ -37,17 +37,6 @@ const CRITERIA: &str = "tests/fixtures/criteria/payouts.md";
 const CRITERION: &str =
     "The content states the cut-off that decides whether an instant payout can still be sent.";
 
-/// The `--seed-grep` fixture: an entry page, the two pages it links to in a
-/// chain, and a page nothing links to.
-const SEED_ENTRY: &str = "tests/fixtures/seed/index.md";
-const SEED_LINKED: &str = "tests/fixtures/seed/notes/checklist.md";
-const SEED_ARCHIVE: &str = "tests/fixtures/seed/notes/archive.md";
-const SEED_ORPHAN: &str = "tests/fixtures/seed/orphan.md";
-
-/// A query whose keywords are the orphan page's own: the pages the entry file
-/// links to are the ones it meets the terms on least.
-const SEED_QUERY: &str = "release checklist";
-
 /// The `.s1mignore` fixture: an entry page, a page it links to, and two pages
 /// the root's `.s1mignore` covers — one behind a matched directory, which the
 /// entry links to, and one matched by name, which is a keyword hit and nothing
@@ -60,10 +49,6 @@ const IGNORE_DRAFTS: &str = "tests/fixtures/ignore/drafts.md";
 
 /// The query the ignore fixture's entry page and its links are written for.
 const IGNORE_QUERY: &str = "settlement timing for instant payouts";
-
-/// A query the matched draft page is the only page in the fixture to answer:
-/// `--seed-grep` would put it on the frontier, if it were not ignored.
-const IGNORE_SEED_QUERY: &str = "unfinished drafts";
 
 /// A line from the matched page that must never leave the machine, so a test
 /// can look for it in every request the binary sent.
@@ -366,7 +351,7 @@ impl FakeApi {
     /// four levels every mode has, which the scorer reports as a relevance of
     /// 1.0. `noul` is what every link's scent comes back as, and it is what a
     /// test varies to put links above or below `--threshold`; `section` does
-    /// the same for the sections `--section-threshold` keeps.
+    /// the same for the sections `--threshold` keeps.
     fn new(score: f64, noul: f64, section: f64) -> FakeApi {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("the bound address");
@@ -633,47 +618,11 @@ fn a_second_run_with_a_warm_cache_reports_no_calls() {
     assert_eq!(api.answered(), 3, "the second run asked the API nothing");
 }
 
-/// `--section-threshold` drops the sections below it, and a repeat run with it
-/// still reads the same answer off the cache: the threshold is the caller's,
-/// applied to the answers, not something the model is asked again about.
+/// A section the model scored below `--threshold` is dropped from the file's
+/// `sections`: the same section comes back under a `--threshold` of 0.5 and is
+/// dropped under the default 0.6, with the cache answering both runs.
 #[test]
-fn a_section_threshold_drops_the_sections_below_it() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let cache = Cache::new();
-
-    let kept = json(&run_with(&[QUERY, ENTRY], &api, &cache));
-    assert_eq!(
-        result(&kept, ENTRY)["sections"],
-        json!([{"heading": "Entry", "lines": [1, 4], "score": 0.7}])
-    );
-
-    let dropped = json(&run_with(
-        &[QUERY, ENTRY, "--section-threshold", "0.8"],
-        &api,
-        &cache,
-    ));
-    assert_eq!(
-        result(&dropped, ENTRY)["sections"],
-        json!([]),
-        "the caller reads the ranges the list gives it, so a weak one is left out"
-    );
-    assert_eq!(
-        paths(&dropped),
-        paths(&kept),
-        "dropping sections does not change the walk"
-    );
-    assert_eq!(
-        api.answered(),
-        3,
-        "the second run was answered from the cache"
-    );
-}
-
-/// `--section-threshold` defaults to `--threshold`, the plan's flag table: the
-/// same sections come back under a `--threshold` of 0.5 and are dropped under
-/// the default 0.6, with no `--section-threshold` anywhere on the line.
-#[test]
-fn the_section_threshold_defaults_to_the_threshold() {
+fn a_section_below_the_threshold_is_dropped() {
     let api = FakeApi::new(3.0, 0.9, 0.55);
     let cache = Cache::new();
 
@@ -781,26 +730,6 @@ fn an_out_of_range_threshold_exits_2() {
     assert_eq!(api.answered(), 0);
 }
 
-/// A section threshold outside 0 to 1 is no more meaningful than a scent
-/// outside it: the flag is rejected where it is parsed, naming the value and
-/// the range.
-#[test]
-fn an_out_of_range_section_threshold_exits_2() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let cache = Cache::new();
-
-    let output = run_with(&[QUERY, ENTRY, "--section-threshold", "2"], &api, &cache);
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let error = stderr(&output);
-    assert!(
-        error.contains("2 is not between 0 and 1"),
-        "the message should name the value and the range it is outside of: {error}"
-    );
-    assert_eq!(api.answered(), 0);
-}
-
 /// `--root` with no entry file is a command line with nothing to walk, not an
 /// empty reading list: it exits 2 saying so, and it says so before the scorer
 /// is built — the key is missing here and the arguments are what get reported.
@@ -824,118 +753,6 @@ fn a_root_without_an_entry_file_exits_2_saying_so() {
     );
     assert_eq!(error.lines().count(), 1, "{error}");
     assert_eq!(api.answered(), 0);
-}
-
-/// The point of `--seed-grep`: a page nothing links to is not reachable at all
-/// without the flag, and is in the reading list with it — on the frontier like
-/// an entry file, marked as a seed, beside the pages a link reached.
-#[test]
-fn seed_grep_reaches_a_page_no_link_points_to() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let cold = Cache::new();
-
-    let without = run_with(&[SEED_QUERY, SEED_ENTRY], &api, &cold);
-
-    assert_eq!(without.status.code(), Some(0), "{}", stderr(&without));
-    assert_eq!(
-        paths(&json(&without)),
-        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED],
-        "the walk follows the entry file's links and stops"
-    );
-
-    // A cache of its own, so the seeded run buys every answer: seeding is one
-    // more file judged.
-    let fresh = Cache::new();
-    let seeded = run_with(&[SEED_QUERY, SEED_ENTRY, "--seed-grep"], &api, &fresh);
-
-    assert_eq!(seeded.status.code(), Some(0), "{}", stderr(&seeded));
-    assert!(seeded.stderr.is_empty(), "{}", stderr(&seeded));
-    let list = json(&seeded);
-    assert_eq!(
-        paths(&list),
-        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED, SEED_ORPHAN],
-        "the keyword hit is on the frontier with the entry file"
-    );
-    assert_eq!(list["visited"], 4);
-    assert_eq!(list["calls"], 4);
-
-    let orphan = result(&list, SEED_ORPHAN);
-    assert_eq!(orphan["seeded"], json!(true), "a seed says so");
-    assert_eq!(orphan["via"], json!([]), "no path reached it");
-    assert_eq!(orphan["scent"], Value::Null);
-
-    let entry = result(&list, SEED_ENTRY);
-    assert_eq!(entry["seeded"], json!(false));
-    assert_eq!(entry["via"], json!([]));
-
-    let archive = result(&list, SEED_ARCHIVE);
-    assert_eq!(archive["seeded"], json!(false), "a link reached this one");
-    assert_eq!(
-        archive["via"].as_array().map(Vec::len),
-        Some(1),
-        "one hop from the page the entry links to"
-    );
-}
-
-/// `--seed-count` is not a flag of its own: a count with no `--seed-grep` is a
-/// usage error rather than a silent no-op, and it is caught before anything is
-/// bought.
-#[test]
-fn a_seed_count_without_seed_grep_exits_2() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let cache = Cache::new();
-
-    let output = run_with(&[SEED_QUERY, SEED_ENTRY, "--seed-count", "1"], &api, &cache);
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(output.stdout.is_empty());
-    let error = stderr(&output);
-    assert!(error.contains("--seed-grep"), "{error}");
-    assert_eq!(api.answered(), 0);
-}
-
-/// `--seed-count` is how many of the hits are used, and the entry file the
-/// caller named is left out before the count is applied rather than after: one
-/// takes the best hit, which is not the entry file, and two takes the orphan as
-/// well.
-#[test]
-fn seed_count_says_how_many_hits_are_used() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let cache = Cache::new();
-
-    let one = run_with(
-        &[SEED_QUERY, SEED_ENTRY, "--seed-grep", "--seed-count", "1"],
-        &api,
-        &cache,
-    );
-
-    assert_eq!(one.status.code(), Some(0), "{}", stderr(&one));
-    let one = json(&one);
-    assert_eq!(
-        paths(&one),
-        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED],
-        "one hit, and the orphan is not it"
-    );
-    assert_eq!(
-        result(&one, SEED_LINKED)["seeded"],
-        json!(true),
-        "the hit used is the best of them, not the entry file the caller named"
-    );
-
-    let two = run_with(
-        &[SEED_QUERY, SEED_ENTRY, "--seed-grep", "--seed-count", "2"],
-        &api,
-        &cache,
-    );
-
-    assert_eq!(two.status.code(), Some(0), "{}", stderr(&two));
-    let two = json(&two);
-    assert_eq!(
-        paths(&two),
-        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED, SEED_ORPHAN],
-        "the second hit is the orphan"
-    );
-    assert_eq!(result(&two, SEED_ORPHAN)["seeded"], json!(true));
 }
 
 // ----------------------------------------------------------- the .s1mignore
@@ -996,59 +813,6 @@ fn an_ignored_page_is_not_in_a_request_or_in_the_reading_list() {
     let tree = stdout(&tree);
     assert!(tree.contains(IGNORE_PUBLIC), "{tree}");
     assert!(!tree.contains("vault"), "{tree}");
-}
-
-/// `--seed-grep` reads the pages under the root to find its hits, so the ignore
-/// applies before it does: a matched page is not a candidate, and the run that
-/// seeds is the run without seeding — same list, same `seeded` flags, and a
-/// request that never named the page the query was written for.
-#[test]
-fn an_ignored_page_is_not_seeded() {
-    let api = FakeApi::new(3.0, 0.9, 0.7);
-    let plain = Cache::new();
-    let seeded = Cache::new();
-
-    let without = run_with(&[IGNORE_SEED_QUERY, IGNORE_ENTRY], &api, &plain);
-    assert_eq!(without.status.code(), Some(0), "{}", stderr(&without));
-
-    let output = run_with(
-        &[IGNORE_SEED_QUERY, IGNORE_ENTRY, "--seed-grep"],
-        &api,
-        &seeded,
-    );
-
-    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
-    let list = json(&output);
-    assert_eq!(
-        paths(&list),
-        paths(&json(&without)),
-        "the only page the query is written for is ignored, so there is nothing to seed"
-    );
-    assert!(!paths(&list).contains(&IGNORE_DRAFTS));
-    assert!(
-        list["results"]
-            .as_array()
-            .expect("results")
-            .iter()
-            .all(|file| file["seeded"] == json!(false)),
-        "{list}"
-    );
-
-    for request in api.requests() {
-        let links = request["state"]["links"]
-            .as_array()
-            .expect("a request carries the links it judges");
-        assert!(
-            links
-                .iter()
-                .all(|link| link["target"] != json!("drafts.md")),
-            "the matched page is not judged: {request}"
-        );
-        assert!(
-            !request.to_string().contains("not for sharing"),
-            "not a byte of the matched page's text is sent: {request}"
-        );
-    }
 }
 
 /// An entry file the caller named is the one case where a matched path is not

@@ -29,13 +29,10 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > [#7](https://github.com/mikekelly/s1m/issues/7), which keeps those answers on disk so a repeat
 > run is identical and free, the three relevance criteria from
 > [#10](https://github.com/mikekelly/s1m/issues/10) below, and the per-section scores and line
-> ranges from [#9](https://github.com/mikekelly/s1m/issues/9), where `--section-threshold` drops
-> the sections the model did not call useful. `s1m::cli` is the CLI's own half: the flags, the
+> ranges from [#9](https://github.com/mikekelly/s1m/issues/9), where a section below
+> `--threshold` is left out of the list. `s1m::cli` is the CLI's own half: the flags, the
 > walk, the reading list and the exit code, with the scorer injected so tests run it without a
-> key or a network. `s1m::seed` is `--seed-grep`
-> ([#14](https://github.com/mikekelly/s1m/issues/14)): the query's keywords matched against the
-> pages under the root and put on the frontier as extra entry files, so a page nothing links to
-> is still reached. `--format` prints that reading list as the JSON above, as `md` — the same
+> key or a network. `--format` prints that reading list as the JSON above, as `md` — the same
 > list to read or paste — or as `tree`, the walk's annotated link tree
 > ([#13](https://github.com/mikekelly/s1m/issues/13)). Milestone 3's numbers are in
 > [`eval/REPORT.md`](eval/REPORT.md), which `cargo run --release --bin eval` reproduced on a
@@ -84,21 +81,21 @@ cost, then one entry per visited file, most relevant first and ties broken by pa
 carries the relevance the model gave it, the scent of the link that reached it, the path that
 got there, the ranges worth reading, and its outgoing links as they were judged — `followed`
 says whether a link queued its target, so the caller can see what was passed over and why.
-`scent` is `null` and `via` is empty for an entry file, which no link reached, and `seeded` says
-whether the entry file was one the caller named or one `--seed-grep` found. A link whose target
+`scent` is `null` and `via` is empty for an entry file, which no link reached; a file a link
+reached carries the scent of that link and the `via` path it came along. A link whose target
 resolves outside `--root` is never followed, whatever its scent.
 
 `sections` is what to open: one entry per heading section of the file that the model called
 useful, each with the heading, the `[first, last]` lines to read and the score, most useful
-first. The ranges are the parser's, so the lines named are the text that was scored.
-`--section-threshold` (0 to 1, defaulting to `--threshold`) drops the sections that scored below
-it: a section is one yes-or-no question to the model, and a Noul near 0.5 means it was unsure,
-so the default leaves those out. Nothing is derived from the scores — a range is never narrowed
-or widened — and because a section's range contains its subsections', a parent that is a mix of
-useful and useless text lands near the middle and is dropped while the subsection that mattered
-stays. A caller that has read one returned range has read everything returned inside it. A file
-whose sections all fell below `--section-threshold` carries `"sections": []` in the JSON — it was
-scored, and nothing cleared the bar — and the `md` view says the same in words.
+first. The ranges are the parser's, so the lines named are the text that was scored. A section
+below `--threshold` is left out: a section is one yes-or-no question to the model, and a Noul
+near 0.5 means it was unsure, so the default leaves those out. Nothing is derived from the
+scores — a range is never narrowed or widened — and because a section's range contains its
+subsections', a parent that is a mix of useful and useless text lands near the middle and is
+dropped while the subsection that mattered stays. A caller that has read one returned range has
+read everything returned inside it. A file whose sections all fell below `--threshold` carries
+`"sections": []` in the JSON — it was scored, and nothing cleared the bar — and the `md` view
+says the same in words.
 
 Every path is spelled the way the entry files were given: `--root wiki` with `wiki/index.md`
 gives `wiki/payments/cutoffs.md`, not `payments/cutoffs.md`, and those are the paths a caller
@@ -120,7 +117,6 @@ what a cold run costs — the same query again is answered from the cache and re
       "relevance": 0.7833333333333333,
       "scent": 0.89,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
-      "seeded": false,
       "sections": [
         {
           "heading": "Release",
@@ -162,17 +158,14 @@ of the page is a "See also" list, which the model scored 0.14 and the threshold 
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
 | `--max-files` | 25 | Files visited before the walk stops. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over four more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
-| `--section-threshold` | `--threshold` | Least section score the reading list keeps, 0 to 1; a section below it is left out |
-| `--fanout` | 8 | Frontier files expanded per round; the eval did not vary it |
+| `--threshold` | 0.6 | Least link scent that queues a target and least section score the list keeps, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | `json` (the list above), `md` (a reading list to paste) or `tree` (the walk's link tree) |
-| `--seed-grep` | off | Add the top keyword hits under the root as extra entry files. The eval measured what it buys: mean recall from 0.67 to 0.89 for 2.7× the reading, so it stays off by default — ask for it when a wiki's best pages are poorly linked ([numbers](eval/REPORT.md#seeding-and-the-pages-links-cannot-reach)) |
-| `--seed-count` | 5 | How many hits `--seed-grep` adds; needs `--seed-grep` |
 
-Every default but `--fanout` is backed by a number in [eval/REPORT.md](eval/REPORT.md), and the
-decisions are recorded in [docs/initial-plan.md](docs/initial-plan.md#defaults-from-the-evaluation).
+The `--threshold` and `--max-files` defaults are backed by numbers in
+[eval/REPORT.md](eval/REPORT.md), and the decisions are recorded in
+[docs/initial-plan.md](docs/initial-plan.md#defaults-from-the-evaluation).
 
 ### Output formats
 
@@ -214,18 +207,18 @@ relevance 0.62; scent 0.87; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
 relevance 0.55; scent 0.84; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- nothing above --section-threshold
+- nothing above --threshold
 
 ## 5. `eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md`
 
 relevance 0.27; scent 0.63; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- nothing above --section-threshold
+- nothing above --threshold
 ```
 
 This is that query from the cache, so it reports no calls and its digits are the stored answers
 rather than the JSON sample's above; `md` is the same reading list either way. A file whose
-sections all fell below `--section-threshold` says so in place of a section line, and a section
+sections all fell below `--threshold` says so in place of a section line, and a section
 with no heading of its own — the text before a file's first heading — reads `(preamble)` where
 the heading would be.
 
@@ -265,9 +258,9 @@ entry follows the link at 0.86; `dogfooding.md`'s stronger-looking link to it, a
 `pruned`, because the file had already been reached and a file is visited once, along the best
 path found to it. The other pruned lines are links the model scored below `--threshold`, which
 is why five files are where the walk spent its calls. Roots are the files no link reached: the
-entry files the caller named, and any `--seed-grep` hit, marked `keyword seed`. A link whose
-target the model never judged prints `scent unknown` — such a link can never be followed, and a
-0.00 would read as a judgment when none was made.
+entry files the caller named, marked `entry file`. A link whose target the model never judged
+prints `scent unknown` — such a link can never be followed, and a 0.00 would read as a judgment
+when none was made.
 
 Both views round scores to two decimals, because they are for reading: `json` is where the
 model's own number lives. Both are rendered from the reading list alone, so either can be
@@ -359,7 +352,6 @@ A matched path is never read, on the way in and on the way out:
 | Where | What happens |
 | --- | --- |
 | A link whose target matches | The link is out of the file before it is judged: no question is asked about it, its target is not opened for a [preview](#what-is-sent-about-each-link), its path is not among the request's links, and the walk does not queue it whatever the model would have scored it. The reading list reports no such link — not as pruned, but not at all |
-| A page `--seed-grep` would hit | It is not a candidate: the keyword match reads the pages under the root, and a matched page is not one of them |
 | An entry file you name | Exit 2 with the path, the `.s1mignore` and one line on stderr, before anything is read or bought. Naming a path is asking for it, so silence would be the wrong answer |
 | The `.s1mignore` itself | A file that cannot be read, that holds a pattern that does not parse, or that is there but is not a readable file — a directory, a symlink whose target has gone — is exit 2. Dropping a rule quietly would send exactly the files the rule was written for |
 
@@ -391,33 +383,6 @@ A file the walk *reached* but could not read is neither an error nor a silent om
 to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
 walk carries on. A *judgment* that fails is an error, because a reading list with a hole in its
 ranking is a different answer.
-
-### Seeding
-
-The walk follows links, so a page nothing links to is never reached however relevant it is.
-`--seed-grep` is the other way in: before the walk starts, s1m reads the pages under `--root`,
-counts the query's keywords in each, and puts the best `--seed-count` of them on the frontier as
-extra entry files — path score 1, no `via`, and `seeded: true` in the reading list.
-
-```bash
-s1m --seed-grep "how do I cut a release and publish the package" \
-  eval/wikis/llm-wiki-manager/wiki/index.md
-```
-
-A keyword is a whole word of three characters or more: `we`, `do` and `a` name too little of a
-query to be worth a hit, and matching a term anywhere in the text would count `for` inside
-`before` and `note` inside `notes`. Files rank by how many of the query's terms they match, then
-by how many hits they have, then by path — the page covering more of the query first, and never
-the order a directory happened to list its files in. The candidates are the same `.md`/`.txt`
-files the parser resolves wikilinks against, so a hidden directory is not searched and a page
-the root's [`.s1mignore`](#keeping-paths-out-of-it-s1mignore) matches is not a candidate — it is
-not read to count a keyword in it — and the entry files the caller named are left out of the
-hits: they are on the frontier already.
-
-This is a keyword match, not a second opinion: it recovers pages that are orphaned or weakly
-linked, and the ranking still comes from the model. A seed that the walk would have reached
-anyway costs no extra call — a seed enters at path score 1 and a file is judged once — and a
-seeded run whose links all fell below the threshold still exits 1, with its seeds in the list.
 
 ### Environment
 
@@ -477,8 +442,8 @@ those and it is a different question; a second identical run makes no API call a
 is one file's judgment, and what that judgment cost when it was bought — the model, the request
 count, the tokens and the latency — so a run whose answers all came off the disk can still say
 what they cost, which is what [`eval/REPORT.md`](eval/REPORT.md) does. The
-thresholds are the caller's, applied to the answers, so changing `--threshold` or
-`--section-threshold` between runs buys nothing.
+thresholds are the caller's, applied to the answers, so changing `--threshold` between runs
+buys nothing.
 
 The model in that key is the alias the request asks for — `jev-latest` — not the version that
 answered it, which is only known once the call has come back. An entry therefore keeps the
@@ -514,10 +479,10 @@ cargo run --release --bin eval -- \
 The harness walks each query at `--max-files` 10 and 25 and reports, per query and in total:
 recall and precision against the gold set, the tokens an agent would read (the returned ranges,
 the same files whole, and the whole corpus), what the API was asked and what it cost, the same
-numbers for the keyword ranker `--seed-grep` uses, the same again with seeding on, the
-calibration curve of a link's scent against what following it reached, a `--threshold` sweep,
-and the preview experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred —
-previews off, previews without frontmatter, previews as they ship.
+numbers for the keyword ranker, the calibration curve of a link's scent against what following
+it reached, a `--threshold` sweep, and the preview experiment
+[#10](https://github.com/mikekelly/s1m/issues/10) deferred — previews off, previews without
+frontmatter, previews as they ship.
 
 Nothing about a wiki or a gold set is in the harness: both are paths, so the same command
 measures a private wiki, and the gold set's paths are relative to `--wiki`. The report is
@@ -536,8 +501,7 @@ Its headline, in three lines:
   everything.
 - **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s
   an answer. On this wiki the keyword ranker finds more and reads far more — recall 0.94 against
-  s1m's 0.67, at 6.9× the tokens — and `--seed-grep 5` on top of the walk is the middle, at recall
-  0.89 for 94,790 tokens.
+  s1m's 0.67, at 6.9× the tokens.
 
 ## Library
 
@@ -548,15 +512,14 @@ the CLI, so they can be driven directly from tests:
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
-| `ignore::Ignore` | The root's `.s1mignore`: `Ignore::at(root)` reads it (a root without one matches nothing, a file that cannot be read or parsed is an error, and `Ignore::none()` is the empty set), `matched(relative_path)` answers for a path or any directory above it. One value a run is built around, asked by the CLI for its entry files, by the walk for what it may read and link to, and by `seed` for its candidates |
+| `ignore::Ignore` | The root's `.s1mignore`: `Ignore::at(root)` reads it (a root without one matches nothing, a file that cannot be read or parsed is an error, and `Ignore::none()` is the empty set), `matched(relative_path)` answers for a path or any directory above it. One value a run is built around, asked by the CLI for its entry files, by the walk for what it may read and link to |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1), one `SectionJudgment` (`heading`, `lines` as the parser gave them, `score` 0 to 1) per section and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, each in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
 | `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's sections and links would not fit the API's 32k state budget in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
-| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file or seed before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, whether they were a keyword seed, their sections (the parser's ranges, in document order) and the outgoing links it judged |
-| `seed::seed(root, query, count, skip, ignore)` | In-process keyword match, no ripgrep: the best `count` pages under `root` for `query`'s keywords, spelled the way `traverse` wants its entry files, with `skip` — the caller's entry files — left out and `ignore`'s matched pages left out before they are read. Whole words of three characters or more, ranked by terms matched, then hits, then path |
-| `cli::Options` | One run's flags — the query, the entry files, the root, the budgets and how many keyword hits to seed — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, their sections (the parser's ranges, in document order) and the outgoing links it judged |
+| `cli::Options` | One run's flags — the query, the entry files, the root and the budgets — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
 | `cli::ReadingList` | The plan's shape, `exit_code()` for the 0/1 decision, and `to_json()` for the JSON view — the other two views are `format::Format::render` |
@@ -593,10 +556,8 @@ tree — an entry page, the page it links to, and two pages the root's rules cov
 directory pattern and one by name — which `tests/cli.rs` walks while holding the fake API to
 the guarantee: no request names those pages and no request carries a byte of their text.
 `tests/fixtures/ignore-broken/` is a root whose `.s1mignore` does not parse, and is the run
-that exits 2 naming the line. `tests/fixtures/seed/` is the `--seed-grep` tree — an entry page,
-the chain it links to, a page in a hidden directory, and a page nothing links to — which
-`src/seed.rs` measures the keyword match against and `tests/cli.rs` walks both ways.
-`eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
+that exits 2 naming the line. `eval/wikis/llm-wiki-manager/` is a real one, vendored with its
+licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
 `docs/spike-notes.md` was measured on. `eval/gold/` labels it for the evaluation harness, and
 `eval/cache/` holds the answers [`eval/REPORT.md`](eval/REPORT.md) was written from, which is

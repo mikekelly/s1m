@@ -7,8 +7,8 @@
 //! results and hands [`s1m::format`] the reading list a caller would get — so
 //! what these tests defend is the view of a real run and not a hand-built list.
 //! The edges a run like this cannot show (no result at all, a link the model
-//! named no scent for, a seed that no link reached) are pinned by the unit
-//! tests in `src/format.rs`.
+//! named no scent for, a file no link reached) are pinned by the unit tests in
+//! `src/format.rs`.
 //!
 //! The expected outputs are committed under `tests/snapshots/` and compared
 //! byte for byte, so a change to either view shows up as a diff of a file a
@@ -161,7 +161,7 @@ const ANSWERS: &[(&str, Answer)] = &[
             scents: &[("notes/ledger.md", 0.35)],
         },
     ),
-    // Nothing links here and no seed is on, so the walk never scores it.
+    // Nothing links here, so the walk never scores it.
     (
         "notes/scratch.md",
         Answer {
@@ -248,9 +248,7 @@ async fn walk() -> cli::ReadingList {
         max_files: MAX_FILES,
         max_depth: MAX_DEPTH,
         threshold: THRESHOLD,
-        section_threshold: THRESHOLD,
         fanout: FANOUT,
-        seed_grep: None,
         mode: "useful-for".to_string(),
     };
 

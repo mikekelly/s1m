@@ -15,10 +15,8 @@
 //! What a matched path is not, on one run:
 //!
 //! - **not read**: an entry file the caller names that matches is exit 2 rather
-//!   than a silent read ([`crate::cli::Error::Ignored`]), `--seed-grep` leaves a
-//!   matched page out of its candidates before it opens it
-//!   ([`crate::seed::seed`]), and a matched link target is taken out of the file
-//!   before it is scored.
+//!   than a silent read ([`crate::cli::Error::Ignored`]), and a matched link
+//!   target is taken out of the file before it is scored.
 //! - **not previewed**: the preview a request carries is read from the target
 //!   ([`crate::parse::preview`]), and a target this module drops never gets
 //!   there.
@@ -55,9 +53,8 @@ pub const FILE: &str = ".s1mignore";
 /// The patterns one root's `.s1mignore` holds.
 ///
 /// [`Ignore::at`] reads them once per run, and the same value is what the CLI
-/// asks about its entry files, the walk about what it may parse and link to, and
-/// the keyword seeds about their candidates, so a run cannot see two versions of
-/// the rules.
+/// asks about its entry files and the walk about what it may parse and link to,
+/// so a run cannot see two versions of the rules.
 #[derive(Debug)]
 pub struct Ignore {
     /// The root the patterns were read against: a path given relative to it is
