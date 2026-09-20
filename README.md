@@ -142,16 +142,19 @@ of the page is a "See also" list, which the model scored 0.14 and the threshold 
 | --- | --- | --- |
 | `--mode` | `useful-for` | What relevance means: `about`, `useful-for` or `answers` |
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
-| `--max-files` | 25 | Files visited before the walk stops |
+| `--max-files` | 25 | Files visited before the walk stops. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over four more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target, 0 to 1 |
+| `--threshold` | 0.6 | Least link scent that queues a target, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--section-threshold` | `--threshold` | Least section score the reading list keeps, 0 to 1; a section below it is left out |
-| `--fanout` | 8 | Frontier files expanded per round |
+| `--fanout` | 8 | Frontier files expanded per round; the eval did not vary it |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | `json` (the list above), `md` (a reading list to paste) or `tree` (the walk's link tree) |
-| `--seed-grep` | off | Add the top keyword hits under the root as extra entry files |
+| `--seed-grep` | off | Add the top keyword hits under the root as extra entry files. The eval measured what it buys: mean recall from 0.67 to 0.89 for 2.7× the reading, so it stays off by default — ask for it when a wiki's best pages are poorly linked ([numbers](eval/REPORT.md#seeding-and-the-pages-links-cannot-reach)) |
 | `--seed-count` | 5 | How many hits `--seed-grep` adds; needs `--seed-grep` |
+
+Every default but `--fanout` is backed by a number in [eval/REPORT.md](eval/REPORT.md), and the
+decisions are recorded in [docs/initial-plan.md](docs/initial-plan.md#defaults-from-the-evaluation).
 
 ### Output formats
 
@@ -306,9 +309,10 @@ separates a page which says nothing from one whose own links point at the answer
 250 input tokens a link, and a threshold tuned with previews is not valid without them
 ([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
 caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
-is the part of a preview most likely to mislead; splitting it out is an experiment for the
-evaluation milestone ([#11](https://github.com/mikekelly/s1m/issues/11)), not a decision to make
-here.
+is the part of a preview most likely to mislead, and the eval put a number on it: dropping the
+frontmatter costs 0.21 of mean recall (0.67 → 0.46) for 43% of the input tokens saved, and
+dropping previews altogether costs 0.28, so the frontmatter is the larger half of what a preview
+buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
 Exit codes:
 

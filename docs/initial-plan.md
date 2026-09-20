@@ -87,7 +87,7 @@ the README's Custom criteria section.
 ### Scoring and pruning
 
 - A frontier entry's priority is its path score: the product of link scents along the best path found so far, so long chains of weak links fade out.
-- A link is queued only if its scent clears `--threshold`. A Noul near 0.5 means uncertain, not moderately relevant, so the default threshold sits above it and is tuned on real data.
+- A link is queued only if its scent clears `--threshold`. A Noul near 0.5 means uncertain, not moderately relevant, so the default threshold sits above it, at the knee the evaluation found (0.6: see "Defaults from the evaluation").
 - A file reached by several paths keeps its best path score and is visited once.
 - Optional seeding: `--seed-grep` adds the top keyword hits as extra entry points, which recovers relevant pages that are orphaned or poorly linked.
 
@@ -97,7 +97,9 @@ Answers are cached on the hash of the request that produced them — file conten
 
 ## Interface
 
-One command, a query, and one or more entry files. Flag names and defaults below are proposals.
+One command, a query, and one or more entry files. The flag names and defaults below are what
+ships; the evaluation checked the defaults and left them as they stand (see "Defaults from the
+evaluation").
 
 ```bash
 s1m "how do we handle settlement timing for instant payouts" wiki/index.md
@@ -117,6 +119,28 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | `--seed-grep` | off | Add top keyword hits as extra entry points |
 | `--format` | `json` | `json`, `md` (reading list) or `tree` (annotated link tree for humans) |
 | `--root` | entry file's directory | Links resolving outside it are not followed |
+
+### Defaults from the evaluation
+
+[#11](https://github.com/mikekelly/s1m/issues/11) measured a 20-query gold set on a 19-page wiki
+(`eval/REPORT.md`), and [#12](https://github.com/mikekelly/s1m/issues/12) read it against the
+flags above. No default moved:
+
+| Flag | Default | What the numbers say |
+| --- | --- | --- |
+| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.67 over 35245 read tokens, 0.5 lifts recall to 0.72 for +39% of the reading, 0.7 drops it to 0.53 for -26% and 0.8 to 0.36 for -69%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
+| `--max-files` | 25 | Not what binds on this corpus: 25 returns a mean recall of 0.67, the same as 10, over 87 files instead of 83 and 40468 read tokens instead of 35245. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
+| `--fanout` | 8 | Unmeasured: the eval never varied it. It bounds how many frontier files a round expands, so on a corpus this size it moves the round count rather than what clears the threshold |
+| `--seed-grep` | off | Off, as the plan had it: seeding lifts mean recall from 0.67 to 0.89 at `--max-files` 10 (0.91 at 25) and reads 94790 tokens against 35245 — 2.7× the reading for the pages links never reached, plus a keyword pass over every file under the root, per query. An agent that wants that recall asks for it |
+
+Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.21 of
+recall (0.67 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.28 —
+the frontmatter is the larger half of what a preview buys, `related:` being why (`eval/REPORT.md`,
+the preview experiment).
+
+The flag table above is what the code holds — `src/main.rs` for the numbers, `JevScorer::from_env`
+for previews with frontmatter and the frontmatter inside them — so the decision is this record and
+the README's table rather than a diff.
 
 ### Output
 
@@ -153,7 +177,7 @@ The tool description agents see should state plainly that s1m reads local files 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
 | Recall is bounded by link structure | Orphaned or weakly linked pages are never reached | `--seed-grep`; report unreachable files in a debug mode |
-| Thresholds are not universal | Too high prunes good trails, too low wastes budget | Calibrate on a labelled set from a real wiki before fixing defaults |
+| Thresholds are not universal | Too high prunes good trails, too low wastes budget | Calibrated on a labelled wiki by the evaluation ([#12](https://github.com/mikekelly/s1m/issues/12)): 0.6 is the knee there, on 19 pages — a larger corpus is unmeasured |
 | Network dependency | Every cold run needs the TypeSafe API and a key | Cache aggressively; fail fast with a clear error; consider a grep-only fallback |
 | Content leaves the machine | Private wikis are sent to a third party | State it in the README; add an ignore file for sensitive paths |
 | Request limits | Hub pages with hundreds of links may exceed per-request question or state limits | Chunk links across requests; limits not yet checked against the API docs |
@@ -162,8 +186,22 @@ The tool description agents see should state plainly that s1m reads local files 
 ### Open questions
 
 - [ ] Python or TypeScript? Both have TypeSafe SDKs.
-- [ ] Does a link preview (title plus first paragraph) improve scent enough to justify the extra tokens?
-- [ ] Is a Score the right primitive for file relevance, or is a Noul simpler and good enough?
+- [x] Does a link preview (title plus first paragraph) improve scent enough to justify the extra
+  tokens? **Yes, and the frontmatter is the larger half of it.** At `--max-files` 10 on the eval
+  wiki, dropping the frontmatter costs 0.21 of recall (0.67 → 0.46) for 43% of the input tokens
+  saved, and dropping previews altogether costs 0.28; on the hub page the frontmatter is what lifts
+  the links to two of the wanted pages over `--threshold`. `related:` making every page look
+  connected is the opposite failure to the one [#10](https://github.com/mikekelly/s1m/issues/10)
+  feared. Previews therefore ship whole, with no caller flag (`eval/REPORT.md`, the preview
+  experiment).
+- [x] Is a Score the right primitive for file relevance, or is a Noul simpler and good enough?
+  **Keep the Score.** The reading list is ordered and sorted by relevance, and a Score answers on
+  that scale where a Noul's 0.5 means unsure rather than middling; its separate `confidence` is
+  what a gate would read (`docs/spike-notes.md`, "Is a Score right for file relevance, or is a Noul
+  enough"). The eval measures it from the other side: mean file relevance rises with the scent the
+  file arrived by, 0.70 in the 0.6–0.7 bin against 0.93 in the 0.9–1.0 bin, and so does the share
+  of arrivals the gold set wanted, 0.16 to 0.86 (`eval/REPORT.md`, the calibration table). A Noul
+  stays where the question is yes/no: one per section, one per link.
 - [ ] Should very long files be scored by section only, skipping the whole-file judgment?
 - [ ] Expose as an MCP server as well as a CLI?
 
