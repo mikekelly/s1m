@@ -14,13 +14,21 @@
 //!   [#9](https://github.com/mikekelly/s1m/issues/9): the query, the criterion
 //!   the answers were judged against, how many files were visited and how many
 //!   calls they cost, and one entry per visited file with its relevance, the
-//!   scent of the link that reached it, the `via` path, and the outgoing links
-//!   that were judged.
+//!   scent of the link that reached it, the `via` path, whether it entered the
+//!   walk as a keyword seed, and the outgoing links that were judged.
 //! - Sorted by relevance descending, then path. Every path is spelled the way
 //!   the caller spelled its entry files, so `--root wiki` with `wiki/index.md`
 //!   reads `wiki/payments/cutoffs.md` and not `payments/cutoffs.md`. That is
 //!   the spelling the plan's example uses, and the one a caller can hand
 //!   straight back to an editor or another command.
+//!
+//! `--seed-grep` adds the query's keyword hits under the root to the frontier as
+//! extra entry files ([`crate::seed`]), and `--seed-count` says how many. A seed
+//! walks exactly like an entry file, and the reading list says which results
+//! they are with `seeded`. The caller's own entry files are left out of the
+//! hits: they are on the frontier already. Seeding changes nothing about the
+//! exit codes — a seeded run whose links all fell below the threshold still
+//! exits 1, with its seeds in the list.
 //!
 //! What the exit code is:
 //!
@@ -44,6 +52,7 @@ use serde::Serialize;
 use crate::cache::{Cacheable, CachedScorer};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
+use crate::seed;
 use crate::traverse::{Config, FailedFile, Failure, Traversal, TraverseError, traverse};
 
 /// One run's inputs: the flags the CLI carries, with their defaults applied.
@@ -70,6 +79,11 @@ pub struct Options {
     pub threshold: f64,
     /// Frontier files expanded per round.
     pub fanout: usize,
+    /// Most keyword hits `--seed-grep` adds as extra entry files under the
+    /// root, or `None` when seeding is off, which is the default. The entry
+    /// files are left out of the hits: they are on the frontier already, so a
+    /// hit on one of them is not an extra entry point.
+    pub seed_grep: Option<usize>,
     /// The criterion the answers were judged against, as the reading list
     /// reports it: the mode's name (`about`, `useful-for`, `answers`), or the
     /// criteria file's path when `--criteria` named one. The scorer is what
@@ -226,6 +240,9 @@ pub struct RankedFile {
     /// The files on the best path to this one, in order and excluding it; empty
     /// for an entry file.
     pub via: Vec<String>,
+    /// Whether this file entered the walk as a `--seed-grep` keyword seed
+    /// rather than as an entry file the caller named or along a link.
+    pub seeded: bool,
     /// This file's outgoing links, in the order they appear, one per target.
     pub links: Vec<RankedLink>,
 }
@@ -293,9 +310,15 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         parse::parse(entry, &root)?;
     }
 
+    let seeds = match options.seed_grep {
+        Some(count) => seed::seed(&root, &options.query, count, &options.entries),
+        None => Vec::new(),
+    };
+
     let config = Config {
         query: &options.query,
         entries: &options.entries,
+        seeds: &seeds,
         root: &root,
         max_files: options.max_files,
         max_depth: options.max_depth,
@@ -330,6 +353,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
             relevance: file.relevance,
             scent: file.scent,
             via: file.via.iter().map(|via| display(&root, via)).collect(),
+            seeded: file.seeded,
             links: file
                 .links
                 .into_iter()
@@ -486,6 +510,7 @@ mod tests {
             max_depth: 6,
             threshold: 0.6,
             fanout: 8,
+            seed_grep: None,
             mode: "useful-for".to_string(),
         }
     }
@@ -515,6 +540,7 @@ mod tests {
                         "relevance": 0.9,
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md", "tests/fixtures/cli/next.md"],
+                        "seeded": false,
                         "links": [],
                     },
                     {
@@ -522,6 +548,7 @@ mod tests {
                         "relevance": 0.9,
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md"],
+                        "seeded": false,
                         "links": [
                             {
                                 "target": "tests/fixtures/cli/deep.md",
@@ -535,6 +562,7 @@ mod tests {
                         "relevance": 0.3,
                         "scent": null,
                         "via": [],
+                        "seeded": false,
                         "links": [
                             {
                                 "target": "tests/fixtures/cli/next.md",

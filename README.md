@@ -22,8 +22,10 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > run is identical and free, and the three relevance criteria from
 > [#10](https://github.com/mikekelly/s1m/issues/10) below. `s1m::cli` is the CLI's own half: the
 > flags, the walk, the reading list and the exit code, with the scorer injected so tests run it
-> without a key or a network.
-> Section line ranges are [#9](https://github.com/mikekelly/s1m/issues/9); `--seed-grep` and the
+> without a key or a network. `s1m::seed` is `--seed-grep`
+> ([#14](https://github.com/mikekelly/s1m/issues/14)): the query's keywords matched against the
+> pages under the root and put on the frontier as extra entry files, so a page nothing links to
+> is still reached. Section line ranges are [#9](https://github.com/mikekelly/s1m/issues/9); the
 > `md` and `tree` formats are later. The design lives in
 > [docs/initial-plan.md](docs/initial-plan.md); what the Jev calls cost and how they read on
 > real pages is in [docs/spike-notes.md](docs/spike-notes.md).
@@ -58,9 +60,10 @@ criterion the answers were judged against, how many files were visited and how m
 cost, then one entry per visited file, most relevant first and ties broken by path. Each entry
 carries the relevance the model gave it, the scent of the link that reached it, the path that
 got there, and its outgoing links as they were judged — `followed` says whether a link queued
-its target, so the caller can see what was passed over and why. `scent` is `null` for an entry
-file, which no link reached, and a link whose target resolves outside `--root` is never
-followed, whatever its scent. Line ranges and per-section scores are
+its target, so the caller can see what was passed over and why. `scent` is `null` and `via` is
+empty for an entry file, which no link reached, and `seeded` says whether the entry file was one
+the caller named or one `--seed-grep` found. A link whose target resolves outside `--root` is
+never followed, whatever its scent. Line ranges and per-section scores are
 [#9](https://github.com/mikekelly/s1m/issues/9).
 
 Every path is spelled the way the entry files were given: `--root wiki` with `wiki/index.md`
@@ -83,6 +86,7 @@ what a cold run costs — the same query again is answered from the cache and re
       "relevance": 0.8133333333333334,
       "scent": 0.87,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
+      "seeded": false,
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
@@ -116,8 +120,10 @@ what a cold run costs — the same query again is answered from the cache and re
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | Only `json` exists so far; any other value exits 2 |
+| `--seed-grep` | off | Add the top keyword hits under the root as extra entry files |
+| `--seed-count` | 5 | How many hits `--seed-grep` adds; needs `--seed-grep` |
 
-Not implemented yet: `--seed-grep`, and the `md` and `tree` formats.
+Not implemented yet: the `md` and `tree` formats.
 
 ### Relevance modes
 
@@ -188,6 +194,31 @@ A file the walk *reached* but could not read is neither an error nor a silent om
 to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
 walk carries on. A *judgment* that fails is an error, because a reading list with a hole in its
 ranking is a different answer.
+
+### Seeding
+
+The walk follows links, so a page nothing links to is never reached however relevant it is.
+`--seed-grep` is the other way in: before the walk starts, s1m reads the pages under `--root`,
+counts the query's keywords in each, and puts the best `--seed-count` of them on the frontier as
+extra entry files — path score 1, no `via`, and `seeded: true` in the reading list.
+
+```bash
+s1m --seed-grep "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+```
+
+A keyword is a whole word of three characters or more: `we`, `do` and `a` name too little of a
+query to be worth a hit, and matching a term anywhere in the text would count `for` inside
+`before` and `note` inside `notes`. Files rank by how many of the query's terms they match, then
+by how many hits they have, then by path — the page covering more of the query first, and never
+the order a directory happened to list its files in. The candidates are the same `.md`/`.txt`
+files the parser resolves wikilinks against, so a hidden directory is not searched, and the
+entry files the caller named are left out of the hits: they are on the frontier already.
+
+This is a keyword match, not a second opinion: it recovers pages that are orphaned or weakly
+linked, and the ranking still comes from the model. A seed that the walk would have reached
+anyway costs no extra call — a seed enters at path score 1 and a file is judged once — and a
+seeded run whose links all fell below the threshold still exits 1, with its seeds in the list.
 
 ### Environment
 
@@ -269,8 +300,9 @@ the CLI, so they can be driven directly from tests:
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the link question and what counts as yes and no. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused(judgment)`, and `calls()` and `hits()` count what reached the API and what came off the disk |
-| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path and the outgoing links it judged |
-| `cli::Options` | One run's flags — the query, the entry files, the root and the budgets — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, whether they were a keyword seed, and the outgoing links it judged |
+| `seed::seed(root, query, count, skip)` | In-process keyword match, no ripgrep: the best `count` pages under `root` for `query`'s keywords, spelled the way `traverse` wants its entry files, with `skip` — the caller's entry files — left out. Whole words of three characters or more, ranked by terms matched, then hits, then path |
+| `cli::Options` | One run's flags — the query, the entry files, the root, the budgets and how many keyword hits to seed — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
 | `cli::ReadingList` | The plan's JSON shape, `exit_code()` for the 0/1 decision, and `to_json()` for stdout |
@@ -297,6 +329,9 @@ with a broken link beside it, and `tests/fixtures/criteria/` is a criterion of a
 `tests/cli.rs` runs the binary over both: the API is a loopback server the test answers itself,
 pointed at with `S1M_ENDPOINT`, so the exit codes, the JSON on stdout, which criterion reached
 the request, and the cache behaviour are checked end to end without a key or a network.
+`tests/fixtures/seed/` is the `--seed-grep` tree — an entry page, the chain it links to, a page
+in a hidden directory, and a page nothing links to — which `src/seed.rs` measures the keyword
+match against and `tests/cli.rs` walks both ways.
 `eval/wikis/llm-wiki-manager/` is a real one, vendored with its licence and commit
 ([its source](eval/wikis/llm-wiki-manager/SOURCE.md)), which `tests/jev_live.rs` scores and
 `docs/spike-notes.md` was measured on. `src/jev.rs` tags each answer with the question id it

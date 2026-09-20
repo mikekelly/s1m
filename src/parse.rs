@@ -681,11 +681,43 @@ fn destination(dest: &str) -> Option<&Path> {
     Some(path)
 }
 
+/// Every `.md`/`.txt` file under the root, relative to it and sorted.
+///
+/// The pages a root holds, which is what both name lookup and keyword seeding
+/// need. Hidden directories are not descended, unreadable directories and
+/// entries whose kind cannot be read are skipped, and a directory reached
+/// through a symlink is not a directory here — the kind is read without
+/// following the link — so the listing never loops.
+pub(crate) fn pages(root: &Path) -> Vec<PathBuf> {
+    let mut pages = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                if !entry.file_name().to_string_lossy().starts_with('.') {
+                    pending.push(entry.path());
+                }
+                continue;
+            }
+            let path = entry.path();
+            if !is_page(&path) {
+                continue;
+            }
+            pages.push(normalize(&relative_to(root, &path)));
+        }
+    }
+    pages.sort();
+    pages
+}
+
 /// File names of every `.md`/`.txt` file under the root, for wikilinks that
 /// name a file rather than a path.
-///
-/// Hidden directories are not descended and unreadable ones are skipped: this
-/// is a name lookup, not a crawl of the tree.
 #[derive(Debug, Default)]
 struct NameIndex {
     by_name: HashMap<String, Vec<PathBuf>>,
@@ -695,35 +727,19 @@ struct NameIndex {
 impl NameIndex {
     fn scan(root: &Path) -> NameIndex {
         let mut index = NameIndex::default();
-        let mut pending = vec![root.to_path_buf()];
-        while let Some(directory) = pending.pop() {
-            let Ok(entries) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let Ok(kind) = entry.file_type() else {
-                    continue;
-                };
-                if kind.is_dir() {
-                    if !entry.file_name().to_string_lossy().starts_with('.') {
-                        pending.push(entry.path());
-                    }
-                    continue;
-                }
-                let path = entry.path();
-                if !is_page(&path) {
-                    continue;
-                }
-                let target = normalize(&relative_to(root, &path));
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let stem = path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                index.by_name.entry(name).or_default().push(target.clone());
-                index.by_stem.entry(stem).or_default().push(target);
-            }
+        for target in pages(root) {
+            let name = target
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let stem = target
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            index.by_name.entry(name).or_default().push(target.clone());
+            index.by_stem.entry(stem).or_default().push(target);
         }
         for targets in index.by_name.values_mut() {
             targets.sort();
