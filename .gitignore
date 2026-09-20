@@ -1,0 +1,8 @@
+/target
+
+# Local secrets. .env.example is committed; real keys never are.
+.env
+.env.*
+!.env.example
+
+.DS_Store

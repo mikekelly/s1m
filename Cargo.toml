@@ -1,0 +1,10 @@
+[package]
+name = "s1m"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Finds the parts of a markdown knowledge base relevant to a query by walking its links."
+publish = false
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
