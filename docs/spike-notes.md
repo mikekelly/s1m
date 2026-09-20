@@ -256,11 +256,17 @@ average in one column.
 
 ## Not settled by this spike
 
+[#11](https://github.com/mikekelly/s1m/issues/11) measured the first two of these on the labelled
+gold set; [`eval/REPORT.md`](../eval/REPORT.md) has the numbers and the method.
+
 - Calibration. No gold set, so nothing here says whether scent 0.89 is *right*, only that it is
   clearly above 0.16 on the same page. The default `--threshold` needs
-  [#9](https://github.com/mikekelly/s1m/issues/9)/evaluation, not this data.
+  [#9](https://github.com/mikekelly/s1m/issues/9)/evaluation, not this data. → the evaluation
+  report's calibration curve and threshold sweep.
+- The frontmatter. This spike varied the whole preview as one knob and could not say which part
+  did the work. → `JevScorer::with_preview_frontmatter`, and the report's preview experiment.
 - Whether splitting a file's questions across requests is better than trimming its previews, past
   the measurements [#9](https://github.com/mikekelly/s1m/issues/9) took: a split keeps every
-  answer at full fidelity, and costs a second round trip for the same file.
+  answer at full fidelity, and costs a second round trip for the same file. → still open.
 - Whether the Score's four levels beat a different number of levels, or beat a Noul plus a
-  second "is it even on topic" question. One run per page is not enough to tell.
+  second "is it even on topic" question. One run per page is not enough to tell. → still open.
