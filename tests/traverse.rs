@@ -164,6 +164,7 @@ fn delay(seed: &AtomicUsize) -> u64 {
 struct Settings {
     root: PathBuf,
     entries: Vec<PathBuf>,
+    seeds: Vec<PathBuf>,
     max_files: usize,
     max_depth: usize,
     fanout: usize,
@@ -176,11 +177,19 @@ impl Settings {
         Settings {
             entries: entries.iter().map(|entry| root.join(entry)).collect(),
             root,
+            seeds: Vec::new(),
             max_files: 8,
             max_depth: 6,
             fanout: 4,
             threshold: 0.6,
         }
+    }
+
+    /// Seeds the walk: the extra entry files `--seed-grep` found, given the way
+    /// the seeder spells them.
+    fn seeds(mut self, seeds: &[&str]) -> Self {
+        self.seeds = seeds.iter().map(|seed| self.root.join(seed)).collect();
+        self
     }
 
     fn max_files(mut self, max_files: usize) -> Self {
@@ -207,6 +216,7 @@ impl Settings {
         let config = Config {
             query: QUERY,
             entries: &self.entries,
+            seeds: &self.seeds,
             root: &self.root,
             max_files: self.max_files,
             max_depth: self.max_depth,
@@ -879,6 +889,7 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
     let config = Config {
         query: QUERY,
         entries: &entries,
+        seeds: &[],
         root: &root,
         max_files: 8,
         max_depth: 6,
@@ -890,4 +901,72 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
         traverse(&config, &scorer).await,
         Err(TraverseError::BaseMismatch { .. })
     ));
+}
+
+/// A seed is an entry file the walk was not given: it starts at path score 1
+/// with no scent and no `via` path, expands like any entry file, and the result
+/// says it was a seed rather than a file a link reached.
+#[tokio::test]
+async fn a_seed_enters_the_walk_like_an_entry_file() {
+    let scorer = Fake::new(&[
+        ("index.md", Entry::new(0.3, &[("payments/cutoffs.md", 0.9)])),
+        (
+            "notes/scratch.md",
+            Entry::new(1.0, &[("notes/ledger.md", 0.9)]),
+        ),
+        ("notes/ledger.md", Entry::new(0.5, &[])),
+        ("payments/cutoffs.md", Entry::new(0.7, &[])),
+    ]);
+
+    let found = Settings::new(&["index.md"])
+        .seeds(&["notes/scratch.md"])
+        .run(&scorer)
+        .await;
+
+    let scratch = visited(&found, "notes/scratch.md");
+    assert!(scratch.seeded, "a seed says so");
+    assert_eq!(scratch.path_score, 1.0);
+    assert_eq!(scratch.depth, 0);
+    assert_eq!(scratch.scent, None, "no link reached it");
+    assert_eq!(scratch.via, Vec::<PathBuf>::new());
+    assert!(
+        followed(scratch, "notes/ledger.md"),
+        "a seed's links are followed like an entry file's"
+    );
+
+    let ledger = visited(&found, "notes/ledger.md");
+    assert_eq!(ledger.via, [PathBuf::from("notes/scratch.md")]);
+    assert!(!ledger.seeded, "a link reached this one");
+    assert!(
+        !visited(&found, "index.md").seeded,
+        "the entry file is not a seed"
+    );
+    assert_eq!(
+        scorer.called(),
+        [
+            "index.md",
+            "notes/ledger.md",
+            "notes/scratch.md",
+            "payments/cutoffs.md"
+        ],
+        "one call per file"
+    );
+}
+
+/// A file named as both an entry file and a seed stays the entry file the
+/// caller named: entries are queued first, and nothing reaches a file at a
+/// better path score than 1.
+#[tokio::test]
+async fn a_seed_that_is_also_an_entry_file_stays_an_entry() {
+    let scorer = Fake::new(&[("index.md", Entry::new(0.3, &[]))]);
+
+    let found = Settings::new(&["index.md"])
+        .seeds(&["index.md"])
+        .run(&scorer)
+        .await;
+
+    assert_eq!(paths(&found), ["index.md"]);
+    assert!(!visited(&found, "index.md").seeded);
+    assert_eq!(found.calls, 1, "judged once, not once per spelling");
+    assert_eq!(scorer.called(), ["index.md"]);
 }

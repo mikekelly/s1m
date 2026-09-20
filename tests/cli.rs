@@ -37,6 +37,17 @@ const CRITERIA: &str = "tests/fixtures/criteria/payouts.md";
 const CRITERION: &str =
     "The content states the cut-off that decides whether an instant payout can still be sent.";
 
+/// The `--seed-grep` fixture: an entry page, the two pages it links to in a
+/// chain, and a page nothing links to.
+const SEED_ENTRY: &str = "tests/fixtures/seed/index.md";
+const SEED_LINKED: &str = "tests/fixtures/seed/notes/checklist.md";
+const SEED_ARCHIVE: &str = "tests/fixtures/seed/notes/archive.md";
+const SEED_ORPHAN: &str = "tests/fixtures/seed/orphan.md";
+
+/// A query whose keywords are the orphan page's own: the pages the entry file
+/// links to are the ones it meets the terms on least.
+const SEED_QUERY: &str = "release checklist";
+
 /// The id the scorer asks the file's own question under; every other question
 /// in a request is a link, `link_0`, `link_1`, and so on.
 const FILE_QUESTION: &str = "file_relevance";
@@ -666,5 +677,73 @@ fn a_root_without_an_entry_file_exits_2_saying_so() {
         "{error}"
     );
     assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(api.answered(), 0);
+}
+
+/// The point of `--seed-grep`: a page nothing links to is not reachable at all
+/// without the flag, and is in the reading list with it — on the frontier like
+/// an entry file, marked as a seed, beside the pages a link reached.
+#[test]
+fn seed_grep_reaches_a_page_no_link_points_to() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cold = Cache::new();
+
+    let without = run_with(&[SEED_QUERY, SEED_ENTRY], &api, &cold);
+
+    assert_eq!(without.status.code(), Some(0), "{}", stderr(&without));
+    assert_eq!(
+        paths(&json(&without)),
+        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED],
+        "the walk follows the entry file's links and stops"
+    );
+
+    // A cache of its own, so the seeded run buys every answer: seeding is one
+    // more file judged.
+    let fresh = Cache::new();
+    let seeded = run_with(&[SEED_QUERY, SEED_ENTRY, "--seed-grep"], &api, &fresh);
+
+    assert_eq!(seeded.status.code(), Some(0), "{}", stderr(&seeded));
+    assert!(seeded.stderr.is_empty(), "{}", stderr(&seeded));
+    let list = json(&seeded);
+    assert_eq!(
+        paths(&list),
+        [SEED_ENTRY, SEED_ARCHIVE, SEED_LINKED, SEED_ORPHAN],
+        "the keyword hit is on the frontier with the entry file"
+    );
+    assert_eq!(list["visited"], 4);
+    assert_eq!(list["calls"], 4);
+
+    let orphan = result(&list, SEED_ORPHAN);
+    assert_eq!(orphan["seeded"], json!(true), "a seed says so");
+    assert_eq!(orphan["via"], json!([]), "no path reached it");
+    assert_eq!(orphan["scent"], Value::Null);
+
+    let entry = result(&list, SEED_ENTRY);
+    assert_eq!(entry["seeded"], json!(false));
+    assert_eq!(entry["via"], json!([]));
+
+    let archive = result(&list, SEED_ARCHIVE);
+    assert_eq!(archive["seeded"], json!(false), "a link reached this one");
+    assert_eq!(
+        archive["via"].as_array().map(Vec::len),
+        Some(1),
+        "one hop from the page the entry links to"
+    );
+}
+
+/// `--seed-count` is not a flag of its own: a count with no `--seed-grep` is a
+/// usage error rather than a silent no-op, and it is caught before anything is
+/// bought.
+#[test]
+fn a_seed_count_without_seed_grep_exits_2() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = run_with(&[SEED_QUERY, SEED_ENTRY, "--seed-count", "1"], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains("--seed-grep"), "{error}");
     assert_eq!(api.answered(), 0);
 }

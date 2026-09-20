@@ -8,6 +8,13 @@
 //! links sink, and a file reached twice keeps its best path and is visited
 //! once.
 //!
+//! An entry file is either one the caller named or a seed the caller found by
+//! keyword ([`crate::seed`]). The two walk exactly alike — path score 1, depth
+//! 0, no scent, no `via` — and differ only in what the result says about them:
+//! [`VisitedFile::seeded`]. A file named as both stays the entry file the caller
+//! named, because entries are queued first and nothing can reach a file at a
+//! better score than 1.
+//!
 //! The walk is async because the scorer is: a round joins one future per file,
 //! so a round costs one round trip rather than one per file, and the caller
 //! supplies the runtime.
@@ -52,6 +59,12 @@ pub struct Config<'a> {
     /// Entry files, given against the same base as `root` the way [`parse`]
     /// wants them. Each is visited with path score 1 and depth 0.
     pub entries: &'a [PathBuf],
+    /// Extra entry files the caller did not name: the keyword hits
+    /// [`crate::seed`] found, given against the same base as `root` like
+    /// `entries`. Each is visited exactly like an entry file — path score 1,
+    /// depth 0, no scent, no `via` — and is the one thing a result says was
+    /// reached by a seed rather than along a link.
+    pub seeds: &'a [PathBuf],
     /// The directory that bounds the walk. A link resolving outside it is
     /// reported and never followed.
     pub root: &'a Path,
@@ -99,6 +112,10 @@ pub struct VisitedFile {
     /// The files on the best path, in order, excluding this one; empty for an
     /// entry file.
     pub via: Vec<PathBuf>,
+    /// Whether this file entered the walk as a seed rather than as an entry
+    /// file the caller named or along a link. A reached file with an empty
+    /// `via` is always a seed or an entry file, and this is which.
+    pub seeded: bool,
     /// This file's outgoing links, in the order they appear, one per target,
     /// each with the scent it was judged at.
     pub links: Vec<JudgedLink>,
@@ -170,6 +187,7 @@ struct Frontier {
     depth: usize,
     scent: Option<f64>,
     via: Vec<PathBuf>,
+    seeded: bool,
 }
 
 /// A max-heap on path score, ties broken by the smaller path, so what is popped
@@ -253,22 +271,27 @@ impl<'a> Search<'a> {
         })
     }
 
-    /// Puts the entry files on the frontier at path score 1.
+    /// Puts the entry files on the frontier at path score 1: the ones the
+    /// caller named first, then the seeds, so a file that is both is the entry
+    /// file it was named as.
     fn seed(&mut self) -> Result<(), TraverseError> {
-        for entry in self.config.entries {
-            if entry.is_absolute() != self.config.root.is_absolute() {
-                return Err(TraverseError::BaseMismatch {
-                    path: entry.clone(),
-                    root: self.config.root.to_path_buf(),
+        for (seeded, paths) in [(false, self.config.entries), (true, self.config.seeds)] {
+            for path in paths {
+                if path.is_absolute() != self.config.root.is_absolute() {
+                    return Err(TraverseError::BaseMismatch {
+                        path: path.clone(),
+                        root: self.config.root.to_path_buf(),
+                    });
+                }
+                self.enqueue(Frontier {
+                    path: relative_to_root(self.config.root, path),
+                    score: 1.0,
+                    depth: 0,
+                    scent: None,
+                    via: Vec::new(),
+                    seeded,
                 });
             }
-            self.enqueue(Frontier {
-                path: relative_to_root(self.config.root, entry),
-                score: 1.0,
-                depth: 0,
-                scent: None,
-                via: Vec::new(),
-            });
         }
         Ok(())
     }
@@ -329,6 +352,7 @@ impl<'a> Search<'a> {
             depth,
             scent,
             via,
+            seeded,
         } = self.best.remove(&entry.path).unwrap_or(entry);
         let (file, judgment) = match outcome {
             Ok(answered) => answered,
@@ -361,6 +385,7 @@ impl<'a> Search<'a> {
                 depth: depth + 1,
                 scent: Some(link_scent),
                 via: child_via,
+                seeded: false,
             });
         }
 
@@ -371,6 +396,7 @@ impl<'a> Search<'a> {
             path_score: score,
             depth,
             via,
+            seeded,
             links,
         });
     }

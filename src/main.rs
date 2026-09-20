@@ -22,16 +22,21 @@ use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError};
 
-/// The plan's defaults for the budgets. They live on the flags that carry them
-/// rather than in the library: nothing below the CLI has a default of its own.
+/// The plan's defaults for the budgets, and the seed count
+/// [#14](https://github.com/mikekelly/s1m/issues/14) asks for. They live on the
+/// flags that carry them rather than in the library: nothing below the CLI has a
+/// default of its own.
 const MAX_FILES: usize = 25;
 const MAX_DEPTH: usize = 6;
 const THRESHOLD: f64 = 0.6;
 const FANOUT: usize = 8;
+const SEED_COUNT: usize = 5;
 
 const AFTER_HELP: &str = "\
 The reading list goes to stdout as JSON: most relevant first, then by path, and
-every path in it spelled the way the entry files were.
+every path in it spelled the way the entry files were. A result with a via path
+was reached along a link; one without is an entry file, and `seeded` says
+whether --seed-grep put it on the frontier.
 
 --mode picks the criterion Jev judges by (about, useful-for, answers); a
 --criteria FILE replaces it with a criterion of your own: the file's whole
@@ -44,8 +49,7 @@ Exit codes:
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
 
-Not implemented yet: --seed-grep, and the md and tree formats. json is the only
-format.
+Not implemented yet: the md and tree formats. json is the only format.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, and a scent per link (see
@@ -103,6 +107,21 @@ struct Cli {
     /// Frontier files expanded per round.
     #[arg(long, value_name = "N", default_value_t = FANOUT)]
     fanout: usize,
+
+    /// Add the top keyword hits under the root as extra entry files, so pages
+    /// that are orphaned or weakly linked are still reached. The hits enter the
+    /// walk like entry files, and the reading list marks them with `seeded`.
+    #[arg(long)]
+    seed_grep: bool,
+
+    /// How many keyword hits `--seed-grep` adds.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = SEED_COUNT,
+        requires = "seed_grep"
+    )]
+    seed_count: usize,
 
     /// Call Jev for every file, ignoring the answers already on disk.
     #[arg(long)]
@@ -190,6 +209,7 @@ impl Cli {
             max_depth: self.max_depth,
             threshold: self.threshold,
             fanout: self.fanout,
+            seed_grep: self.seed_grep.then_some(self.seed_count),
             mode: String::new(),
         }
     }
