@@ -27,6 +27,14 @@ use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
 /// The evaluation endpoint. One call, one shape; the SDKs wrap this.
 pub const ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 
+/// The variable that points the scorer at another endpoint — a proxy, or a
+/// test's fake server — the way [`crate::cache::DIR_VAR`] points the cache
+/// elsewhere. Set but blank counts as unset.
+///
+/// The endpoint is part of the cache key ([`Cacheable::key`]), so a run against
+/// another endpoint never reads the answers a run against the API stored.
+pub const ENDPOINT_VAR: &str = "S1M_ENDPOINT";
+
 /// The model alias the issue names. The response reports the versioned id that
 /// answered, which is what [`JevDetail::model`] carries.
 pub const MODEL: &str = "jev-latest";

@@ -200,6 +200,16 @@ pub fn relative_to_root(root: impl AsRef<Path>, path: impl AsRef<Path>) -> PathB
     normalize(&relative_to(root.as_ref(), path.as_ref()))
 }
 
+/// `path` as the caller spelled its entry files: the inverse of
+/// [`relative_to_root`], which joins `root` back on and normalises the result.
+///
+/// The CLI uses it so that the root-relative paths a walk works in come back
+/// out as the paths the caller passed in — `wiki/index.md` rather than
+/// `index.md` for a root of `wiki`.
+pub(crate) fn from_root(root: impl AsRef<Path>, path: impl AsRef<Path>) -> PathBuf {
+    normalize(&root.as_ref().join(path))
+}
+
 /// Frontmatter title, else first H1, else the file name.
 fn scan_title(scan: &Scan, path: &Path) -> String {
     scan.frontmatter_title

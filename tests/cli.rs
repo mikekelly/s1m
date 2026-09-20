@@ -1,9 +1,37 @@
 //! Tests the built binary, so the exit codes and streams are the ones a caller
 //! actually sees.
 
+use std::fs;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::thread;
+
+use serde_json::{Map, Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_s1m");
+
+/// The directory the child runs in, so every fixture path resolves.
+const MANIFEST_DIR: &str = env!("CARGO_MANIFEST_DIR");
+
+/// The query every test asks.
+const QUERY: &str = "what is there to read";
+
+/// The fixture wiki every test walks: an entry page, one hop on, and one beyond
+/// that.
+const ENTRY: &str = "tests/fixtures/cli/entry.md";
+const NEXT: &str = "tests/fixtures/cli/next.md";
+const DEEP: &str = "tests/fixtures/cli/deep.md";
+
+/// An entry file that is not there, for the run that must name it.
+const GONE: &str = "tests/fixtures/cli/gone.md";
+
+/// The id the scorer asks the file's own question under; every other question
+/// in a request is a link, `link_0`, `link_1`, and so on.
+const FILE_QUESTION: &str = "file_relevance";
 
 fn run(args: &[&str]) -> std::process::Output {
     Command::new(BIN)
@@ -44,4 +72,436 @@ fn planned_arguments_are_rejected() {
 
     assert_eq!(output.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--mode"));
+}
+
+// -------------------------------------------------------------- the fixtures
+
+/// A cache directory of its own under the system temp directory, deleted when
+/// the test ends.
+///
+/// Every run that queries must set `S1M_CACHE_DIR`: without it a test reads and
+/// writes the caller's real cache, and answers stored by one test then decide
+/// another test's `calls`. The name carries the process id while a counter
+/// carries the test, so two test binaries running at once never share one.
+struct Cache {
+    dir: PathBuf,
+}
+
+impl Cache {
+    fn new() -> Cache {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "s1m-cli-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&dir).expect("a cache directory under the system temp directory");
+        Cache { dir }
+    }
+}
+
+impl Drop for Cache {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The binary as a test runs it: from the crate root, with the key the CLI
+/// demands, at `api`'s endpoint instead of the real one, and with `cache` to
+/// read and write.
+fn command(api: &FakeApi, cache: &Cache) -> Command {
+    let mut command = Command::new(BIN);
+    command
+        .env("TYPESAFE_API_KEY", "test-key")
+        .env("S1M_ENDPOINT", api.url())
+        .env("S1M_CACHE_DIR", &cache.dir)
+        .current_dir(MANIFEST_DIR);
+    command
+}
+
+/// Runs the binary as a caller would, with the environment a test controls.
+fn run_with(args: &[&str], api: &FakeApi, cache: &Cache) -> std::process::Output {
+    command(api, cache)
+        .args(args)
+        .output()
+        .expect("s1m should be runnable")
+}
+
+// ---------------------------------------------------------- the fake server
+
+/// A stand-in for the Jev API on a loopback port: one request per connection,
+/// answered with the `score` and `noul` the test was built with.
+///
+/// A real server rather than a mocked scorer, because what a query test needs
+/// to defend is the whole way out to the network and back: the request bytes,
+/// the serde types on both sides, the `S1M_ENDPOINT` the binary chooses, and
+/// the scorer's retry loop. `src/jev.rs`'s own `FakeApi` defends that boundary
+/// one layer down, at the client's API; this one defends it from the process,
+/// which is where a caller stands.
+struct FakeApi {
+    url: String,
+    address: SocketAddr,
+    answered: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl FakeApi {
+    /// A server that answers every file question with `score` and every link
+    /// question with `noul`.
+    ///
+    /// `score` is the file's own Score, on the mode's scale: 3 is the top of the
+    /// four levels `useful-for` has, which the scorer reports as a relevance of
+    /// 1.0. `noul` is what every link's scent comes back as, and it is what a
+    /// test varies to put links above or below `--threshold`.
+    fn new(score: f64, noul: f64) -> FakeApi {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+        let address = listener.local_addr().expect("the bound address");
+        let answered = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let counted = Arc::clone(&answered);
+        let flag = Arc::clone(&stop);
+        let thread = thread::spawn(move || {
+            for stream in listener.incoming() {
+                if flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Ok(mut stream) = stream else { break };
+                let Some(request) = read_request(&mut stream) else {
+                    continue;
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                let body = reply(&request, score, noul);
+                let _ = stream.write_all(response(&body).as_bytes());
+            }
+        });
+        FakeApi {
+            url: format!("http://{address}/"),
+            address,
+            answered,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    /// The URL to hand the binary as `S1M_ENDPOINT`.
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    /// Requests answered: what the binary reports as `calls`, seen from the
+    /// other end of the wire.
+    fn answered(&self) -> usize {
+        self.answered.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for FakeApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the accept loop so the thread notices and returns.
+        let _ = TcpStream::connect(self.address);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// One request body, read off the wire: the head until its `content-length`
+/// bytes of body have arrived, so a body that arrives in pieces still parses.
+fn read_request(stream: &mut TcpStream) -> Option<Value> {
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(head_end) = head_end(&buffer) {
+            let length = content_length(&buffer[..head_end]);
+            if buffer.len() >= head_end + length {
+                let body = String::from_utf8_lossy(&buffer[head_end..head_end + length]);
+                return serde_json::from_str(&body).ok();
+            }
+        }
+        let read = stream.read(&mut chunk).ok()?;
+        if read == 0 {
+            return None;
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Where the head ends in `buffer`, once both blank lines have arrived.
+fn head_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|at| at + 4)
+}
+
+/// The body length the head promised.
+fn content_length(head: &[u8]) -> usize {
+    String::from_utf8_lossy(head)
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0)
+}
+
+/// The API's answer to one request: `score` for the file question and `noul`
+/// for every link question.
+///
+/// The ids are the request's own keys, so a file with any number of links is
+/// answered whole — the scorer treats one unanswered question as a failed
+/// judgment, which would be the test's bug and not the binary's.
+fn reply(request: &Value, score: f64, noul: f64) -> String {
+    let questions = request["questions"]
+        .as_object()
+        .expect("a request should carry questions");
+    let answers = questions
+        .keys()
+        .map(|id| {
+            let answer = if id == FILE_QUESTION {
+                json!({"type": "score", "score": score, "confidence": 0.9})
+            } else {
+                json!({"type": "noul", "noul": noul})
+            };
+            (id.clone(), answer)
+        })
+        .collect::<Map<String, Value>>();
+    json!({
+        "model": "jev-test",
+        "answers": Value::Object(answers),
+        "usage": {"input_tokens": 100, "output_tokens": 10},
+    })
+    .to_string()
+}
+
+/// A response as a one-shot HTTP/1.1 reply: the length is the body's, and the
+/// connection closes after it.
+fn response(body: &str) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+// --------------------------------------------------------------- the answers
+
+/// The reading list a run printed.
+fn json(output: &std::process::Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+        panic!(
+            "stdout should be the reading list as JSON: {error}\n{}",
+            stderr(output)
+        )
+    })
+}
+
+/// Everything the child wrote on stderr.
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+/// The result paths, in the order the reading list gives them.
+fn paths(list: &Value) -> Vec<&str> {
+    list["results"]
+        .as_array()
+        .expect("results should be an array")
+        .iter()
+        .map(|result| result["path"].as_str().expect("a path"))
+        .collect()
+}
+
+/// The one result for `path`.
+fn result<'a>(list: &'a Value, path: &str) -> &'a Value {
+    list["results"]
+        .as_array()
+        .expect("results should be an array")
+        .iter()
+        .find(|result| result["path"] == path)
+        .unwrap_or_else(|| panic!("{path} should be in the reading list"))
+}
+
+// ------------------------------------------------------------- the tests
+
+/// The whole point of the command: one query and an entry file come back as the
+/// reading list on stdout, in the plan's field order, with the walk's paths
+/// spelled the caller's way and the entry file marked as the one no link
+/// reached.
+#[test]
+fn a_run_returns_the_reading_list_as_json_and_exits_0() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(output.stderr.is_empty(), "{}", stderr(&output));
+    let list = json(&output);
+    assert_eq!(list["query"], QUERY);
+    assert_eq!(list["mode"], "useful-for");
+    assert_eq!(list["visited"], 3);
+    assert_eq!(list["calls"], 3);
+    assert_eq!(
+        paths(&list),
+        [DEEP, ENTRY, NEXT],
+        "one relevance for every file ties, so the list is by path"
+    );
+
+    let entry = result(&list, ENTRY);
+    assert_eq!(
+        entry["scent"],
+        Value::Null,
+        "no link reached the entry file"
+    );
+    assert_eq!(entry["via"], json!([]));
+    assert_eq!(entry["relevance"].as_f64(), Some(1.0));
+    assert_eq!(
+        entry["links"],
+        json!([{"target": NEXT, "scent": 0.9, "followed": true}])
+    );
+
+    let deep = result(&list, DEEP);
+    assert_eq!(deep["relevance"].as_f64(), Some(1.0));
+    assert_eq!(deep["scent"].as_f64(), Some(0.9));
+    assert_eq!(deep["via"], json!([ENTRY, NEXT]), "two hops from the entry");
+    assert_eq!(deep["links"], json!([]), "nothing links on from here");
+    assert_eq!(api.answered(), 3, "one call per file judged");
+}
+
+/// `calls` is what the API was asked, not what the walk visited: the same
+/// command over the same wiki a second time is answered from the cache, so the
+/// list is the same and the bill is nothing.
+#[test]
+fn a_second_run_with_a_warm_cache_reports_no_calls() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+    let args = [QUERY, ENTRY];
+
+    let cold = run_with(&args, &api, &cache);
+    let warm = run_with(&args, &api, &cache);
+
+    assert_eq!(cold.status.code(), Some(0), "{}", stderr(&cold));
+    assert_eq!(warm.status.code(), Some(0), "{}", stderr(&warm));
+    let cold = json(&cold);
+    let warm = json(&warm);
+    assert_eq!(cold["visited"], 3);
+    assert_eq!(warm["visited"], 3, "the walk still visits every file");
+    assert_eq!(cold["calls"], 3, "a cold cache buys every answer");
+    assert_eq!(warm["calls"], 0, "a warm cache buys none of them");
+    assert_eq!(paths(&warm), [DEEP, ENTRY, NEXT], "and ranks the same list");
+    assert_eq!(api.answered(), 3, "the second run asked the API nothing");
+}
+
+/// A run whose links all fell below the threshold is not an answer: the list is
+/// the entry files and nothing more, so the code says so on the way out and
+/// says why on stderr, without taking the list away from a caller that wants
+/// it.
+#[test]
+fn nothing_above_the_threshold_exits_1_with_the_entry_file() {
+    let api = FakeApi::new(3.0, 0.1);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(1));
+    let list = json(&output);
+    assert_eq!(list["visited"], 1, "only the entry file was judged");
+    assert_eq!(list["calls"], 1);
+    assert_eq!(paths(&list), [ENTRY]);
+    let error = stderr(&output);
+    assert!(error.contains("nothing cleared the threshold"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+}
+
+/// An entry file the caller named and cannot be read is the caller's mistake,
+/// and it is named before anything is bought: no API call, nothing on stdout,
+/// one line naming the file.
+#[test]
+fn a_missing_entry_file_exits_2_naming_it() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, GONE], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains("gone.md"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(
+        api.answered(),
+        0,
+        "the entry files are read before anything is bought"
+    );
+}
+
+/// Without `TYPESAFE_API_KEY` there is no scorer, so no run: the variable is
+/// named on stderr and nothing is printed on stdout, because a caller whose
+/// environment is wrong has no reading list to parse.
+#[test]
+fn a_missing_api_key_exits_2_saying_so() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = command(&api, &cache)
+        .args([QUERY, ENTRY])
+        .env_remove("TYPESAFE_API_KEY")
+        .output()
+        .expect("s1m should be runnable");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains("TYPESAFE_API_KEY"), "{error}");
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(api.answered(), 0);
+}
+
+/// A threshold outside 0 to 1 follows nothing or everything, which is never
+/// what a caller meant, so the flag is rejected where it is parsed and the
+/// message says both the value and the range it is outside of.
+#[test]
+fn an_out_of_range_threshold_exits_2() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--threshold", "2"], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains("2 is not between 0 and 1"),
+        "the message should name the value and the range it is outside of: {error}"
+    );
+    assert_eq!(api.answered(), 0);
+}
+
+/// `--root` with no entry file is a command line with nothing to walk, not an
+/// empty reading list: it exits 2 saying so, and it says so before the scorer
+/// is built — the key is missing here and the arguments are what get reported.
+#[test]
+fn a_root_without_an_entry_file_exits_2_saying_so() {
+    let api = FakeApi::new(3.0, 0.9);
+    let cache = Cache::new();
+
+    let output = command(&api, &cache)
+        .args([QUERY, "--root", "tests/fixtures/cli"])
+        .env_remove("TYPESAFE_API_KEY")
+        .output()
+        .expect("s1m should be runnable");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains("a query and at least one entry file are required"),
+        "{error}"
+    );
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(api.answered(), 0);
 }
