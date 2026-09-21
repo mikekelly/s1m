@@ -23,6 +23,20 @@ pub fn agent_condition(condition: &str) -> bool {
     matches!(condition, "explore" | "s1m-agent")
 }
 
+/// The model a run of this condition was asked for: the one named on the
+/// command line, on a condition that runs an agent.
+///
+/// An s1m run takes a threshold rather than a model and buys judgments from an
+/// API this harness does not choose the model for, so it is the same run
+/// whatever `--model` says. Naming a model for a pass must not make its `s1m`
+/// runs another pass's runs, on the row, in the ledger, or in the cell a report
+/// files them under.
+pub fn asked_for(condition: &str, model: Option<&str>) -> Option<String> {
+    agent_condition(condition)
+        .then(|| model.map(str::to_string))
+        .flatten()
+}
+
 /// What identifies a run, for a resumed pass and for the ledger: the revision
 /// of the wiki it was measured against, and the query, condition and repeat.
 ///
