@@ -117,6 +117,7 @@ buys one answer per file):
 {
   "query": "how do I cut a release and publish the package",
   "mode": "useful-for",
+  "scorer": "noul",
   "visited": 6,
   "calls": 0,
   "results": [
@@ -201,6 +202,38 @@ Both lists are elided for length: the run returns three results and reports two 
 The `--threshold` and `--max-files` defaults are backed by numbers in
 [eval/REPORT.md](eval/REPORT.md), and the decisions are recorded in
 [docs/initial-plan.md](docs/initial-plan.md#defaults-from-the-evaluation).
+
+### Hidden flags
+
+These are behind `--help`'s back: the experiments the issues track, not the interface. The
+defaults above are what ships, and a run that names none of these flags is the walk the numbers
+above describe.
+
+| Flag | Default | Meaning |
+| --- | --- | --- |
+| `--no-preview-headings` | off | Leave each link target's own H2/H3 headings out of its preview, the way the state was before [#46](https://github.com/mikekelly/s1m/issues/46) |
+| `--no-preview-leads` | off | Leave the anchor text of each link target's own in-root links out of its preview: the same ablation |
+| `--one-hop-links` | off | Ask the link question about one hop rather than two, the way it was asked before [#46](https://github.com/mikekelly/s1m/issues/46) |
+| `--scorer` | `noul` | How a file's links are judged. `noul` is one question per link — is following this likely to lead somewhere useful — and `choice` is one question over the page: which of these links is the best next step, answered as a share per link. The reading list reports which one it was as `scorer`, because a link's `scent` is not the same kind of number under the two ([#47](https://github.com/mikekelly/s1m/issues/47)) |
+| `--previews` | off | Under `--scorer choice`, describe each option with its target's preview as the state carries it, the ablation flags included. Off, an option is the page's own words about the link — its anchor, its sentence and its heading. The file's own Score and its sections are judged with the state that ships either way, so the comparison is between link judgments |
+| `--share-floor` | `0.02` | Under `--scorer choice`, least share of a page's Choice that keeps a link |
+| `--share-k` | `3` | And the cut's numerator: a link has to hold `k / options` of the page's probability |
+| `--beam` | `8` under `--scorer choice`, none otherwise | Files the walk visits at one depth |
+
+A Choice over a page keeps a link when its share clears
+`max(--share-floor, min(--share-k / options, 0.5))`, where `options` counts the `none` option
+every Choice carries — and never keeps one when the page's best option is `none`, and always
+keeps the one link the model put above it. The `0.5` ceiling is what keeps a small page
+followable: without it `k / options` would be one or more on a page of three options or fewer,
+and no answer could clear it. `--beam` is the budget of a beam search, of the same kind as
+`--max-files` one depth at a time: a path the walk has no turn for is dropped rather than
+expanded.
+
+The measurement behind them is in [docs/spike-notes.md](docs/spike-notes.md#the-relative-judge-one-choice-over-a-pages-links),
+and the table is in [eval/REPORT.md](eval/REPORT.md#the-relative-judge-one-choice-over-a-pages-links).
+Its rows are bought rather than free, so `eval` measures them when it is asked to —
+`cargo run --release --bin eval -- --relative-judge` beside its usual arguments — and the
+committed cache answers them for a rerun like any other.
 
 ### Output formats
 

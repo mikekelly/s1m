@@ -209,6 +209,7 @@ impl Scorer for Fake {
                 Ok(LinkJudgment {
                     target: link.target.clone(),
                     scent: scent.1,
+                    keep: true,
                 })
             })
             .collect::<Result<Vec<_>, ScorerError>>()?;
@@ -248,8 +249,11 @@ async fn walk() -> cli::ReadingList {
         max_files: MAX_FILES,
         max_depth: MAX_DEPTH,
         threshold: THRESHOLD,
+        admission: s1m::traverse::Admission::Threshold(THRESHOLD),
+        beam: None,
         fanout: FANOUT,
         mode: "useful-for".to_string(),
+        scorer: "noul".to_string(),
     };
 
     cli::run(&options, &Uncached::new(Fake::new()))

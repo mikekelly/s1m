@@ -7,7 +7,7 @@
 //! answers can be delayed by a varying amount, which is how the determinism
 //! test makes the order answers arrive in irrelevant.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -19,7 +19,7 @@ use tokio::time::sleep;
 use s1m::ignore::Ignore;
 use s1m::parse::{self, ParsedFile, relative_to_root};
 use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
-use s1m::traverse::{Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
+use s1m::traverse::{Admission, Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
 
 const QUERY: &str = "settlement timing for instant payouts";
 
@@ -169,6 +169,7 @@ impl Scorer for Fake {
                 .map(|(target, scent)| LinkJudgment {
                     target: PathBuf::from(target),
                     scent: *scent,
+                    keep: true,
                 })
                 .collect(),
         })
@@ -238,6 +239,11 @@ struct ByRule {
     relevance: f64,
     scent: f64,
     named: HashMap<String, f64>,
+    /// The targets the scorer judges and does not keep: what a walk following
+    /// the scorer's verdict
+    /// ([`s1m::traverse::Admission::Scorer`]) passes over however strong the
+    /// scent beside it.
+    unkept: HashSet<String>,
     calls: Mutex<HashMap<String, usize>>,
 }
 
@@ -247,6 +253,7 @@ impl ByRule {
             relevance,
             scent,
             named: HashMap::new(),
+            unkept: HashSet::new(),
             calls: Mutex::new(HashMap::new()),
         }
     }
@@ -254,6 +261,13 @@ impl ByRule {
     /// Judges a link to `target` at `scent` rather than at the default.
     fn link(mut self, target: &str, scent: f64) -> ByRule {
         self.named.insert(target.to_string(), scent);
+        self
+    }
+
+    /// Judges a link to `target` and does not keep it, which is the verdict a
+    /// walk following the scorer reads instead of the scent.
+    fn unkept(mut self, target: &str) -> ByRule {
+        self.unkept.insert(target.to_string());
         self
     }
 
@@ -305,6 +319,9 @@ impl Scorer for ByRule {
                         .get(&link.target.to_string_lossy().into_owned())
                         .copied()
                         .unwrap_or(self.scent),
+                    keep: !self
+                        .unkept
+                        .contains(&link.target.to_string_lossy().into_owned()),
                 })
                 .collect(),
         })
@@ -397,7 +414,11 @@ struct Settings {
     max_files: usize,
     max_depth: usize,
     fanout: usize,
-    threshold: f64,
+    /// How a link is admitted, and how many files are visited at one depth:
+    /// the two rules the relative judge is followed by, and the walk that
+    /// ships.
+    admission: Admission,
+    beam: Option<usize>,
     ignore: Ignore,
 }
 
@@ -416,7 +437,8 @@ impl Settings {
             max_files: 8,
             max_depth: 6,
             fanout: 4,
-            threshold: 0.6,
+            admission: Admission::Threshold(0.6),
+            beam: None,
         }
     }
 
@@ -436,7 +458,19 @@ impl Settings {
     }
 
     fn threshold(mut self, threshold: f64) -> Self {
-        self.threshold = threshold;
+        self.admission = Admission::Threshold(threshold);
+        self
+    }
+
+    /// A walk that follows what the scorer kept rather than a threshold.
+    fn kept(mut self) -> Self {
+        self.admission = Admission::Scorer;
+        self
+    }
+
+    /// A walk that visits at most `beam` files at one depth.
+    fn beam(mut self, beam: usize) -> Self {
+        self.beam = Some(beam);
         self
     }
 
@@ -448,7 +482,8 @@ impl Settings {
             max_files: self.max_files,
             max_depth: self.max_depth,
             fanout: self.fanout,
-            threshold: self.threshold,
+            admission: self.admission,
+            beam: self.beam,
             ignore: &self.ignore,
         };
         traverse(&config, scorer)
@@ -1447,7 +1482,8 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
         max_files: 8,
         max_depth: 6,
         fanout: 4,
-        threshold: 0.6,
+        admission: Admission::Threshold(0.6),
+        beam: None,
         ignore: &ignore,
     };
 
@@ -1498,4 +1534,184 @@ async fn a_matched_link_target_is_out_of_the_file_before_it_is_scored() {
         [Path::new("public.md")],
         "the link is gone from the judgment and from the result"
     );
+}
+
+/// Two ways on from the entry: one the scorer judges strong and does not keep,
+/// and one it judges weak and keeps.
+fn two_ways(label: &str) -> Tree {
+    let tree = Tree::new(label);
+    tree.page("index.md", &["a.md".to_string(), "b.md".to_string()]);
+    tree.page("a.md", &[]);
+    tree.page("b.md", &[]);
+    tree
+}
+
+/// A walk whose links are admitted by the scorer's own verdict rather than by a
+/// threshold follows what the scorer kept and not what it scored: a scent of 0.9
+/// the scorer passed over is not followed, and a scent of 0.1 it kept is, at the
+/// score the product of the scents gives it.
+///
+/// This is the rule the relative judge is followed by
+/// ([#47](https://github.com/mikekelly/s1m/issues/47)): a Choice share means
+/// something only beside the options it was weighed against, so the number
+/// cannot be compared to a threshold and the scorer's answer is what the walk
+/// reads.
+#[tokio::test]
+async fn a_link_the_scorer_kept_is_followed_whatever_its_scent() {
+    let scorer = ByRule::new(0.5, 0.9).link("b.md", 0.1).unkept("a.md");
+
+    let found = Settings::over(two_ways("kept").root(), &["index.md"])
+        .kept()
+        .run(&scorer)
+        .await;
+
+    assert_eq!(
+        paths(&found),
+        ["b.md", "index.md"],
+        "the page the scorer kept, and the entry the caller named"
+    );
+    assert_eq!(
+        visited(&found, "b.md").path_score,
+        0.1,
+        "queued at the product of the scents, whatever decided it was worth queueing"
+    );
+    assert_eq!(
+        links(visited(&found, "index.md")),
+        [link("a.md", 0.9, false), link("b.md", 0.1, true),],
+        "the strong link the scorer passed over, and the weak one it kept"
+    );
+}
+
+/// A fan: an entry page that links five leaves, each at its own scent, so a beam
+/// has something to choose between at one depth.
+fn fan(label: &str) -> Tree {
+    let tree = Tree::new(label);
+    let leaves: Vec<String> = (1..=5).map(|n| format!("leaf-{n}.md")).collect();
+    tree.page("index.md", &leaves);
+    for leaf in &leaves {
+        tree.page(leaf, &[]);
+    }
+    tree
+}
+
+/// The fan's scents: every leaf above the threshold, in the leaves' own order.
+fn fan_scorer() -> ByRule {
+    ByRule::new(0.5, 0.9)
+        .link("leaf-2.md", 0.8)
+        .link("leaf-3.md", 0.7)
+        .link("leaf-4.md", 0.65)
+        .link("leaf-5.md", 0.61)
+}
+
+/// A beam is a budget of the same kind as `max_files`, one depth at a time:
+/// every link still queues its target — the reading list says so — and only the
+/// best two of them are visited at that depth, because the walk has no turn left
+/// for the rest.
+#[tokio::test]
+async fn a_beam_visits_at_most_that_many_files_at_one_depth() {
+    let scorer = fan_scorer();
+
+    let found = Settings::over(fan("beam").root(), &["index.md"])
+        .beam(2)
+        .run(&scorer)
+        .await;
+
+    assert_eq!(
+        paths(&found),
+        ["index.md", "leaf-1.md", "leaf-2.md"],
+        "the two best paths at depth one, and nothing else at that depth"
+    );
+    assert_eq!(
+        links(visited(&found, "index.md")),
+        [
+            link("leaf-1.md", 0.9, true),
+            link("leaf-2.md", 0.8, true),
+            link("leaf-3.md", 0.7, true),
+            link("leaf-4.md", 0.65, true),
+            link("leaf-5.md", 0.61, true),
+        ],
+        "every link queues its target: the beam is what the walk visits, not what it follows"
+    );
+    assert_eq!(
+        found.calls, 3,
+        "the entry and the two the beam had a turn for"
+    );
+}
+
+/// A beam does not cost the walk its determinism: what is visited is a function
+/// of the walk's own decisions and not of how many files a round scores at once,
+/// so the same tree walked a file at a time and four at a time gives one answer.
+#[tokio::test]
+async fn a_beam_does_not_depend_on_the_round_size() {
+    let one = Settings::over(fan("beam-one").root(), &["index.md"])
+        .beam(2)
+        .fanout(1)
+        .run(&fan_scorer())
+        .await;
+    let four = Settings::over(fan("beam-four").root(), &["index.md"])
+        .beam(2)
+        .fanout(4)
+        .run(&fan_scorer())
+        .await;
+
+    assert_eq!(
+        paths(&one),
+        paths(&four),
+        "the same files, whatever the round size"
+    );
+    assert_eq!(
+        links(visited(&one, "index.md")),
+        links(visited(&four, "index.md")),
+        "and the same verdict on every link"
+    );
+    assert_eq!(one.calls, four.calls, "for the same calls");
+}
+
+/// A page the walk cannot judge still spends the turn the beam reserved for it:
+/// the reservation a round makes at a depth is realized whether or not the file
+/// could be judged, so which paths a depth drops is a function of the pop order
+/// and not of how many files a round happened to hold.
+///
+/// The tree makes that visible: at a beam of one, the broken link pops first,
+/// takes the depth's turn and is reported as skipped, and the good path behind
+/// it is dropped. Same tree, same walk, whatever the round size.
+#[tokio::test]
+async fn a_file_the_walk_cannot_judge_still_spends_its_beam_turn() {
+    let tree = Tree::new("beam-broken");
+    tree.page(
+        "index.md",
+        &["broken.md".to_string(), "good.md".to_string()],
+    );
+    tree.page("good.md", &[]);
+    let scorer = ByRule::new(0.5, 0.9).link("good.md", 0.85);
+
+    let one = Settings::over(tree.root(), &["index.md"])
+        .beam(1)
+        .fanout(1)
+        .run(&scorer)
+        .await;
+    let four = Settings::over(tree.root(), &["index.md"])
+        .beam(1)
+        .fanout(4)
+        .run(&scorer)
+        .await;
+
+    assert_eq!(
+        links(visited(&one, "index.md")),
+        [link("broken.md", 0.9, true), link("good.md", 0.85, true)],
+        "both links queue: the beam is what the walk visits"
+    );
+    assert_eq!(
+        paths(&one),
+        ["index.md"],
+        "the depth's one turn went to a page that could not be judged"
+    );
+    assert!(
+        failures(&one).iter().any(|(path, _)| path == "broken.md"),
+        "and the page it went to is reported: {:?}",
+        failures(&one)
+    );
+    assert_eq!(paths(&one), paths(&four), "the same at any round size");
+    assert_eq!(failures(&one), failures(&four));
+    assert_eq!(one.calls, four.calls);
 }

@@ -342,6 +342,7 @@ mod tests {
             links: vec![LinkJudgment {
                 target: PathBuf::from("linked.md"),
                 scent: 0.5,
+                keep: true,
             }],
         }
     }

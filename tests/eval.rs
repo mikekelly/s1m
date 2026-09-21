@@ -30,8 +30,19 @@ const REPORT: &str = "eval/REPORT.md";
 
 #[test]
 fn the_committed_cache_reproduces_the_committed_report() {
+    // `--relative-judge` is part of the command the report documents: the
+    // committed report carries the relative judge's rows, and the answers they
+    // were bought with are in the committed cache like any other.
     let output = Command::new(EVAL)
-        .args(["--wiki", WIKI, "--gold", GOLD, "--cache", CACHE])
+        .args([
+            "--wiki",
+            WIKI,
+            "--gold",
+            GOLD,
+            "--cache",
+            CACHE,
+            "--relative-judge",
+        ])
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("S1M_ENDPOINT")
         .output()
@@ -160,7 +171,8 @@ async fn the_walk_with_no_budget_leaves_nothing_queued_or_admitted() {
             max_files: usize::MAX,
             max_depth: MAX_DEPTH,
             fanout: FANOUT,
-            threshold: THRESHOLD,
+            admission: s1m::traverse::Admission::Threshold(THRESHOLD),
+            beam: None,
             ignore: &ignore,
         };
         let traversal = s1m::traverse::traverse(&config, &scorer)

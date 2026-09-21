@@ -56,12 +56,12 @@ use async_trait::async_trait;
 use clap::Parser;
 use serde::Deserialize;
 
-use s1m::cache::{CachedScorer, Scored};
+use s1m::cache::{Cacheable, CachedScorer, Scored};
 use s1m::ignore::Ignore;
-use s1m::jev::{self, Context, JevDetail, JevScorer, Mode};
+use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevOutcome, JevScorer, KeepRule, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, Scorer, ScorerError};
-use s1m::traverse::{Config, Failure, traverse};
+use s1m::traverse::{Admission, Config, Failure, traverse};
 
 // ------------------------------------------------------------- what it varies
 
@@ -70,6 +70,13 @@ use s1m::traverse::{Config, Failure, traverse};
 /// constant in `main.rs` — so the harness carries its own copy.
 const MAX_DEPTH: usize = 6;
 const FANOUT: usize = 8;
+
+/// How many files a walk following shares visits at one depth, which is the
+/// spike's own default ([`s1m::traverse::Config::beam`], and `main.rs`'s copy of
+/// the same number). A walk that judges each link on its own has no beam: the
+/// comparison is between link judgments, and a beam is how the relative one is
+/// followed.
+const BEAM: usize = 8;
 
 /// Four characters per token, the rule `docs/spike-notes.md` sets its caps
 /// with. Nothing here tokenises, and this is the estimate the reading numbers
@@ -155,6 +162,60 @@ const CONTEXTS: [(&str, Context); 5] = [
     ("before #46", BEFORE_46),
 ];
 
+/// The keep rule the spike ships its flag with, and the looser one the last row
+/// of the experiment walks at: three options' worth of a question's mass, and
+/// one.
+const KEEP: KeepRule = KeepRule { floor: 0.02, k: 3 };
+const LOOSE: KeepRule = KeepRule { floor: 0.02, k: 1 };
+
+/// The rows of the relative-judge experiment, at the tight budget: what ships,
+/// then the same walk with a page's links judged against each other, from the
+/// page's own words about them and with a look at each target beside them.
+///
+/// The shipping row is also the run the gold set already made for `at_a_budget`,
+/// so it is not walked twice. `choice` and `choice + previews` are the design's
+/// two rows ([#47]), and the last is the same walk at a looser cut — the one
+/// knob that decides how much of a page's mass a link has to hold, so a row at
+/// another setting says whether a difference is the link judgment or the rule it
+/// is followed by.
+///
+/// `choice` describes its options from the page alone, which is what the
+/// design's default is; `choice + previews` gives each option the preview the
+/// state carries, headings and leads included, which is what the shipping walk
+/// judges its links with.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+const POLICIES: [(&str, Policy); 4] = [
+    ("noul: what ships", Policy::noul(Context::DEFAULT)),
+    (
+        "choice",
+        Policy {
+            links: Links::Choice,
+            context: Context {
+                previews: false,
+                ..Context::DEFAULT
+            },
+            keep: KEEP,
+        },
+    ),
+    (
+        "choice + previews",
+        Policy {
+            links: Links::Choice,
+            context: Context::DEFAULT,
+            keep: KEEP,
+        },
+    ),
+    (
+        "choice + previews, k=1",
+        Policy {
+            links: Links::Choice,
+            context: Context::DEFAULT,
+            keep: LOOSE,
+        },
+    ),
+];
+
 // ---------------------------------------------------------------- the command
 
 #[derive(Debug, Parser)]
@@ -192,6 +253,18 @@ struct Args {
     /// Buy every judgment: ignore the answers on disk.
     #[arg(long)]
     no_cache: bool,
+    /// Measure the relative judge — one Choice over a page's links — beside the
+    /// walk that ships ([#47]), and add its table to the report.
+    ///
+    /// Off by default because its answers are not in the committed cache: a
+    /// report is only worth committing if the cache reproduces it, and a run
+    /// with this flag buys rows the cache does not hold. It is the flag that
+    /// puts them there, once, and the report a run with it writes is then
+    /// reproducible like any other.
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    #[arg(long)]
+    relative_judge: bool,
     /// Write the report here instead of stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -617,6 +690,18 @@ struct Billed {
     bought: bool,
 }
 
+impl Billed {
+    /// An answer bought now: what a scorer without a cache in front of it
+    /// returns.
+    fn of(outcome: JevOutcome) -> Result<Billed, ScorerError> {
+        Ok(Billed {
+            judgment: outcome.judgment,
+            detail: outcome.detail,
+            bought: true,
+        })
+    }
+}
+
 /// A scorer the harness can bill: one file in, a judgment and its accounting
 /// out.
 ///
@@ -631,17 +716,27 @@ trait Bill: Send + Sync {
 #[async_trait]
 impl Bill for JevScorer {
     async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
-        let outcome = self.judge(query, file).await?;
-        Ok(Billed {
-            judgment: outcome.judgment,
-            detail: outcome.detail,
-            bought: true,
-        })
+        Billed::of(self.judge(query, file).await?)
     }
 }
 
+/// The relative judge, billed the same way: the harness measures what a walk
+/// asks and what it cost, whatever question the links were judged by
+/// ([#47](https://github.com/mikekelly/s1m/issues/47)).
 #[async_trait]
-impl Bill for CachedScorer<JevScorer> {
+impl Bill for ChoiceScorer {
+    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
+        Billed::of(self.judge(query, file).await?)
+    }
+}
+
+/// Any cacheable scorer whose answers carry the accounting: one row per scorer,
+/// because what a run bought does not depend on which one is behind the cache.
+#[async_trait]
+impl<S> Bill for CachedScorer<S>
+where
+    S: Cacheable<Detail = JevDetail> + Send + Sync,
+{
     async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
         let scored = self.judge(query, file).await?;
         let bought = scored.called();
@@ -820,6 +915,61 @@ impl Run {
 
 // ------------------------------------------------------------------ the walk
 
+/// How a walk's links are judged: one yes/no question each, or one Choice over
+/// a page's links ([#47](https://github.com/mikekelly/s1m/issues/47)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Links {
+    /// What ships: a Noul per link, followed by the caller's threshold.
+    Noul,
+    /// The spike's: one Choice over a page's in-root links, followed by shares.
+    Choice,
+}
+
+/// One measured way of judging a page's links: the question asked of each, the
+/// state it is asked from, and what a share has to hold to be kept.
+///
+/// Under [`Links::Noul`] the context is the state the walk sends and the keep
+/// rule is unread. Under [`Links::Choice`] the context is what the *options*
+/// are described from — the file's own Score and its sections are always asked
+/// with [`Context::DEFAULT`] — and the keep rule is the scorer's own, because a
+/// share means something only beside the options it was weighed against.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Policy {
+    links: Links,
+    context: Context,
+    keep: KeepRule,
+}
+
+impl Policy {
+    /// The walk that ships, at one state of the link context: what every row of
+    /// the preview and link-context tables is.
+    const fn noul(context: Context) -> Policy {
+        Policy {
+            links: Links::Noul,
+            context,
+            keep: KEEP,
+        }
+    }
+
+    /// How the walk admits a link: a Noul against the caller's threshold, a
+    /// Choice share against the scorer's own rule.
+    fn admission(&self, threshold: f64) -> Admission {
+        match self.links {
+            Links::Noul => Admission::Threshold(threshold),
+            Links::Choice => Admission::Scorer,
+        }
+    }
+
+    /// The beam the walk runs with: the spike's, for a walk following shares,
+    /// and none at all for the walk that ships.
+    fn beam(&self) -> Option<usize> {
+        match self.links {
+            Links::Noul => None,
+            Links::Choice => Some(BEAM),
+        }
+    }
+}
+
 /// Where answers come from.
 enum Cache {
     /// `--no-cache`: every judgment is bought.
@@ -874,10 +1024,10 @@ impl Env<'_> {
         &self,
         query: &Query,
         budget: usize,
-        context: Context,
+        policy: Policy,
         threshold: f64,
     ) -> Result<Run, String> {
-        let meter = self.scorer(query, context)?;
+        let meter = self.scorer(query, policy)?;
         // The entry is spelled the way a caller spells it — the root joined on,
         // `wiki/index.md` for a root of `wiki` — because that is what a walk
         // normalises against its root. Everything a walk hands back is relative
@@ -890,7 +1040,8 @@ impl Env<'_> {
             max_files: budget,
             max_depth: MAX_DEPTH,
             fanout: FANOUT,
-            threshold,
+            admission: policy.admission(threshold),
+            beam: policy.beam(),
             ignore: &self.ignore,
         };
         let traversal = traverse(&config, &meter)
@@ -976,35 +1127,61 @@ impl Env<'_> {
         })
     }
 
-    /// The scorer one query needs: its mode's questions, the link state the
-    /// variant asks for, and the cache or none.
+    /// The scorer one query needs: its mode's questions, the link judgment the
+    /// policy asked for, and the cache or none.
+    ///
+    /// Under [`Links::Choice`] the file's own Score and its sections are asked
+    /// by the same scorer as under any other policy — the same state, the same
+    /// wording — and only the links are judged differently, which is what the
+    /// rows of the relative-judge table are comparable on.
     ///
     /// [`jev::ENDPOINT_VAR`] points the calls somewhere else, the way it does
     /// for the CLI — a proxy, or a fake server. The endpoint is part of the
     /// cache key, so a harness run against a proxy never reads the answers a run
     /// against the API stored, and the other way round.
-    fn scorer(&self, query: &Query, context: Context) -> Result<Metered, String> {
-        let mut jev = context
-            .apply(
-                JevScorer::new(self.key.clone(), self.root)
-                    .map_err(|error| format!("{}: {error}", query.id))?,
-            )
-            .with_mode(query.mode()?);
-        if let Some(endpoint) = std::env::var(jev::ENDPOINT_VAR)
-            .ok()
-            .filter(|endpoint| !endpoint.trim().is_empty())
-        {
-            jev = jev.with_endpoint(endpoint);
+    fn scorer(&self, query: &Query, policy: Policy) -> Result<Metered, String> {
+        let base = |context: Context| -> Result<JevScorer, String> {
+            let mut jev = context
+                .apply(
+                    JevScorer::new(self.key.clone(), self.root)
+                        .map_err(|error| format!("{}: {error}", query.id))?,
+                )
+                .with_mode(query.mode()?);
+            if let Some(endpoint) = std::env::var(jev::ENDPOINT_VAR)
+                .ok()
+                .filter(|endpoint| !endpoint.trim().is_empty())
+            {
+                jev = jev.with_endpoint(endpoint);
+            }
+            Ok(jev)
+        };
+        let error = |error: ScorerError| format!("{}: {error}", query.id);
+        match policy.links {
+            Links::Noul => self.cached(base(policy.context)?).map_err(error),
+            Links::Choice => {
+                // The file's own judgment is made with the state that ships,
+                // whatever the options carry: the choice is what varies.
+                let choice = ChoiceScorer::new(base(Context::DEFAULT)?)
+                    .with_keep(policy.keep)
+                    .with_context(policy.context);
+                self.cached(choice).map_err(error)
+            }
         }
+    }
+
+    /// One scorer behind the cache the run was told to use.
+    ///
+    /// Both bounds are named because both arms are: an uncached scorer is billed
+    /// as it is, and the cache in front of one hands its judgment back the same
+    /// way.
+    fn cached<S>(&self, scorer: S) -> Result<Metered, ScorerError>
+    where
+        S: Cacheable<Detail = JevDetail> + Bill + 'static,
+    {
         Ok(match self.cache {
-            Cache::Off => Metered::new(jev),
-            Cache::Dir(dir) => Metered::new(
-                CachedScorer::new(jev, dir.as_path())
-                    .map_err(|error| format!("{}: {error}", query.id))?,
-            ),
-            Cache::Env => Metered::new(
-                CachedScorer::from_env(jev).map_err(|error| format!("{}: {error}", query.id))?,
-            ),
+            Cache::Off => Metered::new(scorer),
+            Cache::Dir(dir) => Metered::new(CachedScorer::new(scorer, dir.as_path())?),
+            Cache::Env => Metered::new(CachedScorer::from_env(scorer)?),
         })
     }
 
@@ -1118,6 +1295,12 @@ struct Findings {
     ///
     /// [#46]: https://github.com/mikekelly/s1m/issues/46
     contexts: Vec<(&'static str, Vec<Run>)>,
+    /// The relative-judge experiment, at the smallest budget: the walk that
+    /// ships, and each way of judging a page's links against each other
+    /// ([#47](https://github.com/mikekelly/s1m/issues/47)). Empty unless
+    /// `--relative-judge` asked for it: those rows are bought, and the report a
+    /// plain run writes has to be one the committed cache reproduces.
+    policies: Vec<(&'static str, Vec<Run>)>,
     /// One query's entry page under each preview policy: what each knob does to
     /// one page's link scents.
     scents: Vec<(&'static str, Vec<(PathBuf, f64)>)>,
@@ -1181,7 +1364,12 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
             let run = env
-                .walk(query, *budget, Context::DEFAULT, args.threshold)
+                .walk(
+                    query,
+                    *budget,
+                    Policy::noul(Context::DEFAULT),
+                    args.threshold,
+                )
                 .await?;
             total.merge(&run.spent);
             runs.push(run);
@@ -1206,7 +1394,9 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for threshold in SWEEP {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, tight, Context::DEFAULT, threshold).await?;
+            let run = env
+                .walk(query, tight, Policy::noul(Context::DEFAULT), threshold)
+                .await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1220,12 +1410,42 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     // The ablations of #46, the first of them the same run again.
     let mut contexts = vec![(CONTEXTS[0].0, at[0].1.clone())];
     for (label, context) in PREVIEWS.iter().skip(1) {
-        let runs = experiment(&env, &gold, tight, *context, args.threshold, &mut total).await?;
+        let runs = experiment(
+            &env,
+            &gold,
+            tight,
+            Policy::noul(*context),
+            args.threshold,
+            &mut total,
+        )
+        .await?;
         previews.push((*label, runs));
     }
     for (label, context) in CONTEXTS.iter().skip(1) {
-        let runs = experiment(&env, &gold, tight, *context, args.threshold, &mut total).await?;
+        let runs = experiment(
+            &env,
+            &gold,
+            tight,
+            Policy::noul(*context),
+            args.threshold,
+            &mut total,
+        )
+        .await?;
         contexts.push((*label, runs));
+    }
+
+    // The relative judge ([#47]) at the tight budget, when the run asked for
+    // it: the same gold set with each page's links judged against each other.
+    // The first policy is the walk the gold set has already made — re-walking it
+    // would be free and report no cost — so the experiment starts from the runs
+    // that paid, and the rest are bought here.
+    let mut policies = Vec::new();
+    if args.relative_judge {
+        policies.push((POLICIES[0].0, at[0].1.clone()));
+        for (label, policy) in POLICIES.iter().skip(1) {
+            let runs = experiment(&env, &gold, tight, *policy, args.threshold, &mut total).await?;
+            policies.push((*label, runs));
+        }
     }
 
     // One page's links under each policy, which is the same question at the
@@ -1262,6 +1482,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         sweep,
         previews,
         contexts,
+        policies,
         scents,
         scents_of,
         total,
@@ -1282,13 +1503,13 @@ async fn experiment(
     env: &Env<'_>,
     gold: &Gold,
     budget: usize,
-    context: Context,
+    policy: Policy,
     threshold: f64,
     total: &mut Spent,
 ) -> Result<Vec<Run>, String> {
     let mut runs = Vec::with_capacity(gold.queries.len());
     for query in &gold.queries {
-        let run = env.walk(query, budget, context, threshold).await?;
+        let run = env.walk(query, budget, policy, threshold).await?;
         total.merge(&run.spent);
         runs.push(run);
     }
@@ -1311,7 +1532,7 @@ async fn scents(
         .map_err(|error| format!("{}: {error}", query.entry))?;
     let mut table = Vec::new();
     for (label, context) in PREVIEWS {
-        let meter = env.scorer(query, context)?;
+        let meter = env.scorer(query, Policy::noul(context))?;
         let judgment = Scorer::score(&meter, &query.query, &page)
             .await
             .map_err(|error| format!("{}: {error}", query.id))?;
@@ -1348,6 +1569,9 @@ impl Findings {
         self.the_threshold(out);
         self.the_preview_experiment(out);
         self.the_link_context_experiment(out);
+        if !self.policies.is_empty() {
+            self.the_relative_judge(out);
+        }
         self.limitations(out);
         self.the_cache(out);
     }
@@ -1578,6 +1802,9 @@ impl Findings {
         if let Some(flag) = &self.cache_flag {
             let _ = writeln!(out, "{flag}");
         }
+        if !self.policies.is_empty() {
+            let _ = writeln!(out, "  --relative-judge \\");
+        }
         let _ = writeln!(out, "  --out PATH");
         let _ = writeln!(out, "```");
         let _ = writeln!(out);
@@ -1590,7 +1817,9 @@ impl Findings {
              cost columns are those stored tokens at the list rate in the header — the cache fixes \
              the tokens, not the rate — and `--no-cache` with a key buys every judgment again. \
              `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about \
-             either is committed here."
+             either is committed here. `--relative-judge` is what adds the relative judge's rows \
+             below: those asks are this report's own, so a run without the flag prints the report \
+             without that table, and the cache answers the rest either way."
         );
         let _ = writeln!(out);
     }
@@ -2365,6 +2594,123 @@ impl Findings {
         let _ = writeln!(out);
     }
 
+    /// One page's links weighed against each other instead of one at a time:
+    /// what the relative judge ([#47]) is worth against the absolute one.
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    fn the_relative_judge(&self, out: &mut String) {
+        let _ = writeln!(out, "## The relative judge: one Choice over a page's links");
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The walk as it ships follows a link on the model's own answer about that link — is \
+             following it likely to lead somewhere useful — measured against `--threshold`. The \
+             same page can be judged as one question instead: which of its links is the best next \
+             step, answered as a share per link. A share is followed where it clears a cut that \
+             moves with the page — `max({}, min({} / options, {}))`, against the options the \
+             question actually carried, and never a page whose best option is `none` — and the \
+             walk visits at most `--beam` {} files at each depth. The file's own Score and its \
+             section Nouls are asked exactly as the shipping judge asks them, from the same state, \
+             so the rows vary the link judgment — and, in the last one, the cut — and nothing \
+             else. `choice` describes its options from the page alone; `choice + previews` gives \
+             each option the preview the state carries. At `--max-files {}`:",
+            KEEP.floor,
+            KEEP.k,
+            jev::KEEP_CEILING,
+            BEAM,
+            self.budgets[0],
+        );
+        let _ = writeln!(out);
+        head(
+            out,
+            &[
+                "Links judged",
+                "Recall",
+                "Precision",
+                "Precision (visited)",
+                "Read (tok)",
+                "Whole (tok)",
+                "Returned",
+                "Input (tok)",
+                "Cost",
+                "Requests",
+                "Req/answer",
+            ],
+        );
+        for (label, runs) in &self.policies {
+            row(
+                out,
+                &[
+                    (*label).to_string(),
+                    ratio(mean_recall(runs)),
+                    ratio(mean_precision(runs)),
+                    ratio(mean_precision_over_visited(runs)),
+                    sum(runs, |run| run.score.read_tokens).to_string(),
+                    sum(runs, |run| run.score.whole_tokens).to_string(),
+                    sum(runs, |run| run.score.returned).to_string(),
+                    sum(runs, |run| run.spent.input_tokens).to_string(),
+                    usd(sum_cost(runs)),
+                    sum(runs, |run| run.spent.requests).to_string(),
+                    format!("{:.2}", requests_per_answer(runs)),
+                ],
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "`Requests` is what the API was asked over the whole gold set and `Req/answer` the \
+             same over the files it judged, so 1.00 is a question set that fits one post: a row \
+             above 1.00 is the second request a page's Choice costs. A `choice` row that asks \
+             more than the row above it and reads less is the relative judge doing its job — \
+             fewer, better files — and one that recalls less is the cut closing pages the Noul \
+             would have walked through."
+        );
+        let _ = writeln!(out);
+
+        let mut headers = vec!["Query".to_string(), "Gold".to_string()];
+        headers.extend(self.policies.iter().map(|(label, _)| (*label).to_string()));
+        let _ = writeln!(
+            out,
+            "Recall per query, the queries the shipped walk found least first:"
+        );
+        let _ = writeln!(out);
+        head(out, &headers.iter().map(String::as_str).collect::<Vec<_>>());
+        let shipped = &self.policies[0].1;
+        let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
+        order.sort_by(|left, right| {
+            shipped[*left]
+                .score
+                .recall()
+                .partial_cmp(&shipped[*right].score.recall())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.gold.queries[*left]
+                        .id
+                        .cmp(&self.gold.queries[*right].id)
+                })
+        });
+        for &index in &order {
+            let mut cells = vec![
+                format!("`{}`", self.gold.queries[index].id),
+                shipped[index].score.gold.to_string(),
+            ];
+            cells.extend(
+                self.policies
+                    .iter()
+                    .map(|(_, runs)| ratio(runs[index].score.recall())),
+            );
+            row(out, &cells);
+        }
+        let mut means = vec!["**mean**".to_string(), String::new()];
+        means.extend(
+            self.policies
+                .iter()
+                .map(|(_, runs)| format!("**{}**", ratio(mean_recall(runs)))),
+        );
+        row(out, &means);
+        let _ = writeln!(out);
+    }
+
     fn limitations(&self, out: &mut String) {
         let _ = writeln!(out, "## What these numbers are not");
         let _ = writeln!(out);
@@ -2715,6 +3061,7 @@ mod tests {
             requests,
             relevance_level: 2.0,
             relevance_confidence: 0.8,
+            choice_confidence: Vec::new(),
             input_tokens: tokens,
             output_tokens: 10,
             latency: Duration::from_millis(latency_ms),

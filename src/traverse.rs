@@ -8,12 +8,21 @@
 //!
 //! Beyond them the walk is one frontier ordered by path score, across rounds
 //! and not within one: nothing reorders the queue per round. A link is admitted
-//! on its own scent — in the root, at or above the threshold, within the depth
-//! budget — and is queued at the score of the path it was found on, the product
-//! of the link scents from an entry file. So a file's priority is the score of
-//! the best path found to it: long chains of weak links sink, a file reached
-//! twice keeps its best path and is visited once, and a link whose own scent
-//! clears the threshold is queued whatever its path score came out as.
+//! by the config's [`Admission`] rule — in the root, kept by the scorer or at or
+//! above the threshold, within the depth budget — and is queued at the score of
+//! the path it was found on, the product of the link scents from an entry file.
+//! So a file's priority is the score of the best path found to it: long chains
+//! of weak links sink, a file reached twice keeps its best path and is visited
+//! once, and a link the rule admits is queued whatever its path score came out
+//! as.
+//!
+//! A config may also make the walk a beam search: with `beam`, at most that many
+//! files are visited at each depth, and a path the walk has no turn for is
+//! dropped rather than expanded, so what it pursues at a depth is the best of
+//! what it found there. Priority is the product of the shares either way, and a
+//! beam is a budget of the same kind as `max_files`, one depth at a time: the
+//! links that queued a path are still reported as followed, whatever became of
+//! the path afterwards.
 //!
 //! Every entry file is one the caller named: it starts at path score 1, depth
 //! 0, with no scent and no `via`, and nothing can reach a file at a better
@@ -64,13 +73,14 @@ use serde::Serialize;
 
 use crate::ignore::Ignore;
 use crate::parse::{ParseError, ParsedFile, parse, relative_to_root};
-use crate::scorer::{FileJudgment, Scorer, ScorerError};
+use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
 
 /// One traversal: the query, where to start, and the budgets that stop it.
 ///
 /// Nothing here has a default. The plan's defaults (`max_files` 25,
 /// `max_depth` 6, `threshold` 0.6) belong to the CLI flags that carry them;
-/// `fanout` is the constant `main.rs` hands the walk.
+/// `fanout` is the constant `main.rs` hands the walk, and `beam` is off except
+/// where a caller asks for a beam search.
 #[derive(Debug, Clone)]
 pub struct Config<'a> {
     /// The query, passed unchanged to every [`Scorer::score`] call.
@@ -94,9 +104,26 @@ pub struct Config<'a> {
     /// leaves the ones it overtook on the frontier for their turn, and a walk
     /// scores this many files rather than visiting them.
     pub fanout: usize,
-    /// Least link scent that queues a target. A Noul near 0.5 means uncertain,
-    /// so this is meant to sit above it.
-    pub threshold: f64,
+    /// How a link earns its place on the frontier.
+    pub admission: Admission,
+    /// Most files the walk visits at one depth, or `None` for no ceiling: the
+    /// walk as a beam search, which is how the relative-scent spike follows
+    /// shares ([#47], where priority is the product of shares and a depth's
+    /// worst paths are dropped rather than expanded).
+    ///
+    /// A budget of the same kind as [`Config::max_files`], one depth at a time:
+    /// a path the beam has no turn for is taken off the frontier and never
+    /// visited, so what the walk expands at a depth is the best `beam` paths it
+    /// found there. What is visited is a function of the walk's own decisions
+    /// and not of the round size, so a beam does not cost the walk its
+    /// determinism.
+    ///
+    /// The entry files are not on the frontier — they are visited as the
+    /// entries they were named as — so a beam never starves a walk of what the
+    /// caller named, whatever its size.
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    pub beam: Option<usize>,
     /// The root's `.s1mignore` patterns ([`crate::ignore`]), applied to every
     /// path the walk could read.
     ///
@@ -107,6 +134,44 @@ pub struct Config<'a> {
     /// silent drop ([`crate::cli::Error::Ignored`]); the drop is here so that no
     /// caller of the walk can read a matched path by passing one.
     pub ignore: &'a Ignore,
+}
+
+/// How a file's links earn their place on the frontier.
+///
+/// A Noul and a Choice share are both 0 to 1 and are not the same kind of
+/// number: 0.6 on a Noul is "likely useful", and 0.6 on a Choice share is a page
+/// of two links all but decided. So the rule that reads them lives beside the
+/// scorer that gives them, and the walk is told which one it is walking under.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Admission {
+    /// The link's own scent, at or above the threshold: the rule for a scorer
+    /// whose number is on a scale of its own, where 0.5 means unsure and the
+    /// caller's floor sits above it.
+    Threshold(f64),
+    /// Whatever the scorer kept ([`crate::scorer::LinkJudgment::keep`]),
+    /// whatever number is beside it: the rule for a number that means something
+    /// only beside the options it was weighed against.
+    Scorer,
+}
+
+impl Admission {
+    /// Whether one link's judgment earns it a place on the frontier: its scent
+    /// against the caller's floor, or the scorer's own verdict.
+    ///
+    /// A scent outside 0 to 1 is not admitted by either rule, and is not the
+    /// caller's to admit: path scores are products of scents and may never rise
+    /// along a path, which is what lets a file that has been popped be settled
+    /// rather than re-opened. A scorer that answered outside that range is not
+    /// followed, whatever it says about keeping the link.
+    fn admits(self, scent: f64, keep: bool) -> bool {
+        if !(0.0..=1.0).contains(&scent) {
+            return false;
+        }
+        match self {
+            Admission::Threshold(threshold) => scent >= threshold,
+            Admission::Scorer => keep,
+        }
+    }
 }
 
 /// What one traversal found.
@@ -198,6 +263,10 @@ pub struct JudgedLink {
     /// The scent the scorer gave it, `None` when the scorer named no link to
     /// this target.
     pub scent: Option<f64>,
+    /// Whether the scorer kept it ([`crate::scorer::LinkJudgment::keep`]): what
+    /// [`Admission::Scorer`] reads, and `false` for a link the scorer named no
+    /// judgment for.
+    pub keep: bool,
     /// Whether the target is inside the root. A link outside it is never
     /// followed, whatever its scent.
     pub in_root: bool,
@@ -307,6 +376,13 @@ struct Search<'a> {
     failed: Vec<FailedFile>,
     /// Files judged beyond the entry files: what `max_files` bounds.
     spent: usize,
+    /// Files judged at each depth: what `beam` bounds, and the reason a beam is
+    /// not a property of the round size — the depth a file is judged at is the
+    /// depth its best path reached it at, and the walk's decisions do not depend
+    /// on how many files a round scores at once ([#47]).
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    depths: HashMap<usize, usize>,
     calls: usize,
 }
 
@@ -322,6 +398,7 @@ impl<'a> Search<'a> {
             results: Vec::new(),
             failed: Vec::new(),
             spent: 0,
+            depths: HashMap::new(),
             calls: 0,
         }
     }
@@ -431,7 +508,7 @@ impl<'a> Search<'a> {
     fn next_batch(&mut self) -> Vec<Frontier> {
         let mut batch = Vec::new();
         while batch.len() < self.config.fanout && self.spent + batch.len() < self.config.max_files {
-            let Some(entry) = self.next_pending() else {
+            let Some(entry) = self.next_pending(&batch) else {
                 break;
             };
             batch.push(entry);
@@ -440,14 +517,39 @@ impl<'a> Search<'a> {
     }
 
     /// The frontier's best file, taken off the heap: the ones the walk has
-    /// already dealt with are thrown away as they are met.
-    fn next_pending(&mut self) -> Option<Frontier> {
+    /// already dealt with are thrown away as they are met, and so are the ones
+    /// the beam has no turn left for.
+    ///
+    /// A path the beam drops is dropped for good rather than put back: the walk
+    /// has visited all it will at that depth, and a path no turn will come for
+    /// is not something to hold. Keeping it in `best` is what the walk already
+    /// does with the paths it has taken — a file is visited by the best path
+    /// found to it, once — so a later path to the same file is judged against
+    /// the one the beam dropped, not against nothing.
+    fn next_pending(&mut self, batch: &[Frontier]) -> Option<Frontier> {
         loop {
             let entry = self.frontier.pop()?;
-            if !self.dealt_with(&entry) {
-                return Some(entry);
+            if self.dealt_with(&entry) || self.past_beam(entry.depth, batch) {
+                continue;
             }
+            return Some(entry);
         }
+    }
+
+    /// Whether the walk has taken as many files at this depth as its beam
+    /// allows: the ones it has visited, and the ones this round has popped and
+    /// not yet recorded. `None` is no beam at all, which is the walk that
+    /// ships.
+    ///
+    /// The round's own batch counts because it is popped together: a file the
+    /// batch holds is a file the walk is about to visit, and a beam that did
+    /// not count it would take a whole round's worth of paths at a depth.
+    fn past_beam(&self, depth: usize, batch: &[Frontier]) -> bool {
+        self.config.beam.is_some_and(|beam| {
+            let taken = self.depths.get(&depth).copied().unwrap_or(0)
+                + batch.iter().filter(|entry| entry.depth == depth).count();
+            taken >= beam
+        })
     }
 
     /// Whether the walk has dealt with a frontier entry: its file is visited or
@@ -562,28 +664,40 @@ impl<'a> Search<'a> {
         let (file, judgment) = match outcome {
             Ok(answered) => answered,
             Err(failure) => {
+                // A file the walk popped and could not judge still spends the
+                // turn the beam reserved for it at this depth. That is what
+                // makes the turn a function of the pop order and nothing else:
+                // the reservation [`Search::past_beam`] makes for a round is
+                // realized here whether or not the file could be judged, so the
+                // paths a depth drops do not depend on how many files a round
+                // happened to hold. `spent` is not charged for it — the file
+                // budget counts the files the walk judged, and this is not one.
+                if depth > 0 {
+                    *self.depths.entry(depth).or_default() += 1;
+                }
                 self.failed.push(FailedFile { path, failure });
                 return;
             }
         };
         // The budget is the files the walk judges beyond the entry files, so a
         // file that could not be judged cost it nothing; an entry file is not
-        // the budget's business at all.
+        // the budget's business at all. A beam is the same kind of budget one
+        // depth at a time, and counts the files the walk visited there.
         if depth > 0 {
             self.spent += 1;
+            *self.depths.entry(depth).or_default() += 1;
         }
 
         let mut links = judged_links(&file, &judgment);
         for link in &mut links {
-            // A link the scorer named no scent for, a scent that is not a
-            // probability, one below the threshold, one out of the root or one
-            // past the depth budget all queue nothing.
+            // A link the scorer named no scent for, one it did not keep, a
+            // scent that is not a probability, one below the threshold, one out
+            // of the root or one past the depth budget all queue nothing.
             let Some(link_scent) = link.scent else {
                 continue;
             };
             if !link.in_root
-                || !(0.0..=1.0).contains(&link_scent)
-                || link_scent < self.config.threshold
+                || !self.config.admission.admits(link_scent, link.keep)
                 || depth + 1 > self.config.max_depth
             {
                 continue;
@@ -663,14 +777,14 @@ fn judged_sections(file: &ParsedFile, judgment: &FileJudgment) -> Vec<JudgedSect
 /// entry per target, each with the scent the scorer gave it.
 ///
 /// Only targets the file actually links to are reported, and a target the
-/// scorer named no link to keeps `scent: None`. A scorer cannot add a link that
-/// is not in the file, so it cannot send the walk somewhere the file does not
-/// point.
+/// scorer named no link to keeps `scent: None` and `keep: false`. A scorer
+/// cannot add a link that is not in the file, so it cannot send the walk
+/// somewhere the file does not point.
 fn judged_links(file: &ParsedFile, judgment: &FileJudgment) -> Vec<JudgedLink> {
-    let mut judged: HashMap<&Path, f64> = HashMap::with_capacity(judgment.links.len());
+    let mut judged: HashMap<&Path, &LinkJudgment> = HashMap::with_capacity(judgment.links.len());
     for link in &judgment.links {
-        // A target named twice keeps the scent it was first judged at.
-        judged.entry(link.target.as_path()).or_insert(link.scent);
+        // A target named twice keeps the judgment it was first given.
+        judged.entry(link.target.as_path()).or_insert(link);
     }
 
     let mut seen: HashSet<&Path> = HashSet::with_capacity(file.links.len());
@@ -680,9 +794,11 @@ fn judged_links(file: &ParsedFile, judgment: &FileJudgment) -> Vec<JudgedLink> {
         if !seen.insert(link.target.as_path()) {
             continue;
         }
+        let judged = judged.get(link.target.as_path());
         links.push(JudgedLink {
             target: link.target.clone(),
-            scent: judged.get(link.target.as_path()).copied(),
+            scent: judged.map(|judged| judged.scent),
+            keep: judged.is_some_and(|judged| judged.keep),
             in_root: link.in_root,
             followed: false,
         });

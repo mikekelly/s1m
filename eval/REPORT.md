@@ -10,15 +10,15 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 | Price | $0.042 per million input tokens, output free |
 | Walk | `--threshold` 0.6, `--max-depth` 6, 8 frontier files a round |
 | Answers | `eval/cache` |
-| Requests | 1677 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
-| Cost | $0.044431 for the gold set at `--max-files 10`, $0.048529 at `--max-files 25`; every answer this report used, at the list price above, $0.396000 |
+| Requests | 2046 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
+| Cost | $0.044431 for the gold set at `--max-files 10`, $0.048529 at `--max-files 25`; every answer this report used, at the list price above, $0.457720 |
 
 ## Headline
 
 - **Recall and precision at `--max-files 10`**: mean recall 0.83, mean precision 0.26 — 32 of the 39 wanted pages are in the list the agent opens, over 129 files returned, 6.5 a query — against 0.19 over everything the walk visited: 181 files judged, 129 of them earned a place, and the rest are what the JSON reports as `walked`. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` visits 202 files for the same mean recall (0.83), 141 of which earn a place, so everything below is a statement about the link graph and the threshold, not about the budget.
 - **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.83, at 243070 tokens against 68663 — 3.5× the reading for 0.11 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
 - **What an agent reads**: 68663 tokens for the returned ranges, against 122023 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 35% of the corpus's text; the section scores take 44% off that, and the ranking 80% off reading everything.
-- **What it costs**: $0.044431 for the gold set at `--max-files 10` — $0.002222 a query, at 0.19 s an answer, $0.048529 at `--max-files 25`; every answer this report used, at the price above, $0.396000. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
+- **What it costs**: $0.044431 for the gold set at `--max-files 10` — $0.002222 a query, at 0.19 s an answer, $0.048529 at `--max-files 25`; every answer this report used, at the price above, $0.457720. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
 - **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.05 and reading +50%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.17 and reading -40%; 0.8: recall -0.30 and reading -70%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.18 of the time, the ones it passed over 0.14, and 394 links clear the threshold and are still not followed.
 - **The frontmatter earns its tokens**: dropping it from the preview costs 0.08 of recall (0.83 → 0.75) for -33% of the input tokens, and dropping previews altogether costs 0.47. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
 
@@ -29,10 +29,11 @@ cargo run --release --bin eval -- \
   --wiki eval/wikis/llm-wiki-manager/wiki \
   --gold eval/gold/llm-wiki-manager.json \
   --cache eval/cache \
+  --relative-judge \
   --out PATH
 ```
 
-This report goes to stdout without `--out`, and `--out PATH` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here.
+This report goes to stdout without `--out`, and `--out PATH` writes it to a file instead. Every judgment is cached on the request that produced it, and the cache stores the tokens each call spent beside its answer, so the cache committed under that directory reproduces this report byte for byte with no `TYPESAFE_API_KEY` at all. The cost columns are those stored tokens at the list rate in the header — the cache fixes the tokens, not the rate — and `--no-cache` with a key buys every judgment again. `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about either is committed here. `--relative-judge` is what adds the relative judge's rows below: those asks are this report's own, so a run without the flag prints the report without that table, and the cache answers the rest either way.
 
 ## The gold set
 
@@ -295,6 +296,45 @@ Requests per query, the same order: what each variant asked of the API, where th
 | `wiki-code-sync` | 1 | 11 | 11 | 11 | 10 | 9 |
 | `wiki-validation` | 2 | 11 | 11 | 7 | 6 | 3 |
 | **total** |  | **181** | **165** | **118** | **97** | **85** |
+
+## The relative judge: one Choice over a page's links
+
+The walk as it ships follows a link on the model's own answer about that link — is following it likely to lead somewhere useful — measured against `--threshold`. The same page can be judged as one question instead: which of its links is the best next step, answered as a share per link. A share is followed where it clears a cut that moves with the page — `max(0.02, min(3 / options, 0.5))`, against the options the question actually carried, and never a page whose best option is `none` — and the walk visits at most `--beam` 8 files at each depth. The file's own Score and its section Nouls are asked exactly as the shipping judge asks them, from the same state, so the rows vary the link judgment — and, in the last one, the cut — and nothing else. `choice` describes its options from the page alone; `choice + previews` gives each option the preview the state carries. At `--max-files 10`:
+
+| Links judged | Recall | Precision | Precision (visited) | Read (tok) | Whole (tok) | Returned | Input (tok) | Cost | Requests | Req/answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| noul: what ships | 0.83 | 0.26 | 0.19 | 68663 | 122023 | 129 | 1057882 | $0.044431 | 181 | 1.00 |
+| choice | 0.57 | 0.38 | 0.34 | 24649 | 39239 | 50 | 395339 | $0.016604 | 115 | 1.95 |
+| choice + previews | 0.62 | 0.41 | 0.39 | 29123 | 43458 | 51 | 483671 | $0.020314 | 113 | 1.95 |
+| choice + previews, k=1 | 0.72 | 0.43 | 0.40 | 40504 | 59763 | 64 | 590513 | $0.024802 | 141 | 1.93 |
+
+`Requests` is what the API was asked over the whole gold set and `Req/answer` the same over the files it judged, so 1.00 is a question set that fits one post: a row above 1.00 is the second request a page's Choice costs. A `choice` row that asks more than the row above it and reads less is the relative judge doing its job — fewer, better files — and one that recalls less is the cut closing pages the Noul would have walked through.
+
+Recall per query, the queries the shipped walk found least first:
+
+| Query | Gold | noul: what ships | choice | choice + previews | choice + previews, k=1 |
+| --- | --- | --- | --- | --- | --- |
+| `flat-entities` | 2 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `wiki-log` | 2 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `raw-immutable` | 2 | 0.50 | 0.50 | 0.50 | 0.50 |
+| `release-and-publish` | 2 | 0.50 | 0.50 | 0.50 | 0.50 |
+| `what-is-it` | 3 | 0.67 | 0.00 | 0.00 | 0.67 |
+| `cli-dispatch` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `compiled-cli-tests` | 2 | 1.00 | 0.50 | 0.50 | 0.50 |
+| `index-tables` | 2 | 1.00 | 0.50 | 0.50 | 0.50 |
+| `ingest-summary` | 3 | 1.00 | 0.33 | 0.33 | 1.00 |
+| `init-copies` | 2 | 1.00 | 0.00 | 0.50 | 0.50 |
+| `init-scaffold` | 3 | 1.00 | 0.33 | 0.33 | 0.67 |
+| `node-runtime-floor` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `run-unit-tests` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `source-layout` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `template-vars` | 3 | 1.00 | 0.67 | 0.67 | 0.67 |
+| `types-alignment` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `upgrade-preserves` | 3 | 1.00 | 0.67 | 0.67 | 1.00 |
+| `utils-fs` | 2 | 1.00 | 0.50 | 1.00 | 1.00 |
+| `wiki-code-sync` | 1 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `wiki-validation` | 2 | 1.00 | 1.00 | 1.00 | 1.00 |
+| **mean** |  | **0.83** | **0.57** | **0.62** | **0.72** |
 
 ## What these numbers are not
 
