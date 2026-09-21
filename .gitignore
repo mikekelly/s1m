@@ -9,3 +9,7 @@
 
 # The raw half of an eval-agent run: rows that quote queries and name files.
 /eval/agent/out/
+
+# The ledger of what has been bought, when a machine has no home directory to
+# keep it in: it carries query ids and what they cost.
+ledger.jsonl

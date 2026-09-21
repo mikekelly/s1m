@@ -1,9 +1,14 @@
 //! The `run` command: every query, under every condition, as many times as
 //! asked, with one JSONL row per run.
 //!
-//! Runs cost money and take minutes, so the pass is resumable: a row already in
-//! the JSONL is a run that has happened, and it is not run again. The rows are
-//! flushed one at a time for the same reason.
+//! Runs cost money and take minutes, so the pass is resumable — and what it
+//! must not do is buy the same run twice. A run already recorded in this
+//! directory is not made again, and neither is one the [ledger](crate::ledger)
+//! says was bought and measured anywhere else on the machine. Before buying
+//! anything, the pass prices what it owes and stops when that is more than this
+//! harness spends without being told to.
+//!
+//! The rows are flushed one at a time for the same reason.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -14,9 +19,11 @@ use std::time::{Duration, Instant};
 
 use crate::explore::{self, Usage};
 use crate::gold::{Gold, Query};
+use crate::ledger::{self, Entry, Id, Ledger};
 use crate::reading;
 use crate::report::Method;
-use crate::row::Row;
+use crate::row::{Key, Row};
+use crate::wiki;
 
 /// The file every run appends to, under `--out`.
 pub const ROWS: &str = "runs.jsonl";
@@ -82,6 +89,15 @@ pub struct Options {
     pub cold_repeats: usize,
     /// Measure only these query ids; every one when empty.
     pub queries: Vec<String>,
+    /// Print what the owed runs are expected to cost, and buy nothing.
+    pub estimate: bool,
+    /// Run even when the estimate is above [`SPEND_LIMIT_USD`].
+    pub yes: bool,
+    /// Re-run the runs this directory recorded as failed, and nothing else.
+    pub retry_failed: bool,
+    /// The ledger of what has been bought, shared by every run directory.
+    /// `None` is [`ledger::default_path`].
+    pub ledger: Option<PathBuf>,
     pub timeout: Duration,
 }
 
@@ -105,7 +121,7 @@ pub fn pending(
     conditions: &[String],
     repeats: usize,
     cold_repeats: usize,
-    done: &BTreeSet<(String, String, usize)>,
+    done: &Done,
 ) -> Vec<Job> {
     let mut jobs = Vec::new();
     for (at, query) in gold.queries.iter().enumerate() {
@@ -117,7 +133,16 @@ pub fn pending(
                 }
                 wanted.push(condition.clone());
                 for condition in wanted {
-                    if done.contains(&(query.id.clone(), condition.clone(), repeat)) {
+                    let key = Key {
+                        // Membership is the query, condition and repeat: the
+                        // wiki revision and the model were settled when the
+                        // ledger was read.
+                        wiki: String::new(),
+                        query: query.id.clone(),
+                        condition: condition.clone(),
+                        repeat,
+                    };
+                    if done.contains(&key) {
                         continue;
                     }
                     jobs.push(Job {
@@ -130,6 +155,86 @@ pub fn pending(
         }
     }
     jobs
+}
+
+/// The `(query, condition, repeat)` of a run.
+type Triple = (String, String, usize);
+
+fn triple(key: &Key) -> Triple {
+    (key.query.clone(), key.condition.clone(), key.repeat)
+}
+
+/// What has already been measured: one set of runs, read from two records that
+/// are held to two different rules.
+///
+/// This directory's rows are its own record, so a run in it has happened and is
+/// not made again whatever wiki revision it was made against: a pass resumed on
+/// a directory from before revisions were recorded does not pay for all of it
+/// again to learn what its rows already say.
+///
+/// The ledger's entries are every directory's record, so they are held to the
+/// key: only the ones for the wiki revision being measured now, and only the
+/// ones bought at the model being asked for — where the condition takes a
+/// model at all. The same query against another cut or at another tier is
+/// another measurement, and a screening pass at a cheaper model has to be able
+/// to make it.
+///
+/// `--retry-failed` puts back the runs that failed — here and in the ledger —
+/// and nothing else.
+pub struct Done {
+    runs: BTreeSet<Triple>,
+}
+
+impl Done {
+    /// Nothing measured: what a pass over a new directory reads.
+    #[cfg(test)]
+    pub fn nothing() -> Done {
+        Done {
+            runs: BTreeSet::new(),
+        }
+    }
+
+    /// `model` is the model this pass is asking for, or `None` where it names
+    /// none.
+    pub fn read(
+        rows: &[Row],
+        recorded: &BTreeMap<Id, Entry>,
+        wiki: &str,
+        model: Option<&str>,
+        retry_failed: bool,
+    ) -> Done {
+        let mut runs: BTreeSet<Triple> = rows
+            .iter()
+            .filter(|row| !(retry_failed && !row.ok))
+            .map(|row| triple(&row.key()))
+            .collect();
+        runs.extend(
+            recorded
+                .values()
+                .filter(|entry| match entry.ok {
+                    // A purchase with no outcome is a run killed before its row
+                    // was written: the money is gone and the measurement is
+                    // missing, so the run is owed and is counted as bought.
+                    None => false,
+                    Some(false) => !retry_failed,
+                    Some(true) => true,
+                })
+                .filter(|entry| {
+                    entry.key.wiki == wiki && entry.model == asked_for(&entry.key.condition, model)
+                })
+                .map(|entry| triple(&entry.key)),
+        );
+        Done { runs }
+    }
+
+    pub fn contains(&self, key: &Key) -> bool {
+        self.runs.contains(&triple(key))
+    }
+
+    /// How many runs are behind it.
+    pub fn len(&self) -> usize {
+        self.runs.len()
+    }
 }
 
 /// The rows already written, if any: a resumed pass reads them back rather than
@@ -164,11 +269,9 @@ pub fn run(options: &Options) -> Result<(), String> {
     // An agent reports the paths it opened as it opened them, which is
     // absolute; the wiki has to be absolute too for those to come back
     // relative.
-    let options = &Options {
-        wiki: std::fs::canonicalize(&options.wiki)
-            .map_err(|error| format!("{}: {error}", options.wiki.display()))?,
-        ..options.clone()
-    };
+    let mut options = options.clone();
+    options.wiki = std::fs::canonicalize(&options.wiki)
+        .map_err(|error| format!("{}: {error}", options.wiki.display()))?;
     for condition in &options.conditions {
         if !crate::row::CONDITIONS.contains(&condition.as_str())
             && threshold_of(condition).is_none()
@@ -182,11 +285,26 @@ pub fn run(options: &Options) -> Result<(), String> {
     }
     let mut gold = Gold::load(&options.gold)?;
     gold.only(&options.queries)?;
-    fs::create_dir_all(options.out.join(RAW))
-        .map_err(|error| format!("{}: {error}", options.out.display()))?;
 
+    // A run is what it found as well as what it asked: the revision of the wiki
+    // is part of its identity, so it is read once here and carried by every row
+    // and every purchase this pass makes.
+    let wiki = wiki::revision(&options.wiki)?;
+    let ledger = Ledger::at(
+        options
+            .ledger
+            .clone()
+            .unwrap_or_else(|| ledger::default_path(&options.out)),
+    );
+    let recorded = ledger.read()?;
     let mut rows = read_rows(&options.out)?;
-    let done: BTreeSet<(String, String, usize)> = rows.iter().map(Row::key).collect();
+    let done = Done::read(
+        &rows,
+        &recorded,
+        &wiki,
+        options.model.as_deref(),
+        options.retry_failed,
+    );
     let jobs = pending(
         &gold,
         &options.conditions,
@@ -194,17 +312,54 @@ pub fn run(options: &Options) -> Result<(), String> {
         options.cold_repeats,
         &done,
     );
+    let estimate = estimate(&jobs, &wiki, &recorded);
     eprintln!(
-        "eval-agent: {} runs owed, {} already measured",
+        "eval-agent: {} runs owed, {} already measured, {}",
         jobs.len(),
-        rows.len()
+        done.len(),
+        estimate.summary()
     );
 
+    // An estimate costs nothing and a pass does not: with `--estimate` it is
+    // the whole job and nothing is created, and above the limit it is the
+    // pass's answer unless the caller has said yes.
+    if options.estimate {
+        print!("{}", estimate.table());
+        eprintln!(
+            "eval-agent: estimate only, nothing was bought; the ledger is {}",
+            ledger.path().display()
+        );
+        return Ok(());
+    }
+    if estimate.total > SPEND_LIMIT_USD && !options.yes {
+        eprint!("{}", estimate.table());
+        return Err(format!(
+            "the {} runs owed are estimated at ${}, above the ${} this harness \
+             spends without being told: pass --yes to buy them, or --estimate to \
+             see what they are priced from",
+            jobs.len(),
+            money(estimate.total),
+            money(SPEND_LIMIT_USD)
+        ));
+    }
+
+    fs::create_dir_all(options.out.join(RAW))
+        .map_err(|error| format!("{}: {error}", options.out.display()))?;
+    let out = std::fs::canonicalize(&options.out)
+        .map_err(|error| format!("{}: {error}", options.out.display()))?;
+    let pass = Pass {
+        options,
+        out,
+        wiki,
+        ledger,
+    };
+
+    let mut made: BTreeSet<Key> = BTreeSet::new();
     for (at, job) in jobs.iter().enumerate() {
         let query = &gold.queries[job.query];
         // A prerequisite may have made this run already.
-        let key = (query.id.clone(), job.condition.clone(), job.repeat);
-        if rows.iter().any(|row| row.key() == key) {
+        let key = pass.key(query, job);
+        if made.contains(&key) {
             continue;
         }
         if let Some(needed) = prerequisite(job, &query.id, &rows) {
@@ -217,8 +372,8 @@ pub fn run(options: &Options) -> Result<(), String> {
                 job.repeat,
                 needed.condition
             );
-            let row = measure(options, query, &needed, &rows);
-            append(&options.out, &row)?;
+            let row = pass.buy(pass.key(query, &needed), query, &needed, &rows)?;
+            made.insert(row.key());
             rows.push(row);
         }
         eprintln!(
@@ -229,19 +384,240 @@ pub fn run(options: &Options) -> Result<(), String> {
             job.condition,
             job.repeat
         );
-        let row = measure(options, query, job, &rows);
-        append(&options.out, &row)?;
+        let row = pass.buy(key, query, job, &rows)?;
+        made.insert(row.key());
         rows.push(row);
     }
 
-    write_aggregates(options, &rows)
+    write_aggregates(&pass.options, &rows, &pass.ledger, &pass.out)
+}
+
+/// One pass as it is being made: the flags it was given, where its rows go,
+/// what it records them in, and the wiki revision every one of them is measured
+/// against.
+struct Pass {
+    options: Options,
+    /// The canonical `--out`, which is what the ledger records a purchase for.
+    out: PathBuf,
+    wiki: String,
+    ledger: Ledger,
+}
+
+impl Pass {
+    /// The key of one run against this pass's wiki revision.
+    fn key(&self, query: &Query, job: &Job) -> Key {
+        Key {
+            wiki: self.wiki.clone(),
+            query: query.id.clone(),
+            condition: job.condition.clone(),
+            repeat: job.repeat,
+        }
+    }
+
+    /// One run, bought and recorded.
+    ///
+    /// The purchase is written before the run is paid for and its outcome after
+    /// the row has been written: a pass that dies in between has still said what
+    /// it bought, and the run is owed again by whoever comes next.
+    fn buy(&self, key: Key, query: &Query, job: &Job, rows: &[Row]) -> Result<Row, String> {
+        let model = asked_for(&job.condition, self.options.model.as_deref());
+        let buying = Entry::buying(key, model.as_deref(), &self.out);
+        self.ledger.record(&buying)?;
+        let row = measure(&self.options, &self.wiki, query, job, rows);
+        append(&self.options.out, &row)?;
+        // A failed run carries no metrics, so it has no price and none is
+        // recorded: a zero would read as a run that came free.
+        let cost = row.metrics.get("cost_usd").copied();
+        self.ledger.record(&buying.measured(row.ok, cost))?;
+        Ok(row)
+    }
+}
+
+/// Above this many dollars, a pass says what it is about to spend and stops
+/// unless the caller has said yes. It is the README's "start small" as a rule of
+/// the harness rather than as advice.
+pub const SPEND_LIMIT_USD: f64 = 5.0;
+
+/// What the runs that are owed are expected to cost.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Estimate {
+    pub lines: Vec<EstimateLine>,
+    /// The sum of the lines: a floor rather than a total when one of them had
+    /// nothing to price it with.
+    pub total: f64,
+    /// The conditions with no run of that kind to price them by.
+    pub unknown: usize,
+}
+
+/// One condition's pending runs, priced by what that condition has cost before.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EstimateLine {
+    pub condition: String,
+    pub jobs: usize,
+    /// The mean cost of a run of this condition, and how many were averaged.
+    pub mean: Option<f64>,
+    pub n: usize,
+    /// Whether the mean came from runs against another wiki revision: this one
+    /// has none of its own, which is what a wiki that has just changed looks
+    /// like.
+    pub elsewhere: bool,
+}
+
+impl Estimate {
+    /// What the owed runs are expected to cost, in one line for the pass's own
+    /// summary.
+    pub fn summary(&self) -> String {
+        let floor = if self.unknown > 0 { "at least " } else { "" };
+        format!("{floor}${} to buy", money(self.total))
+    }
+
+    /// The estimate as a table, with what each mean was averaged from: the
+    /// ledger is the only evidence a directory with no rows of its own has, and
+    /// a mean over no rows says so rather than reading as free.
+    pub fn table(&self) -> String {
+        // The header is written with the same columns as the rows below it, so
+        // that a change to one cannot leave the table out of line.
+        let mut out = format!(
+            "  {:<14} {:>6} {:>14} {:>6} {:>12}\n",
+            "condition", "owed", "mean $/run", "n", "subtotal"
+        );
+        for line in &self.lines {
+            let (mean, subtotal) = match line.mean {
+                Some(mean) => (money(mean), money(mean * line.jobs as f64)),
+                None => ("unknown".to_string(), "?".to_string()),
+            };
+            out.push_str(&format!(
+                "  {:<14} {:>6} {:>14} {:>6} {:>12}{}\n",
+                line.condition,
+                line.jobs,
+                mean,
+                line.n,
+                subtotal,
+                if line.elsewhere { " *" } else { "" }
+            ));
+        }
+        let owed: usize = self.lines.iter().map(|line| line.jobs).sum();
+        out.push_str(&format!(
+            "  {:<14} {owed:>6} {:>14} {:>6} {:>12}\n",
+            "total",
+            "",
+            "",
+            money(self.total)
+        ));
+        if self.unknown > 0 {
+            out.push_str(&format!(
+                "  note: the total is a floor: {} condition(s) have no rows to \
+                 price them\n",
+                self.unknown
+            ));
+        }
+        if self.lines.iter().any(|line| line.elsewhere) {
+            out.push_str(
+                "  note: * priced from runs against another wiki revision, \
+                 which has no rows of its own yet\n",
+            );
+        }
+        out
+    }
+}
+
+/// A cost as the estimate prints it, at the precision that leaves a mean and
+/// its subtotal telling the same story: four places below a dollar, where one of
+/// these runs costs a fraction of one, six below a thousandth, and the report's
+/// own rule above a dollar. Printing a tenth of a cent as `0.00` would say a
+/// condition came free, which is the one thing this table is for.
+fn money(value: f64) -> String {
+    match value.abs() {
+        0.0 => "0.00".to_string(),
+        above if above >= 1.0 => crate::report::number(value),
+        above if above >= 0.001 => format!("{value:.4}"),
+        _ => format!("{value:.6}"),
+    }
+}
+
+/// The runs that are owed, priced by what runs of the same condition have cost
+/// before — the per-condition mean of the rows that already exist.
+///
+/// The same wiki revision is preferred, because how big the wiki is is most of
+/// what a run costs; a revision with nothing recorded falls back to any
+/// revision, since a wiki that has just changed is exactly when an estimate is
+/// wanted. A condition with no rows at all is unknown, and the total says so.
+fn estimate(jobs: &[Job], wiki: &str, recorded: &BTreeMap<Id, Entry>) -> Estimate {
+    let mut owed: BTreeMap<String, usize> = BTreeMap::new();
+    for job in jobs {
+        *owed.entry(job.condition.clone()).or_default() += 1;
+    }
+
+    let mut lines = Vec::new();
+    let mut total = 0.0;
+    let mut unknown = 0;
+    for (condition, jobs) in owed {
+        let measured: Vec<&Entry> = recorded
+            .values()
+            .filter(|entry| {
+                entry.key.condition == condition
+                    && entry.ok == Some(true)
+                    && entry.cost_usd.is_some()
+            })
+            .collect();
+        let here: Vec<&Entry> = measured
+            .iter()
+            .copied()
+            .filter(|entry| entry.key.wiki == wiki)
+            .collect();
+        let elsewhere = here.is_empty();
+        let sample = if elsewhere { measured } else { here };
+        let n = sample.len();
+        let mean = (n > 0).then(|| {
+            sample
+                .iter()
+                .filter_map(|entry| entry.cost_usd)
+                .sum::<f64>()
+                / n as f64
+        });
+        match mean {
+            Some(mean) => total += mean * jobs as f64,
+            None => unknown += 1,
+        }
+        lines.push(EstimateLine {
+            condition,
+            jobs,
+            mean,
+            n,
+            elsewhere: elsewhere && n > 0,
+        });
+    }
+    Estimate {
+        lines,
+        total,
+        unknown,
+    }
 }
 
 /// Reduces every row and writes `aggregates.json`: numbers, ids and
 /// categories, and nothing else.
-pub fn write_aggregates(options: &Options, rows: &[Row]) -> Result<(), String> {
+pub fn write_aggregates(
+    options: &Options,
+    rows: &[Row],
+    ledger: &Ledger,
+    out: &Path,
+) -> Result<(), String> {
     let mut aggregates = crate::aggregate::aggregate(rows);
-    aggregates.method = Some(method(options));
+    // The rows describe the method, not this invocation's flags: a pass that
+    // adds five runs to a directory does not get to rewrite the provenance of
+    // the other three hundred.
+    aggregates.method = Some(Method::from_rows(rows));
+    // What was bought for this directory, read back at the end of the pass so
+    // that this pass's own purchases are in it. A purchase with no row is a run
+    // that was paid for and never measured, and these two counts beside each
+    // other are how a report says so.
+    aggregates.bought = Some(
+        ledger
+            .read()?
+            .values()
+            .filter(|entry| entry.out == out)
+            .count(),
+    );
     let path = options.out.join("aggregates.json");
     let text = serde_json::to_string_pretty(&aggregates).map_err(|error| error.to_string())?;
     fs::write(&path, text).map_err(|error| format!("{}: {error}", path.display()))?;
@@ -268,28 +644,14 @@ pub fn method_flags() -> Vec<String> {
     ]
 }
 
-/// How the runs were made, for the report's method table. Every value here is
-/// a flag or a constant of this harness: no path, no query, no page.
-pub fn method(options: &Options) -> Method {
-    Method {
-        repeats: options.repeats,
-        conditions: options.conditions.clone(),
-        claude_model: options
-            .model
-            .clone()
-            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
-        claude_flags: method_flags(),
-        s1m_flags: vec!["--format json".to_string(), "--root .".to_string()],
-        explore_prompt: EXPLORE_PROMPT.to_string(),
-        s1m_agent_prompt: S1M_AGENT_PROMPT.to_string(),
-        thoroughness: THOROUGHNESS.to_string(),
-        chars_per_token: reading::CHARS_PER_TOKEN,
-    }
+/// The s1m flags, as the report prints them.
+pub fn s1m_flags() -> Vec<String> {
+    vec!["--format json".to_string(), "--root .".to_string()]
 }
 
 /// One run, as a row whatever happens: a run that failed is a row too, so that
 /// a resumed pass does not try it forever.
-fn measure(options: &Options, query: &Query, job: &Job, rows: &[Row]) -> Row {
+fn measure(options: &Options, wiki: &str, query: &Query, job: &Job, rows: &[Row]) -> Row {
     let outcome = match job.condition.as_str() {
         "explore" => explore_condition(options, query, job),
         "s1m" => s1m_condition(options, query, job, false, None),
@@ -303,36 +665,64 @@ fn measure(options: &Options, query: &Query, job: &Job, rows: &[Row]) -> Row {
             None => Err(format!("no condition named {other:?}")),
         },
     };
-    match outcome {
-        Ok((metrics, detail)) => Row {
-            query_id: query.id.clone(),
-            category: query.category().to_string(),
-            condition: job.condition.clone(),
-            repeat: job.repeat,
-            ok: true,
-            metrics,
-            detail: Some(detail),
-        },
+    let measured = match outcome {
+        Ok(measured) => measured,
         // A run that failed is a row with no metrics: nothing is averaged from
         // it, and what went wrong goes in the raw half with everything else
         // that may name a file — an API error quotes the request that caused
         // it, and a process error quotes its own stderr.
         Err(error) => {
             eprintln!("eval-agent: {} {}: {error}", query.id, job.condition);
-            Row {
+            return Row {
                 query_id: query.id.clone(),
                 category: query.category().to_string(),
                 condition: job.condition.clone(),
                 repeat: job.repeat,
+                wiki: wiki.to_string(),
                 ok: false,
                 metrics: BTreeMap::new(),
+                model_asked_for: asked_for(&job.condition, options.model.as_deref()),
+                models: Vec::new(),
                 detail: Some(serde_json::json!({ "error": error })),
-            }
+            };
         }
+    };
+    Row {
+        query_id: query.id.clone(),
+        category: query.category().to_string(),
+        condition: job.condition.clone(),
+        repeat: job.repeat,
+        wiki: wiki.to_string(),
+        ok: true,
+        metrics: measured.metrics,
+        model_asked_for: asked_for(&job.condition, options.model.as_deref()),
+        models: measured.models,
+        detail: Some(measured.detail),
     }
 }
 
-type Measured = (BTreeMap<String, f64>, serde_json::Value);
+/// The model a run of this condition was asked for: the one named on the
+/// command line, on a condition that runs an agent.
+///
+/// An s1m run takes a threshold rather than a model and buys judgments from an
+/// API this harness does not choose the model for, so it is the same run
+/// whatever `--model` says. Naming a model for a pass must not make its `s1m`
+/// runs another pass's runs, on the row or in the ledger.
+fn asked_for(condition: &str, model: Option<&str>) -> Option<String> {
+    crate::row::agent_condition(condition)
+        .then(|| model.map(str::to_string))
+        .flatten()
+}
+
+/// What one run produced: the numbers a report averages, the raw half it does
+/// not, and the models that answered.
+struct Measured {
+    metrics: BTreeMap<String, f64>,
+    detail: serde_json::Value,
+    /// The models Claude Code resolved for the work being measured, empty for a
+    /// condition that runs no agent.
+    models: Vec<String>,
+}
 
 /// The Explore condition: a parent agent that hands the query to the built-in
 /// Explore subagent, measured on the subagent's own tokens.
@@ -395,7 +785,11 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
         metrics.insert("agent_cost_share_usd".to_string(), agent.cost_usd * share);
     }
 
-    Ok((metrics, agent.detail))
+    Ok(Measured {
+        metrics,
+        detail: agent.detail,
+        models: agent.models,
+    })
 }
 
 /// Where the warm runs' answers live: the directory the caller named, else one
@@ -508,9 +902,9 @@ fn s1m_condition(
         merge_cache(&cache, &warm_cache(options));
     }
 
-    Ok((
+    Ok(Measured {
         metrics,
-        serde_json::json!({
+        detail: serde_json::json!({
             "query": query.query,
             "entry": entries,
             "command": arguments,
@@ -520,7 +914,11 @@ fn s1m_condition(
             "wanted": query.wanted,
             "read_chars": list.read_chars,
         }),
-    ))
+        // s1m's walk buys judgments from a model, but the model is the
+        // judgment API's, not one this harness asked for: nothing here is a
+        // measured tier.
+        models: Vec::new(),
+    })
 }
 
 /// The s1m-agent condition: an agent handed the reading list s1m returned for
@@ -579,7 +977,11 @@ fn s1m_agent_condition(
         "parent_total_tokens".to_string(),
         agent.parent.total() as f64,
     );
-    Ok((metrics, agent.detail))
+    Ok(Measured {
+        metrics,
+        detail: agent.detail,
+        models: agent.models,
+    })
 }
 
 /// What one `claude -p` run reported, whichever condition asked for it.
@@ -607,6 +1009,11 @@ struct AgentRun {
     cost_usd: f64,
     wall_ms: u128,
     agent_wall_ms: Option<u64>,
+    /// The models Claude Code resolved for the work measured: the Explore
+    /// subagent's, as the `Task` result stated it, else the agent that answered
+    /// when nothing was spawned. A label, and the only one here a report may
+    /// print.
+    models: Vec<String>,
     detail: serde_json::Value,
 }
 
@@ -733,6 +1140,19 @@ fn agent_run(
             .iter()
             .filter_map(|task| task.duration_ms)
             .reduce(|total, ms| total + ms),
+        // What the subagents resolved to, as the `Task` results stated it; a
+        // run that spawned none was answered by the parent, whose model is the
+        // one the stream reported.
+        models: if explore.is_empty() {
+            summary.model.clone().into_iter().collect()
+        } else {
+            explore
+                .iter()
+                .filter_map(|task| task.resolved_model.clone())
+                .collect::<BTreeSet<String>>()
+                .into_iter()
+                .collect()
+        },
         detail: serde_json::json!({
             "query": query.query,
             "prompt": prompt,
@@ -742,10 +1162,9 @@ fn agent_run(
             "files_read": files_read,
             "wanted": query.wanted,
             "relied_parsed": relied_parsed,
-            // Three different things, and the point of the run is that they
-            // can differ: what was asked for, what the parent answered on, and
-            // what the subagent answered on.
-            "model_asked_for": options.model,
+            // What the parent and the subagent answered on, which the point of
+            // the run is that they can differ. What was asked for is on the row
+            // itself, where a report may read it.
             "parent_model": summary.model,
             "agent_model": agent_model,
             "parent_tools": summary.parent_tools,
@@ -1051,12 +1470,32 @@ mod tests {
         .expect("a gold set")
     }
 
+    /// The revision the tests measure against. Only the report checks the shape
+    /// of one, and these never reach it.
+    const WIKI: &str = "sha256:0f1e2d3c";
+
+    /// A row with nothing in it but what the test it is used in is about.
+    fn row(query: &str, condition: &str, repeat: usize, ok: bool) -> Row {
+        Row {
+            query_id: query.to_string(),
+            category: "how-to".to_string(),
+            condition: condition.to_string(),
+            repeat,
+            wiki: WIKI.to_string(),
+            ok,
+            metrics: BTreeMap::new(),
+            model_asked_for: None,
+            models: Vec::new(),
+            detail: None,
+        }
+    }
+
     /// A pass costs money, so a run already in the JSONL is never made again,
     /// and the cold s1m run is made only as often as it is asked for.
     #[test]
     fn a_resumed_pass_owes_only_what_is_missing() {
         let conditions = vec!["explore".to_string(), "s1m".to_string()];
-        let all = pending(&gold(), &conditions, 2, 1, &BTreeSet::new());
+        let all = pending(&gold(), &conditions, 2, 1, &Done::nothing());
         // Two queries, two repeats, two conditions, plus one cold s1m run per
         // query on the first repeat.
         assert_eq!(all.len(), 10);
@@ -1067,10 +1506,11 @@ mod tests {
         // One query at a time, so a pass stopped early has whole queries.
         assert!(all[..5].iter().all(|job| job.query == 0));
 
-        let done = BTreeSet::from([
-            ("one".to_string(), "explore".to_string(), 0),
-            ("one".to_string(), "s1m-cold".to_string(), 0),
-        ]);
+        let rows = vec![
+            row("one", "explore", 0, true),
+            row("one", "s1m-cold", 0, true),
+        ];
+        let done = Done::read(&rows, &BTreeMap::new(), WIKI, None, false);
         let owed = pending(&gold(), &conditions, 2, 1, &done);
         assert_eq!(owed.len(), 8);
         assert!(!owed.contains(&Job {
@@ -1081,26 +1521,182 @@ mod tests {
     }
 
     /// The rows are the record of what has been measured: they are read back
-    /// exactly as they were written.
+    /// exactly as they were written, provenance included.
     #[test]
     fn rows_are_written_and_read_back() {
         let out = TempDir::new("rows");
-        let row = Row {
-            query_id: "one".to_string(),
-            category: "how-to".to_string(),
-            condition: "explore".to_string(),
-            repeat: 0,
-            ok: true,
+        let written = Row {
             metrics: BTreeMap::from([("recall".to_string(), 1.0)]),
+            models: vec!["claude-sonnet-5".to_string()],
+            model_asked_for: Some("sonnet".to_string()),
             detail: Some(serde_json::json!({"query": "q"})),
+            ..row("one", "explore", 0, true)
         };
         assert!(read_rows(out.path()).expect("no rows yet").is_empty());
-        append(out.path(), &row).expect("a row");
-        append(out.path(), &row).expect("another row");
+        append(out.path(), &written).expect("a row");
+        append(out.path(), &written).expect("another row");
+        let key = written.key();
         assert_eq!(
             read_rows(out.path()).expect("two rows"),
-            vec![row.clone(), row]
+            vec![written.clone(), written]
         );
+        assert_eq!(
+            (
+                key.wiki.as_str(),
+                key.query.as_str(),
+                key.condition.as_str(),
+                key.repeat
+            ),
+            (WIKI, "one", "explore", 0)
+        );
+    }
+
+    /// The directory's own rows are what it has made, whatever wiki revision
+    /// they were made against; the ledger's are held to the revision and to the
+    /// model, because the same query against another cut or at another tier is
+    /// another measurement.
+    #[test]
+    fn what_a_pass_owes_is_the_directorys_rows_and_the_ledgers_key() {
+        let out = PathBuf::from("/somewhere/run");
+        let listed = |wiki: &str, condition: &str, model: Option<&str>, ok: Option<bool>| {
+            let entry = Entry::buying(
+                Key {
+                    wiki: wiki.to_string(),
+                    query: "one".to_string(),
+                    condition: condition.to_string(),
+                    repeat: 0,
+                },
+                model,
+                &out,
+            );
+            match ok {
+                Some(ok) => (entry.id(), entry.measured(ok, Some(0.1))),
+                // Bought, and no outcome: the pass died before the row.
+                None => (entry.id(), entry),
+            }
+        };
+        let recorded: BTreeMap<Id, Entry> = BTreeMap::from([
+            // The same run, against this revision, at this model.
+            listed(WIKI, "explore", None, Some(true)),
+            // Another cut of the wiki.
+            listed("sha256:ff", "s1m-agent", None, Some(true)),
+            // Another tier.
+            listed(WIKI, "s1m", Some("haiku"), Some(true)),
+        ]);
+
+        let done = Done::read(&[], &recorded, WIKI, None, false);
+        let known = |condition: &str| {
+            done.contains(&Key {
+                wiki: String::new(),
+                query: "one".to_string(),
+                condition: condition.to_string(),
+                repeat: 0,
+            })
+        };
+        assert!(known("explore"), "the ledger's own run is measured");
+        assert!(!known("s1m-agent"), "another revision is not this one");
+        assert!(!known("s1m"), "another model is another measurement");
+
+        // This directory's rows are its own record, and hold whatever revision
+        // they were written against: a resumed pass on an old directory does
+        // not buy all of it again.
+        let rows = vec![Row {
+            wiki: String::new(),
+            ..row("one", "explore", 0, true)
+        }];
+        let done = Done::read(&rows, &recorded, WIKI, None, false);
+        assert!(done.contains(&Key {
+            wiki: WIKI.to_string(),
+            query: "one".to_string(),
+            condition: "explore".to_string(),
+            repeat: 0
+        }));
+
+        // An s1m run takes no model, so it is the same run whether or not the
+        // pass names one: only the conditions that run an agent are another
+        // measurement at another tier.
+        assert_eq!(asked_for("s1m", Some("sonnet")), None);
+        assert_eq!(asked_for("s1m-cold", Some("sonnet")), None);
+        assert_eq!(
+            asked_for("explore", Some("sonnet")).as_deref(),
+            Some("sonnet")
+        );
+        assert_eq!(asked_for("explore", None), None);
+        let plain: BTreeMap<Id, Entry> = BTreeMap::from([listed(WIKI, "s1m", None, Some(true))]);
+        let agent: BTreeMap<Id, Entry> =
+            BTreeMap::from([listed(WIKI, "explore", None, Some(true))]);
+        let named =
+            |recorded: &BTreeMap<Id, Entry>| Done::read(&[], recorded, WIKI, Some("sonnet"), false);
+        assert!(
+            named(&plain).contains(&Key {
+                wiki: String::new(),
+                query: "one".to_string(),
+                condition: "s1m".to_string(),
+                repeat: 0
+            }),
+            "an s1m run is the same run whatever the pass names"
+        );
+        assert!(
+            !named(&agent).contains(&Key {
+                wiki: String::new(),
+                query: "one".to_string(),
+                condition: "explore".to_string(),
+                repeat: 0
+            }),
+            "an agent run measured at no model is not one measured at sonnet"
+        );
+
+        // A purchase with no outcome was killed before it wrote a row: it is
+        // owed, and the money is already spent.
+        let killed: BTreeMap<Id, Entry> = BTreeMap::from([listed(WIKI, "s1m-agent", None, None)]);
+        assert!(!Done::read(&[], &killed, WIKI, None, false).contains(&Key {
+            wiki: WIKI.to_string(),
+            query: "one".to_string(),
+            condition: "s1m-agent".to_string(),
+            repeat: 0
+        }));
+    }
+
+    /// `--retry-failed` puts back the runs that failed and nothing else: a run
+    /// that worked is still measured however many passes ask for it.
+    #[test]
+    fn retrying_covers_the_failed_runs_only() {
+        let out = PathBuf::from("/somewhere/run");
+        let entry = |condition: &str, ok: bool| {
+            let entry = Entry::buying(
+                Key {
+                    wiki: WIKI.to_string(),
+                    query: "two".to_string(),
+                    condition: condition.to_string(),
+                    repeat: 0,
+                },
+                None,
+                &out,
+            );
+            (entry.id(), entry.measured(ok, ok.then_some(0.1)))
+        };
+        let recorded: BTreeMap<Id, Entry> =
+            BTreeMap::from([entry("explore", false), entry("s1m", true)]);
+        let failed = vec![row("two", "explore", 0, false), row("two", "s1m", 0, true)];
+
+        let plain = Done::read(&failed, &recorded, WIKI, None, false);
+        let retried = Done::read(&failed, &recorded, WIKI, None, true);
+        // Both records hold the same two runs, and a run two records hold is
+        // one run.
+        assert_eq!(plain.len(), 2, "both conditions, without retrying");
+        assert_eq!(retried.len(), 1, "only the run that worked is measured");
+        assert!(retried.contains(&Key {
+            wiki: WIKI.to_string(),
+            query: "two".to_string(),
+            condition: "s1m".to_string(),
+            repeat: 0
+        }));
+        assert!(!retried.contains(&Key {
+            wiki: WIKI.to_string(),
+            query: "two".to_string(),
+            condition: "explore".to_string(),
+            repeat: 0
+        }));
     }
 
     /// `s1m-t0.4` is s1m at threshold 0.4. Anything else that starts the same
@@ -1177,6 +1773,10 @@ mod tests {
             transcripts: None,
             cold_repeats: 0,
             queries: Vec::new(),
+            estimate: false,
+            yes: false,
+            retry_failed: false,
+            ledger: None,
             timeout: Duration::from_secs(30),
         };
         fs::create_dir_all(out.path().join(RAW)).expect("a raw directory");
@@ -1187,7 +1787,7 @@ mod tests {
             repeat: 0,
         };
 
-        let row = measure(&options, query, &job, &[]);
+        let row = measure(&options, WIKI, query, &job, &[]);
         assert!(!row.ok);
         assert!(row.metrics.is_empty(), "{:?}", row.metrics);
         let reason = row.detail.as_ref().expect("the raw half")["error"]
@@ -1200,11 +1800,13 @@ mod tests {
         // And it is a run that has happened: a resumed pass does not pay for
         // it again.
         append(out.path(), &row).expect("a row");
-        let done: BTreeSet<(String, String, usize)> = read_rows(out.path())
-            .expect("one row")
-            .iter()
-            .map(Row::key)
-            .collect();
+        let done = Done::read(
+            &read_rows(out.path()).expect("one row"),
+            &BTreeMap::new(),
+            WIKI,
+            None,
+            false,
+        );
         assert!(
             pending(&gold(), &options.conditions, 1, 0, &done)
                 .iter()
@@ -1222,6 +1824,10 @@ mod tests {
             repeats: 1,
             conditions: vec!["s1m".to_string()],
             cache_dir: None,
+            estimate: false,
+            yes: false,
+            retry_failed: false,
+            ledger: None,
             entry: vec!["index.md".to_string()],
             model: None,
             s1m: PathBuf::from("s1m"),
@@ -1234,17 +1840,23 @@ mod tests {
     }
 
     /// A shell script at `<dir>/s1m` that answers like s1m and buys one
-    /// judgment into whatever cache it was pointed at.
+    /// judgment into whatever cache it was pointed at. `record` names a file it
+    /// appends its arguments to, so a test can count what was bought.
     #[cfg(unix)]
-    fn fake_s1m(dir: &TempDir) -> PathBuf {
+    fn fake_s1m(dir: &TempDir, record: Option<&Path>) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
+        let recording = record.map_or(String::new(), |path| {
+            format!("printf '%s\\n' \"$*\" >> \"{}\"\n", path.display())
+        });
         dir.write(
             "s1m",
-            "#!/bin/sh\n\
+            &format!(
+                "#!/bin/sh\n{recording}\
              mkdir -p \"$S1M_CACHE_DIR/judgments\"\n\
-             printf '{\"format\":3,\"judgment\":{},\"detail\":{\"input_tokens\":1000,\"output_tokens\":10}}' \
+             printf '{{\"format\":3,\"judgment\":{{}},\"detail\":{{\"input_tokens\":1000,\"output_tokens\":10}}}}' \
              > \"$S1M_CACHE_DIR/judgments/bought.json\"\n\
-             printf '{\"query\":\"q\",\"mode\":\"useful-for\",\"visited\":1,\"calls\":1,\"results\":[{\"path\":\"index.md\",\"relevance\":0.9,\"scent\":null,\"via\":[],\"links\":[],\"sections\":[{\"heading\":null,\"lines\":[1,1],\"score\":0.9}]}]}'\n",
+             printf '{{\"query\":\"q\",\"mode\":\"useful-for\",\"visited\":1,\"calls\":1,\"results\":[{{\"path\":\"index.md\",\"relevance\":0.9,\"scent\":null,\"via\":[],\"links\":[],\"sections\":[{{\"heading\":null,\"lines\":[1,1],\"score\":0.9}}]}}]}}'\n"
+            ),
         );
         let binary = dir.path().join("s1m");
         fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("an executable");
@@ -1263,7 +1875,7 @@ mod tests {
         let out = TempDir::new("cold-out");
         let fake = TempDir::new("cold-s1m");
         let options = Options {
-            s1m: fake_s1m(&fake),
+            s1m: fake_s1m(&fake, None),
             ..options(&wiki, &out)
         };
         fs::create_dir_all(out.path().join(RAW)).expect("a raw directory");
@@ -1274,14 +1886,17 @@ mod tests {
             condition: "s1m-cold".to_string(),
             repeat: 0,
         };
-        let (metrics, _) =
+        let measured =
             s1m_condition(&options, query, &job, true, None).expect("a cold measurement");
 
         // What it bought is what it is charged for: 1000 input tokens.
-        assert_eq!(metrics["jev_input_tokens"], 1000.0);
+        assert_eq!(measured.metrics["jev_input_tokens"], 1000.0);
         assert!(
-            (metrics["cost_usd"] - 1000.0 / 1_000_000.0 * s1m::jev::PRICE_PER_MTOK).abs() < 1e-12
+            (measured.metrics["cost_usd"] - 1000.0 / 1_000_000.0 * s1m::jev::PRICE_PER_MTOK).abs()
+                < 1e-12
         );
+        // Nothing about s1m's walk is a measured tier: no agent ran.
+        assert!(measured.models.is_empty(), "{:?}", measured.models);
 
         // And the warm cache now holds it, with no `--cache-dir` in sight.
         assert!(
@@ -1297,13 +1912,9 @@ mod tests {
     #[test]
     fn the_reading_list_an_agent_is_handed_is_its_own_repeats() {
         let list = |repeat: usize, file: &str, cost: f64| Row {
-            query_id: "one".to_string(),
-            category: "how-to".to_string(),
-            condition: "s1m".to_string(),
-            repeat,
-            ok: true,
             metrics: BTreeMap::from([("cost_usd".to_string(), cost)]),
             detail: Some(serde_json::json!({ "files": [file] })),
+            ..row("one", "s1m", repeat, true)
         };
         let rows = vec![list(0, "a.md", 0.002), list(1, "b.md", 0.0)];
 
@@ -1403,7 +2014,7 @@ mod tests {
             conditions: vec!["explore".to_string()],
             ..options(&wiki, &out)
         };
-        let row = measure(&options, query, &job, &[]);
+        let row = measure(&options, WIKI, query, &job, &[]);
         assert!(!row.ok);
         assert!(row.metrics.is_empty(), "{:?}", row.metrics);
         let reason = row.detail.expect("the raw half")["error"]
@@ -1419,7 +2030,7 @@ mod tests {
             claude: fake_claude(&other, &stream("general-purpose")),
             ..options
         };
-        let row = measure(&options, query, &job, &[]);
+        let row = measure(&options, WIKI, query, &job, &[]);
         assert!(!row.ok);
         let reason = row.detail.expect("the raw half")["error"]
             .as_str()
@@ -1504,5 +2115,263 @@ mod tests {
         assert!(EXPLORE_PROMPT.contains("thoroughness"), "{EXPLORE_PROMPT}");
         // It is the word the subagent is given, not one the report invented.
         assert_eq!(THOROUGHNESS, "medium");
+    }
+    /// The runs that are owed are priced by what runs of the same condition
+    /// have cost before: the same revision first, because how big the wiki is is
+    /// most of what a run costs, and a condition with nothing to price it by is
+    /// unknown rather than free.
+    #[test]
+    fn the_estimate_prices_what_is_owed_by_what_has_been_bought() {
+        let out = PathBuf::from("/somewhere/run");
+        let bought = |condition: &str, wiki: &str, repeat: usize, ok: bool, cost: Option<f64>| {
+            let entry = Entry::buying(
+                Key {
+                    wiki: wiki.to_string(),
+                    query: "one".to_string(),
+                    condition: condition.to_string(),
+                    repeat,
+                },
+                None,
+                &out,
+            );
+            (entry.id(), entry.measured(ok, cost))
+        };
+        let recorded: BTreeMap<Id, Entry> = BTreeMap::from([
+            // Two runs of this revision, one of another, and one that failed
+            // and so was never priced.
+            bought("explore", WIKI, 0, true, Some(0.30)),
+            bought("explore", WIKI, 1, true, Some(0.10)),
+            bought("explore", "sha256:1234abcd", 0, true, Some(9.0)),
+            bought("s1m-agent", WIKI, 0, false, None),
+        ]);
+
+        let jobs = vec![
+            Job {
+                query: 0,
+                condition: "explore".to_string(),
+                repeat: 0,
+            },
+            Job {
+                query: 1,
+                condition: "explore".to_string(),
+                repeat: 0,
+            },
+            Job {
+                query: 0,
+                condition: "s1m-agent".to_string(),
+                repeat: 0,
+            },
+        ];
+        let priced = estimate(&jobs, WIKI, &recorded);
+
+        let explore = &priced.lines[0];
+        assert_eq!(
+            (explore.condition.as_str(), explore.jobs, explore.n),
+            ("explore", 2, 2)
+        );
+        assert!(
+            (explore.mean.expect("a mean") - 0.20).abs() < 1e-12,
+            "{explore:?}"
+        );
+        assert!(!explore.elsewhere, "this revision has its own runs");
+        let agent = &priced.lines[1];
+        assert_eq!(agent.mean, None, "a failed run was not priced");
+        assert_eq!(priced.unknown, 1);
+        assert!((priced.total - 0.40).abs() < 1e-12, "two runs at 0.20");
+
+        let table = priced.table();
+        assert!(table.contains("explore"), "{table}");
+        assert!(table.contains("unknown"), "{table}");
+        assert!(table.contains("the total is a floor"), "{table}");
+        assert!(priced.summary().starts_with("at least $0.40"), "{priced:?}");
+
+        // A wiki that has just changed has no rows of its own, and is priced
+        // from every revision there is — saying so.
+        let elsewhere = estimate(&jobs, "sha256:5678abcd", &recorded);
+        let explore = &elsewhere.lines[0];
+        assert!(explore.elsewhere);
+        assert_eq!(explore.n, 3);
+        assert!(
+            (explore.mean.expect("a mean") - (0.30 + 0.10 + 9.0) / 3.0).abs() < 1e-12,
+            "{explore:?}"
+        );
+        assert!(
+            elsewhere.table().contains("another wiki revision"),
+            "{elsewhere:?}"
+        );
+    }
+
+    /// A run bought for one directory is not bought again for another: one
+    /// ledger for the machine is what makes a second `--out` a resume rather
+    /// than a second bill.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_directory_does_not_buy_what_the_ledger_already_has() {
+        let wiki = TempDir::new("ledger-wiki");
+        wiki.write("index.md", "# Index\n");
+        let gold = TempDir::new("ledger-gold");
+        gold.write(
+            "gold.json",
+            r#"{"queries": [{"id": "one", "query": "q", "wanted": ["index.md"]}]}"#,
+        );
+        let fake = TempDir::new("ledger-s1m");
+        let calls = fake.path().join("calls");
+        let ledger = TempDir::new("ledger-file");
+        let cache = TempDir::new("ledger-cache");
+        let first = TempDir::new("ledger-out-one");
+        let second = TempDir::new("ledger-out-two");
+
+        for out in [&first, &second] {
+            let options = Options {
+                gold: gold.path().join("gold.json"),
+                cache_dir: Some(cache.path().to_path_buf()),
+                ledger: Some(ledger.path().join("ledger.jsonl")),
+                s1m: fake_s1m(&fake, Some(&calls)),
+                cold_repeats: 0,
+                ..options(&wiki, out)
+            };
+            run(&options).expect("a pass");
+        }
+
+        // One run was bought, and the second directory bought nothing.
+        let bought: Vec<String> = fs::read_to_string(&calls)
+            .expect("the calls")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(bought.len(), 1, "{bought:?}");
+        assert!(read_rows(second.path()).expect("rows").is_empty());
+
+        // And the record is complete: what the first directory bought is what
+        // it measured, and its aggregates say both.
+        let aggregates: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(first.path().join("aggregates.json")).expect("aggregates"),
+        )
+        .expect("aggregates");
+        assert_eq!(aggregates["bought"], 1);
+        assert_eq!(aggregates["method"]["conditions"][0], "s1m");
+        assert_eq!(aggregates["method"]["repeats"], 1);
+        assert_eq!(aggregates["queries"], 1);
+        // The revision every row of it was measured against, in the aggregates.
+        let revision = wiki::revision(wiki.path()).expect("a revision");
+        assert_eq!(aggregates["wiki"][0], revision.as_str());
+        assert_eq!(
+            read_rows(first.path()).expect("rows")[0].wiki,
+            revision,
+            "the row carries it too"
+        );
+    }
+
+    /// What a directory bought and what it measured are two counts of the same
+    /// ledger: a purchase with no row is money spent with nothing to show for
+    /// it, and the aggregates carry both so a report can say so.
+    #[cfg(unix)]
+    #[test]
+    fn the_aggregates_count_what_was_bought_as_well_as_what_was_measured() {
+        let wiki = TempDir::new("bought-wiki");
+        wiki.write("index.md", "# Index\n");
+        let out = TempDir::new("bought-out");
+        let ledger_file = TempDir::new("bought-ledger");
+        let ledger = Ledger::at(ledger_file.path().join("ledger.jsonl"));
+        let options = Options {
+            ..options(&wiki, &out)
+        };
+        let key = Key {
+            wiki: WIKI.to_string(),
+            query: "one".to_string(),
+            condition: "s1m".to_string(),
+            repeat: 0,
+        };
+        // One run that was measured, and one that was bought and killed before
+        // it wrote a row.
+        let measured = Entry::buying(key.clone(), None, out.path());
+        ledger.record(&measured).expect("a purchase");
+        ledger
+            .record(&measured.measured(true, Some(0.002)))
+            .expect("a measurement");
+        ledger
+            .record(&Entry::buying(
+                Key {
+                    condition: "s1m-cold".to_string(),
+                    ..key
+                },
+                None,
+                out.path(),
+            ))
+            .expect("a purchase that wrote no row");
+
+        let rows = vec![row("one", "s1m", 0, true)];
+        write_aggregates(&options, &rows, &ledger, out.path()).expect("aggregates");
+
+        let aggregates: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(out.path().join("aggregates.json")).expect("aggregates"),
+        )
+        .expect("aggregates");
+        assert_eq!(
+            aggregates["bought"], 2,
+            "both purchases are for this directory"
+        );
+        assert_eq!(aggregates["conditions"]["s1m"]["runs"], 1);
+        assert_eq!(aggregates["method"]["repeats"], 1);
+    }
+    /// A pass whose estimate is above the limit stops before it buys anything,
+    /// and `--yes` is what buys it anyway.
+    #[cfg(unix)]
+    #[test]
+    fn a_pass_over_the_limit_stops_unless_it_is_told_to_go() {
+        let wiki = TempDir::new("limit-wiki");
+        wiki.write("index.md", "# Index\n");
+        let gold = TempDir::new("limit-gold");
+        gold.write(
+            "gold.json",
+            r#"{"queries": [{"id": "one", "query": "q", "wanted": ["index.md"]}]}"#,
+        );
+        let fake = TempDir::new("limit-s1m");
+        let calls = fake.path().join("calls");
+        let ledger = TempDir::new("limit-ledger");
+        let cache = TempDir::new("limit-cache");
+        let out = TempDir::new("limit-out");
+        let options = Options {
+            gold: gold.path().join("gold.json"),
+            cache_dir: Some(cache.path().to_path_buf()),
+            ledger: Some(ledger.path().join("ledger.jsonl")),
+            s1m: fake_s1m(&fake, Some(&calls)),
+            cold_repeats: 0,
+            ..options(&wiki, &out)
+        };
+        // What the ledger says one run of this condition costs against this
+        // wiki: more than a pass may spend without being told to.
+        let elsewhere = Entry::buying(
+            Key {
+                wiki: wiki::revision(wiki.path()).expect("a revision"),
+                query: "elsewhere".to_string(),
+                condition: "s1m".to_string(),
+                repeat: 0,
+            },
+            None,
+            out.path(),
+        );
+        Ledger::at(ledger.path().join("ledger.jsonl"))
+            .record(&elsewhere.measured(true, Some(SPEND_LIMIT_USD + 1.0)))
+            .expect("a purchase");
+
+        let error = run(&options).expect_err("a refusal");
+        assert!(error.contains("--yes"), "{error}");
+        assert!(!calls.exists(), "nothing may be bought by a refused pass");
+        assert!(read_rows(out.path()).expect("rows").is_empty());
+
+        // And saying yes is what buys it.
+        let options = Options {
+            yes: true,
+            ..options
+        };
+        run(&options).expect("a pass");
+        assert_eq!(
+            fs::read_to_string(&calls)
+                .expect("the call")
+                .lines()
+                .count(),
+            1
+        );
     }
 }

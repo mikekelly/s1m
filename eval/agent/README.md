@@ -7,9 +7,11 @@ any wiki, and writes two halves that are deliberately kept apart:
 - **`--out`**, the raw rows: one JSONL row a run, with the query as it was
   asked, the files each run opened and the command that was run. **Never
   commit this directory.** It is where a private wiki shows through.
-- **the report**, rendered from the aggregates alone: numbers, query ids and
-  category labels. Nothing else reaches it, and the renderer refuses a label
-  that looks like a path or reads like a question rather than printing it.
+- **the report**, rendered from the aggregates alone: numbers, query ids,
+  category labels, the models that answered and the wiki revision the runs were
+  measured against — a content hash, not a page. Nothing else reaches it, and
+  the renderer refuses a label that looks like a path or reads like a question
+  rather than printing it.
 
 Every command takes paths, so the tooling here is generic and the wiki it
 measures need not be.
@@ -26,10 +28,11 @@ cargo run --release --bin eval-agent -- graph-stats \
 # 2. Every query under every condition. This one costs money.
 cargo run --release --bin eval-agent -- run \
   --wiki /path/to/wiki --gold /path/to/gold.json --out /path/to/run-dir \
-  --repeats 3 --conditions explore,s1m,s1m-agent \
-  --cache-dir /path/to/s1m-cache
+  --conditions explore,s1m,s1m-agent --cache-dir /path/to/s1m-cache
 # --model MODEL pins every agent in the run to MODEL; leave it off to measure
 # whatever Claude Code would have used.
+# --estimate prices the runs that are owed and buys nothing.
+# --repeats N measures each query N times; the default is 1.
 
 # 3. The committed half.
 cargo run --release --bin eval-agent -- report \
@@ -42,13 +45,88 @@ takes `--entry <relative path>`, and the report then says the entry page was
 `given` rather than which one it was. `run` writes
 `runs.jsonl`, `aggregates.json` and each run's own output under `raw/`.
 `report` renders `aggregates.json` plus `graph_stats.json` — it picks the
-latter up from `--out` on its own, or takes `--stats PATH`.
+latter up from `--out` on its own, or takes `--stats PATH` — and prints the runs
+bought beside the rows measured.
 
-**Start small.** `--queries id1,id2 --repeats 1` measures two queries once:
-an Explore run is tens of thousands of tokens, and a gold set is twenty of
-them. A pass is resumable — a `(query, condition, repeat)` already in
-`runs.jsonl` is never run again — so a pass that is stopped, or that crashed,
-is continued by running the same command again.
+**Start small.** `--queries id1,id2` measures two queries once: an Explore run
+is tens of thousands of tokens, and a gold set is twenty of them. A pass is
+resumable — a `(query, condition, repeat)` already in `runs.jsonl` is never run
+again, and neither is one the ledger says was bought and measured — so a pass
+that is stopped, or that crashed, is continued by running the same command
+again. What follows is what a pass costs and what it writes down about it.
+
+## What a pass costs, and what it records
+
+**`--repeats` defaults to 1.** At equal money, spreading runs across queries
+buys more than repeating them, and a repeat that returns what the repeat before
+it returned has bought nothing. Measured on this harness's own 68 `explore`
+rows: the within-query sd of recall was 0.148, the between-query sd 0.144, and
+on 10 of 21 queries every repeat returned the same recall. As the standard
+error of the mean over 23 queries:
+
+| Design | Runs | SE of mean recall |
+| --- | --- | --- |
+| 23 queries x 1 repeat | 23 | 0.0430 |
+| 23 queries x 3 repeats | 69 | 0.0349 (-19%) |
+| 69 queries x 1 repeat, the same money | 69 | 0.0249 (-42%) |
+
+So the screening rule is: every query once, then a 2nd or 3rd repeat only for
+the queries where the conditions came out close together or where the repeats
+disagreed. What is left over buys gold-set queries, which cost nothing to add
+and are worth more than a repeat a first pass has already shown to be identical.
+
+**A pass says what it is about to spend.** `run --estimate` prints the runs
+that are owed and, per condition, the mean cost of a run of that condition from
+the ledger's own rows, and then stops without buying. This is a four-query pass
+over the vendored wiki, against a ledger holding two measured runs of `s1m`:
+
+```
+  condition        owed     mean $/run      n     subtotal
+  s1m                 2         0.0024      2       0.0047
+  s1m-agent           4        unknown      0            ?
+  total               6                             0.0047
+  note: the total is a floor: 1 condition(s) have no rows to price them
+```
+
+Every pass computes that estimate, and refuses to buy above $5.00 without
+`--yes`. A condition with no history is priced `unknown` and the total says it
+is a floor. The mean prefers runs against the wiki revision being measured and
+falls back to any revision, because a wiki that has just changed is exactly
+when an estimate is wanted.
+
+**One ledger, for the machine.** Resume keyed on the run directory buys the same
+run twice: the same query measured into a second directory is bought again. The
+ledger is keyed on what a run is — the wiki revision, the query, the condition,
+the repeat — and on the model it was asked for, because the same query at a
+cheaper tier is another measurement and a screening pass has to be able to make
+it. `--ledger PATH` names the file; it defaults to `$S1M_LEDGER`, else
+`$XDG_DATA_HOME/eval-agent/ledger.jsonl`, else
+`~/.local/share/eval-agent/ledger.jsonl`. That it is outside every run directory
+and outside this repository is deliberate: its lines carry query ids and what
+they cost. A machine with no home directory has nothing to share between
+directories and gets one under `--out`, which is where the rows are anyway.
+
+A run is written to the ledger when it is *bought* and again when it has been
+measured. A purchase with no completion is a run that was paid for and whose row
+was never written — a pass killed between the two — and the next pass owes it
+again rather than counting it as measured. `report` prints both counts,
+`341 bought, 340 measured`, so that an incomplete record is visible instead of
+silent.
+
+**`--retry-failed`** re-runs the runs this directory recorded as `ok: false`,
+and nothing else: a failed run is a row with no metrics, and without the flag
+every later pass skips it forever, so one transient error would shrink `n` for
+that cell permanently. A retry appends a row of its own, so the attempt that
+failed stays in the record beside the one that worked.
+
+**A row says which wiki it measured.** The revision is a `sha256:` hash of the
+pages the walk reads — not a git commit, because a commit does not move when a
+working tree does. It is part of a row's key, so a pass resumed against a wiki
+that has changed measures that cut rather than averaging two together. The
+method table names it, and says the rows disagree when a directory holds more
+than one. The method table is read back from the rows rather than from the
+command that wrote them, so a pass that resumes a directory cannot rewrite the
+provenance of the rows an earlier pass made.
 
 `s1m` needs `TYPESAFE_API_KEY` in the environment for anything it has not
 already bought; `claude` needs whatever Claude Code is authenticated with.
@@ -208,16 +286,21 @@ lists agent names only (`["claude", "Explore", "general-purpose", "Plan"]`).
 What is observable is the model Claude Code resolved for the subagent, which
 the `Task` tool's own result carries as `resolvedModel`; it is recorded per run
 as `detail.tasks[].resolved_model`, beside the model of every turn in the
-subagent's transcript. With `--model` passed, the observed behaviour is
-inheritance — the subagent resolves to the model the parent was given.
+subagent's transcript, and carried on the row as `models`. With `--model`
+passed, the observed behaviour is inheritance — the subagent resolves to the
+model the parent was given.
 
 **No `--model` unless you name one.** A model named on the command line is
 inherited by every agent in the run, so `--model sonnet` measures Sonnet
 exploring rather than what Claude Code would have sent. With `--model` left
-off, no flag is passed, each agent takes its own default, and the method table
-says so. What actually answered is read back per run either way, and the
-parent's model and the subagent's are recorded separately:
-`detail.model_asked_for`, `detail.parent_model`, `detail.agent_model`.
+off, no flag is passed and each agent takes its own default. What actually
+answered is read back per run either way: the models Claude Code resolved are
+on the row as `models` — the Explore subagent's as the `Task` result stated it,
+else the agent that answered where nothing was spawned — and what was asked for
+is on the row as `model_asked_for`, with the parent's model and the subagent's
+kept apart in `detail` as `parent_model` and `agent_model`. The aggregates count
+those models by run, and the method table names the tier measured. Leaving
+`--model` off is not a choice of tier, and this is what makes the tier visible.
 
 ## What the numbers mean
 
