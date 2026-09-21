@@ -50,10 +50,11 @@ bought beside the rows measured.
 
 **Start small.** `--queries id1,id2` measures two queries once: an Explore run
 is tens of thousands of tokens, and a gold set is twenty of them. A pass is
-resumable — a `(query, condition, repeat)` already in `runs.jsonl` is never run
-again, and neither is one the ledger says was bought and measured — so a pass
-that is stopped, or that crashed, is continued by running the same command
-again. What follows is what a pass costs and what it writes down about it.
+resumable — a `(query, condition, repeat)` already in `runs.jsonl` at the model
+the pass asks for is never run again, and neither is one the ledger says was
+bought and measured — so a pass that is stopped, or that crashed, is continued
+by running the same command again. What follows is what a pass costs and what it
+writes down about it.
 
 ## What a pass costs, and what it records
 
@@ -105,6 +106,14 @@ it. `--ledger PATH` names the file; it defaults to `$S1M_LEDGER`, else
 and outside this repository is deliberate: its lines carry query ids and what
 they cost. A machine with no home directory has nothing to share between
 directories and gets one under `--out`, which is where the rows are anyway.
+
+A directory's own rows are read on that same key, minus the revision: they are
+its record of what it measured whatever cut of the wiki they were measured
+against, so a resumed pass on an old directory does not buy it all again — but a
+row is at the tier it names, so `--model haiku` into a directory full of sonnet
+rows owes every one of them rather than reporting them all measured and buying
+nothing. A condition that runs no agent has no tier: an `s1m` row is the same run
+whatever the pass names.
 
 A run is written to the ledger when it is *bought* and again when it has been
 measured. A purchase with no completion is a run that was paid for and whose row

@@ -75,7 +75,11 @@ pub struct Row {
 }
 
 impl Row {
-    /// What identifies this run: a resumed pass skips a run it already has.
+    /// What identifies this run, beside [`Row::model_asked_for`]: a resumed
+    /// pass skips a run it already has at the tier it asks for. The model is
+    /// carried by the row rather than by the key because it identifies a run
+    /// only where the condition takes one, which is the reader's rule — see
+    /// `run::Done`.
     pub fn key(&self) -> Key {
         Key {
             wiki: self.wiki.clone(),
