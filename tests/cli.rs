@@ -268,6 +268,113 @@ fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
     );
 }
 
+/// The hidden flags of the link-context experiment [#46] are a run's state: each
+/// one reaches the request the binary sends, under the name the API's state
+/// spells it, and the state a run that names none of them sends is the one that
+/// ships.
+///
+/// This is the flag-to-field wiring the unit tests cannot see: the switches are
+/// [`s1m::jev::Context`]'s, and nothing but this checks that the flag a person
+/// types is the field the harness measures.
+///
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+#[test]
+fn the_hidden_link_context_flags_reach_the_request() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(
+        &[
+            QUERY,
+            ENTRY,
+            "--preview-headings",
+            "--preview-leads",
+            "--via-titles",
+            "--two-hop-links",
+        ],
+        &api,
+        &cache,
+    );
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    let next = request_for(&requests, NEXT);
+
+    // The target's own headings and the anchor text of its own in-root links.
+    // `next.md` is an H1 and one link, so its headings are none and its lead is
+    // the one link it makes.
+    assert_eq!(
+        entry["state"]["links"][0]["target_preview"]["headings"],
+        json!([])
+    );
+    assert_eq!(
+        entry["state"]["links"][0]["target_preview"]["leads_to"],
+        json!(["Deep"])
+    );
+
+    // The path the walk came by: present and empty where it started, the entry
+    // file's title one hop on.
+    assert_eq!(entry["state"]["via"], json!([]));
+    assert_eq!(next["state"]["via"], json!(["Entry"]));
+
+    // The link question is the two-hop one, on every file of the walk.
+    for request in &requests {
+        if let Some(link) = request["state"]["links"]
+            .as_array()
+            .and_then(|links| links.first())
+        {
+            assert!(link.is_object(), "{request}");
+            let asked = instructions(request, "link_0");
+            assert!(
+                asked.contains("directly or through the pages it links to"),
+                "the two-hop question is what reached the API: {asked}"
+            );
+        }
+    }
+
+    // Without the flags, the same walk sends the state that shipped: no path,
+    // no headings, no leads, and the question the spike tuned the threshold
+    // with.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    for request in api.requests() {
+        assert!(request["state"].get("via").is_none(), "{request}");
+        let links = request["state"]["links"].as_array().expect("a link list");
+        for link in links {
+            assert!(
+                link["target_preview"].get("headings").is_none(),
+                "{request}"
+            );
+            assert!(
+                link["target_preview"].get("leads_to").is_none(),
+                "{request}"
+            );
+        }
+        if !links.is_empty() {
+            assert!(
+                !instructions(&request, "link_0").contains("directly or through"),
+                "{request}"
+            );
+        }
+    }
+}
+
+/// The request one file was judged in, found by the fixture path it ends with.
+fn request_for<'a>(requests: &'a [Value], page: &str) -> &'a Value {
+    requests
+        .iter()
+        .find(|request| {
+            request["state"]["file"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(page))
+        })
+        .unwrap_or_else(|| panic!("{page} was never judged: {requests:?}"))
+}
+
 /// The one-shot HTTP reply the fake server sends, and the request bodies it
 /// saw, are enough to answer the questions above; these read the wording out of
 /// one.
