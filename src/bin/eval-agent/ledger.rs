@@ -104,11 +104,15 @@ pub fn default_path(out: &Path) -> PathBuf {
 /// That the default is outside every run directory, and outside this
 /// repository, is deliberate: its lines carry query ids and what they cost.
 fn path_from(env: &dyn Fn(&str) -> Option<String>) -> Option<PathBuf> {
-    if let Some(path) = env("S1M_LEDGER") {
+    // A variable that is set and empty names nothing: the XDG spec says as
+    // much, and `S1M_LEDGER=` would otherwise be the empty path, which is the
+    // directory the pass was started from.
+    let named = |name: &str| env(name).filter(|value| !value.is_empty());
+    if let Some(path) = named("S1M_LEDGER") {
         return Some(PathBuf::from(path));
     }
-    let base = env("XDG_DATA_HOME").or_else(|| {
-        env("HOME").map(|home| Path::new(&home).join(".local/share").display().to_string())
+    let base = named("XDG_DATA_HOME").or_else(|| {
+        named("HOME").map(|home| Path::new(&home).join(".local/share").display().to_string())
     })?;
     Some(Path::new(&base).join("eval-agent").join(LEDGER))
 }
@@ -126,10 +130,16 @@ impl Ledger {
     /// Every run the ledger holds, the last line for a run winning.
     ///
     /// A ledger that is not there is an empty one: the first pass on a machine
-    /// has nothing to resume from.
+    /// has nothing to resume from. One that is there and cannot be read is not:
+    /// reading it as empty would buy every run it holds all over again, which
+    /// is the one thing this file exists to prevent.
     pub fn read(&self) -> Result<BTreeMap<Id, Entry>, String> {
-        let Ok(text) = fs::read_to_string(&self.path) else {
-            return Ok(BTreeMap::new());
+        let text = match fs::read_to_string(&self.path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BTreeMap::new());
+            }
+            Err(error) => return Err(format!("{}: {error}", self.path.display())),
         };
         let mut entries: BTreeMap<Id, Entry> = BTreeMap::new();
         for (at, line) in text.lines().enumerate() {
@@ -221,6 +231,26 @@ mod tests {
         );
     }
 
+    /// A ledger that is there and cannot be read is not an empty one: reading
+    /// it as empty would buy every run it holds all over again.
+    #[test]
+    fn a_ledger_that_is_not_there_is_empty_and_one_that_cannot_be_read_is_not() {
+        let dir = TempDir::new("ledger-unreadable");
+        let path = dir.path().join("ledger.jsonl");
+        // Nothing there yet is the first pass on a machine.
+        assert!(
+            Ledger::at(path.clone())
+                .read()
+                .expect("an empty one")
+                .is_empty()
+        );
+        // A directory where the ledger should be: there, and not readable as a
+        // file, which is not the same thing as absent.
+        fs::create_dir(&path).expect("a directory in its place");
+        let error = Ledger::at(path.clone()).read().expect_err("a refusal");
+        assert!(error.contains("ledger.jsonl"), "{error}");
+    }
+
     /// A ledger line that is not an entry stops the pass: it is the record of
     /// what was bought, and a record that cannot be read is not one.
     #[test]
@@ -271,6 +301,22 @@ mod tests {
             ])),
             Some(PathBuf::from("/data/eval-agent/ledger.jsonl"))
         );
+        // A variable that is set and empty names nothing either: the XDG spec
+        // says so, and an empty `S1M_LEDGER` would be the working directory.
+        assert_eq!(
+            path_from(&env(&[("S1M_LEDGER", ""), ("HOME", "/home/someone")])),
+            Some(PathBuf::from(
+                "/home/someone/.local/share/eval-agent/ledger.jsonl"
+            ))
+        );
+        assert_eq!(path_from(&env(&[("XDG_DATA_HOME", "")])), None);
+        assert_eq!(
+            path_from(&env(&[("XDG_DATA_HOME", ""), ("HOME", "/home/someone")])),
+            Some(PathBuf::from(
+                "/home/someone/.local/share/eval-agent/ledger.jsonl"
+            ))
+        );
+
         // A machine that keeps no home directory has nothing to share, and the
         // ledger goes where the rows are.
         assert_eq!(path_from(&env(&[])), None);

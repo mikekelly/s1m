@@ -201,12 +201,16 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         out.push_str(&format!(
             "| Runs | {bought} bought, {measured} measured |\n"
         ));
-        if bought != measured {
+        // Only one direction of difference means a missing measurement: a
+        // retried run appends a row of its own for a run the ledger holds one
+        // entry for, so more rows than purchases says the opposite, and is left
+        // to the caveats rather than called a missing run here.
+        if bought > measured {
             out.push_str(&format!(
                 "\n{bought} runs were bought for this directory and {measured} rows \
                  are in it. A run is recorded before it is paid for and its row \
-                 after it is measured, so the difference is a run that was bought \
-                 and left unmeasured.\n"
+                 after it is measured, so a purchase with no row is a run that was \
+                 bought and left unmeasured.\n"
             ));
         }
     }
@@ -446,7 +450,9 @@ fn caveats_section(out: &mut String) {
          one, and which row came from which cut is in the raw rows.",
         "A run is recorded when it is bought and its row when it has been \
          measured, so *Runs* counts both: a directory with more runs bought than \
-         rows measured holds a run that was paid for and never measured.",
+         rows holds a run that was paid for and never measured, and one with more \
+         rows than runs holds a retried run, whose second attempt is a row of its \
+         own and not a new purchase.",
     ] {
         out.push_str(&format!("- {caveat}\n"));
     }
@@ -1181,6 +1187,22 @@ mod tests {
         let report = render(&aggregates, None, &Method::from_rows(&rows)).expect("a report");
         assert!(
             report.contains("| Runs | 1 bought, 1 measured |"),
+            "{report}"
+        );
+        assert!(!report.contains("left unmeasured"), "{report}");
+
+        // More rows than purchases is the other direction: a run retried after
+        // it failed is a second row and not a second purchase, and calling that
+        // a missing measurement would say the opposite of what happened.
+        let retried = vec![
+            row("one", "how-to", "s1m", 0.0),
+            row("one", "how-to", "s1m", 1.0),
+        ];
+        let mut twice = aggregate(&retried);
+        twice.bought = Some(1);
+        let report = render(&twice, None, &Method::from_rows(&retried)).expect("a report");
+        assert!(
+            report.contains("| Runs | 1 bought, 2 measured |"),
             "{report}"
         );
         assert!(!report.contains("left unmeasured"), "{report}");
