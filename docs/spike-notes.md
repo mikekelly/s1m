@@ -277,12 +277,26 @@ Reading them:
   content useful for someone doing what `query` describes" can be answered from one hop, and the
   model answered it one hop at a time; asking it to reach through the pages the target links to
   is what moves the walk.
-- **The state budget did not bind.** Requests per answer was 1.00 under every variant: no page
-  on this wiki is big enough for the richer preview to push it past the 32k state budget
-  ([#37](#the-state-budget-measured-on-the-counter-that-enforces-it)), so the extra requests are
+- **The state budget did not bind on the vendored wiki, and it costs one more post where it
+  does.** Requests per answer was 1.00 under every variant here — no page in that wiki is big
+  enough for the richer preview to push it past the 32k state budget
+  ([#37](#the-state-budget-measured-on-the-counter-that-enforces-it)) — so the extra requests are
   pages the walk now visits (the combined variant asks 2.1× what ships does) rather than posts.
-  The private wiki is where that page exists, and the private measurement is where the split is
-  counted.
+  On the shape #37 was found on — 17,007 characters, 22 headings, 88 links to pages that each
+  carry frontmatter, ten headings and ten links of their own, generated the way that section
+  generates it — the richer state costs exactly one more request, and no failure:
+
+  ```bash
+  s1m score-file "how do I cut a release and publish the package" /tmp/issue-46/hub.md \
+    --root /tmp/issue-46
+  # default:      112 questions in 2 request(s)   49,568 tokens in
+  # --two-hop-links --preview-headings --preview-leads:
+  #               112 questions in 3 request(s)   76,782 tokens in
+  ```
+
+  One more post and 1.55× the input tokens on the page that already split, which is the price of
+  the fields when a page is link-heavy; a page of ordinary size pays the tokens and no post,
+  because a preview is only large when its target is.
 - **Two of the four zero-recall queries stay at zero under every variant**, including the
   fullest one: nothing on a visited page links anywhere near those wanted pages, so no richer
   view of a link that was never offered can find them. That is the case
