@@ -4,7 +4,7 @@ tests/fixtures/wiki/index.md  entry file; relevance 0.62
   tests/fixtures/wiki/payments/README.md  followed; scent 0.86; relevance 0.81
     tests/fixtures/wiki/payments/settlement.md  followed; scent 0.94; relevance 0.94
       tests/fixtures/wiki/payments/cutoffs.md  followed; scent 0.86; relevance 0.71
-        tests/fixtures/wiki/payments/settlement.md  pruned; scent 0.58
+        tests/fixtures/wiki/payments/settlement.md  already reached; scent 0.68
     tests/fixtures/wiki/notes/ledger.md  followed; scent 0.72; relevance 0.55
       tests/fixtures/wiki/notes/weekly review.md  followed; scent 0.83; relevance 0.52
       tests/fixtures/wiki/notes/reading.txt  followed; scent 0.77; relevance 0.30

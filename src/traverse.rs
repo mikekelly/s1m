@@ -292,6 +292,13 @@ pub struct JudgedLink {
     /// threshold, within the depth budget, and ahead of any better path already
     /// found to that target.
     pub followed: bool,
+    /// Why it queued nothing, when it did not: the walk's own reason, so the
+    /// reading list can say which rule refused the link rather than leaving a
+    /// reader to work it out from the scent and the rest of the list
+    /// ([#50](https://github.com/mikekelly/s1m/issues/50)).
+    ///
+    /// `None` exactly when [`Self::followed`] is true.
+    pub reason: Option<Reason>,
 }
 
 /// A file the walk reached but could not score.
@@ -644,6 +651,14 @@ impl<'a> Search<'a> {
         }
     }
 
+    /// One link the walk queued nothing for, and why: the reason goes on the
+    /// link, which the reading list publishes, and to the trace beside it, so
+    /// the two documents cannot disagree about what happened to a link.
+    fn pass_over(&self, source: &Path, link: &mut JudgedLink, reason: Reason) {
+        link.reason = Some(reason);
+        self.prune(source, &link.target, link.scent, reason);
+    }
+
     /// One path the walk queued and dropped before visiting it, as the trace
     /// reports it. The source is the file whose link queued the path, which
     /// every path on the frontier has: the entries were named and are not
@@ -816,7 +831,7 @@ impl<'a> Search<'a> {
             // said about it — and a Choice scorer is not even asked about one —
             // so it is reported here rather than as an answer with no home.
             if !link.in_root {
-                self.prune(&path, &link.target, link.scent, Reason::OutOfRoot);
+                self.pass_over(&path, link, Reason::OutOfRoot);
                 continue;
             }
             // A link the scorer named no scent for, a scent that is not a
@@ -824,15 +839,15 @@ impl<'a> Search<'a> {
             // the depth budget all queue nothing: each is reported with the
             // reason the walk read it by.
             let Some(link_scent) = link.scent else {
-                self.prune(&path, &link.target, None, Reason::Unjudged);
+                self.pass_over(&path, link, Reason::Unjudged);
                 continue;
             };
             if !self.config.admission.admits(link_scent, link.keep) {
-                self.prune(&path, &link.target, link.scent, self.refusal());
+                self.pass_over(&path, link, self.refusal());
                 continue;
             }
             if depth + 1 > self.config.max_depth {
-                self.prune(&path, &link.target, link.scent, Reason::MaxDepth);
+                self.pass_over(&path, link, Reason::PastDepth);
                 continue;
             }
             let mut child_via = via.clone();
@@ -844,20 +859,15 @@ impl<'a> Search<'a> {
                 scent: Some(link_scent),
                 via: child_via,
             });
-            if let Some(trace) = self.config.trace {
-                if link.followed {
+            if link.followed {
+                if let Some(trace) = self.config.trace {
                     trace.admitted(&path, &link.target, link_scent);
-                } else {
-                    // The target is visited already, or a path at least as good
-                    // was queued for it: the first path to reach a file at its
-                    // best score is the one the walk keeps.
-                    trace.pruned(
-                        &path,
-                        &link.target,
-                        Some(link_scent),
-                        Reason::AlreadyReached,
-                    );
                 }
+            } else {
+                // The target is visited already, or a path at least as good was
+                // queued for it: the first path to reach a file at its best
+                // score is the one the walk keeps.
+                self.pass_over(&path, link, Reason::AlreadyReached);
             }
         }
 
@@ -969,6 +979,9 @@ fn judged_links(file: &ParsedFile, judgment: &FileJudgment) -> Vec<JudgedLink> {
             keep: judged.is_some_and(|judged| judged.keep),
             in_root: link.in_root,
             followed: false,
+            // The walk sets this as it reads the link, and a link the walk
+            // queues keeps `None`: nothing refused it.
+            reason: None,
         });
     }
     links

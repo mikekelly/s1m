@@ -340,8 +340,13 @@ enum Event<'a> {
 /// queues it — so a `pruned` record is not always the other half of an
 /// `admitted` one. What a player knows from the pair is that the path never
 /// became a visit.
+///
+/// One vocabulary, two documents: a `pruned` record in the trace and a link's
+/// `reason` in the reading list spell the same reasons the same way, hyphenated
+/// the way the CLI's own values are (`useful-for`), so a reader comparing them
+/// never meets two names for one thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum Reason {
     /// Its scent did not clear the walk's floor
     /// ([`crate::traverse::Admission::Threshold`]). A scent outside 0 to 1
@@ -356,7 +361,7 @@ pub enum Reason {
     /// Its target is outside the root, which is never followed.
     OutOfRoot,
     /// Its target is a hop past the depth budget.
-    MaxDepth,
+    PastDepth,
     /// Its target has been visited, or a path at least as good was already
     /// queued for it: the first path to reach a file at its best score is the
     /// one kept.

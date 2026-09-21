@@ -5,8 +5,8 @@
 //! the files that earned a place, the lines worth reading and the scores that
 //! say why each one is there. `tree` is the walk's link tree: every file it
 //! visited with every link it judged under it, each with the scent the model
-//! gave it and whether the walk followed it, so a person can see what was
-//! passed over and how narrowly.
+//! gave it and what the walk did about it — followed, already reached, or
+//! pruned — so a person can see what was passed over and how narrowly.
 //!
 //! The two reading views differ in what they are for, and so in what they
 //! print. `md` is the reading list — [`ReadingList::results`] — because a
@@ -31,6 +31,14 @@
 //! - A link the model named no scent for prints `scent unknown` rather than a
 //!   number it never gave: such a link can never be followed, so it is always
 //!   `pruned`, and inventing a 0.00 would read as a judgment.
+//! - A link line carries one of three marks, because a link the walk passed
+//!   over and a link whose target it already held are two different things with
+//!   the same line otherwise: `followed` when it queued the link's target,
+//!   `already reached` when the walk already held that file, and `pruned` for
+//!   every other reason — a scent below `--threshold`, a target outside `--root`
+//!   or one past `--max-depth`. The JSON spells the same fact out as a link's
+//!   `reason` ([`crate::trace::Reason`]), and the tree keeps the three words a
+//!   reader scans for.
 //!
 //! # Order
 //!
@@ -58,6 +66,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use crate::cli::{RankedFile, RankedLink, RankedSection, ReadingList, WalkedFile};
+use crate::trace::Reason;
 
 /// Spaces of indentation per hop in the link tree.
 const INDENT: usize = 2;
@@ -69,7 +78,7 @@ pub enum Format {
     Json,
     /// A reading list to read or paste: each file with the lines worth reading.
     Md,
-    /// The walk's link tree: every judged link, and whether it was followed.
+    /// The walk's link tree: every judged link, and what became of it.
     Tree,
 }
 
@@ -169,7 +178,8 @@ fn md(list: &ReadingList) -> String {
 }
 
 /// The walk's link tree, annotated: every file it visited, and under it every
-/// link it judged, with that link's scent and whether the walk followed it.
+/// link it judged, with that link's scent and what the walk did about it
+/// ([`mark`]).
 ///
 /// The first line names the run, so a tree pasted on its own still says what it
 /// is a tree of. Everything under it is one file or one judged link per line,
@@ -262,18 +272,39 @@ fn node(
                 node(out, child, depth + 1, &annotation, index);
             }
             None => {
-                let mark = if link.followed { "followed" } else { "pruned" };
                 let _ = writeln!(
                     out,
                     "{:indent$}{}  {}; {}",
                     "",
                     link.target,
-                    mark,
+                    mark(link),
                     scent(link.scent),
                     indent = (depth + 1) * INDENT,
                 );
             }
         }
+    }
+}
+
+/// What the tree says the walk did with one of a file's links: `followed` when
+/// it queued the link's target, `already reached` when that file was one the
+/// walk already held, and `pruned` for every other reason — a scent below
+/// `--threshold`, a target outside the root, one past `--max-depth`, or a link
+/// the model named no scent for.
+///
+/// Two marks were not enough. `pruned` covered both a link the walk dropped and
+/// a link whose target it already had, and the two lines look identical, so a
+/// reader had to work out from the rest of the list which one it was — the
+/// ambiguity that misled two analyses ([#50](https://github.com/mikekelly/s1m/issues/50)).
+/// The JSON's `reason` is the same fact spelled out, and this is the three
+/// labels the tree has room for.
+fn mark(link: &RankedLink) -> &'static str {
+    if link.followed {
+        return "followed";
+    }
+    match link.reason {
+        Some(Reason::AlreadyReached) => "already reached",
+        _ => "pruned",
     }
 }
 
@@ -463,14 +494,17 @@ mod tests {
     }
 
     /// The same file with the links the walk judged, in the order the file
-    /// lists them.
-    fn linking(mut file: RankedFile, links: &[(&str, Option<f64>, bool)]) -> RankedFile {
+    /// lists them: the scent the model gave it, and why the walk queued nothing
+    /// — `None` for a link it followed, which is the only shape a walk
+    /// produces.
+    fn linking(mut file: RankedFile, links: &[(&str, Option<f64>, Option<Reason>)]) -> RankedFile {
         file.links = links
             .iter()
-            .map(|(target, scent, followed)| RankedLink {
+            .map(|(target, scent, reason)| RankedLink {
                 target: target.to_string(),
                 scent: *scent,
-                followed: *followed,
+                followed: reason.is_none(),
+                reason: *reason,
             })
             .collect();
         file
@@ -622,8 +656,12 @@ relevance 0.94; scent 0.88; via `wiki/index.md`
             vec![walked(linking(
                 entry("wiki/index.md", 0.42),
                 &[
-                    ("wiki/payments/settlement.md", Some(0.88), true),
-                    ("wiki/notes/ledger.md", Some(0.24), false),
+                    ("wiki/payments/settlement.md", Some(0.88), None),
+                    (
+                        "wiki/notes/ledger.md",
+                        Some(0.24),
+                        Some(Reason::BelowThreshold),
+                    ),
                 ],
             ))],
         );
@@ -650,7 +688,7 @@ wiki/index.md  entry file; relevance 0.42
             vec![
                 linking(
                     reached("wiki/payments/README.md", 0.81, 0.86, &["wiki/index.md"]),
-                    &[("wiki/notes/ledger.md", Some(0.72), true)],
+                    &[("wiki/notes/ledger.md", Some(0.72), None)],
                 ),
                 reached(
                     "wiki/payments/settlement.md",
@@ -663,8 +701,8 @@ wiki/index.md  entry file; relevance 0.42
                 walked(linking(
                     entry("wiki/index.md", 0.42),
                     &[
-                        ("wiki/payments/settlement.md", Some(0.88), true),
-                        ("wiki/payments/README.md", Some(0.86), true),
+                        ("wiki/payments/settlement.md", Some(0.88), None),
+                        ("wiki/payments/README.md", Some(0.86), None),
                     ],
                 )),
                 walked(reached(
@@ -700,14 +738,18 @@ wiki/index.md  entry file; relevance 0.42
             linking(
                 entry("wiki/index.md", 0.62),
                 &[
-                    ("wiki/payments/README.md", Some(0.88), true),
-                    ("wiki/notes/ledger.md", Some(0.31), false),
+                    ("wiki/payments/README.md", Some(0.88), None),
+                    (
+                        "wiki/notes/ledger.md",
+                        Some(0.31),
+                        Some(Reason::BelowThreshold),
+                    ),
                 ],
             ),
             sectioned(
                 linking(
                     reached("wiki/payments/README.md", 0.81, 0.88, &["wiki/index.md"]),
-                    &[("wiki/payments/settlement.md", Some(0.94), true)],
+                    &[("wiki/payments/settlement.md", Some(0.94), None)],
                 ),
                 &[(Some("Payments"), [1, 9], 0.85)],
             ),
@@ -738,7 +780,7 @@ wiki/index.md  entry file; relevance 0.62
     fn tree_prints_a_link_with_no_scent_as_unknown_and_pruned() {
         let list = list(vec![linking(
             entry("wiki/index.md", 0.62),
-            &[("wiki/notes/ledger.md", None, false)],
+            &[("wiki/notes/ledger.md", None, Some(Reason::Unjudged))],
         )]);
 
         assert_eq!(
@@ -763,7 +805,11 @@ wiki/index.md  entry file; relevance 0.62
         let list = list(vec![
             linking(
                 reached("wiki/notes/scratch.md", 0.44, 0.9, &["wiki/absent.md"]),
-                &[("wiki/notes/ledger.md", Some(0.31), false)],
+                &[(
+                    "wiki/notes/ledger.md",
+                    Some(0.31),
+                    Some(Reason::BelowThreshold),
+                )],
             ),
             // Not in path order in the list, so the sort is what puts it first.
             entry("wiki/index.md", 0.62),
@@ -792,11 +838,11 @@ wiki/payments/README.md  entry file; relevance 0.81
         let list = list(vec![
             linking(
                 entry("wiki/index.md", 0.62),
-                &[("wiki/payments/settlement.md", Some(0.55), true)],
+                &[("wiki/payments/settlement.md", Some(0.55), None)],
             ),
             linking(
                 entry("wiki/payments/README.md", 0.81),
-                &[("wiki/payments/settlement.md", Some(0.94), true)],
+                &[("wiki/payments/settlement.md", Some(0.94), None)],
             ),
             reached(
                 "wiki/payments/settlement.md",
@@ -828,10 +874,14 @@ wiki/payments/README.md  entry file; relevance 0.81
         let list = list(vec![linking(
             entry("wiki/index.md", 0.62),
             &[
-                ("wiki/notes/ledger.md", Some(0.31), false),
-                ("wiki/payments/README.md", Some(0.88), true),
-                ("wiki/payments/cutoffs.md", Some(0.88), true),
-                ("wiki/notes/scratch.md", None, false),
+                (
+                    "wiki/notes/ledger.md",
+                    Some(0.31),
+                    Some(Reason::BelowThreshold),
+                ),
+                ("wiki/payments/README.md", Some(0.88), None),
+                ("wiki/payments/cutoffs.md", Some(0.88), None),
+                ("wiki/notes/scratch.md", None, Some(Reason::Unjudged)),
             ],
         )]);
 
@@ -844,6 +894,59 @@ wiki/index.md  entry file; relevance 0.62
   wiki/payments/README.md  followed; scent 0.88
   wiki/payments/cutoffs.md  followed; scent 0.88
   wiki/notes/ledger.md  pruned; scent 0.31
+  wiki/notes/scratch.md  pruned; scent unknown
+"
+        );
+    }
+
+    /// Three marks and not two: a link the walk followed, a link it passed over
+    /// and a link whose target the walk already had are three different things,
+    /// and printing the last as `pruned` made a reader infer which of the two a
+    /// line was ([#50]).
+    ///
+    /// [#50]: https://github.com/mikekelly/s1m/issues/50
+    #[test]
+    fn tree_marks_a_link_to_a_file_the_walk_already_reached() {
+        let list = list(vec![
+            linking(
+                entry("wiki/index.md", 0.62),
+                &[
+                    ("wiki/payments/README.md", Some(0.88), None),
+                    (
+                        "wiki/payments/settlement.md",
+                        Some(0.71),
+                        Some(Reason::AlreadyReached),
+                    ),
+                    (
+                        "wiki/notes/ledger.md",
+                        Some(0.24),
+                        Some(Reason::BelowThreshold),
+                    ),
+                    ("wiki/notes/scratch.md", None, Some(Reason::Unjudged)),
+                ],
+            ),
+            linking(
+                reached("wiki/payments/README.md", 0.81, 0.88, &["wiki/index.md"]),
+                &[("wiki/payments/settlement.md", Some(0.94), None)],
+            ),
+            reached(
+                "wiki/payments/settlement.md",
+                0.94,
+                0.94,
+                &["wiki/index.md", "wiki/payments/README.md"],
+            ),
+        ]);
+
+        assert_eq!(
+            Format::Tree.render(&list),
+            "\
+settlement timing (useful-for); 3 files visited, 3 calls
+
+wiki/index.md  entry file; relevance 0.62
+  wiki/payments/README.md  followed; scent 0.88; relevance 0.81
+    wiki/payments/settlement.md  followed; scent 0.94; relevance 0.94
+  wiki/payments/settlement.md  already reached; scent 0.71
+  wiki/notes/ledger.md  pruned; scent 0.24
   wiki/notes/scratch.md  pruned; scent unknown
 "
         );

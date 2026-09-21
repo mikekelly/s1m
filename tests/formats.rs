@@ -118,12 +118,14 @@ const ANSWERS: &[(&str, Answer)] = &[
         },
     ),
     // The bottom of the walk: its one link points back at a page already
-    // visited, and the walk has nothing left to follow.
+    // visited, and above the threshold at that, so the tree marks it `already
+    // reached` rather than `pruned` — a link the walk was holding, not one the
+    // model passed over — and has nothing left to follow.
     (
         "payments/cutoffs.md",
         Answer {
             relevance: 0.71,
-            scents: &[("payments/settlement.md", 0.58)],
+            scents: &[("payments/settlement.md", 0.68)],
         },
     ),
     // Three hops out, and the busiest page: three links worth following and one
@@ -344,11 +346,12 @@ async fn md_lists_the_fixture_wikis_files_with_the_lines_to_read() {
 }
 
 /// The walk's link tree: every file it visited with every link it judged
-/// beneath it, each link with the scent the model gave it and whether the walk
-/// followed it — so a reader sees both the link the entry follows at 0.86 and
-/// the one it passes over at 0.28, and that a link out of the root is passed
-/// over however strong it is.
+/// beneath it, each link with the scent the model gave it and what the walk did
+/// about it — so a reader sees the link the entry follows at 0.86, the ones it
+/// passes over at 0.41 and 0.28, the link out of the root that is passed over
+/// however strong it is, and the back-link at the bottom marked `already
+/// reached` rather than `pruned`.
 #[tokio::test]
-async fn tree_marks_every_judged_link_followed_or_pruned() {
+async fn tree_marks_every_judged_link_followed_pruned_or_already_reached() {
     snapshot("link-tree.txt", &Format::Tree.render(&walk().await));
 }

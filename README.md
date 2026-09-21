@@ -82,10 +82,12 @@ cost, then `results` — the files that earned a place, most relevant first and 
 path — and `walked`, the files the walk visited without earning one. Each result carries the
 relevance the model gave it, the scent of the link that reached it, the path that got there,
 the ranges worth reading, and its outgoing links as they were judged — `followed` says whether
-a link queued its target, so the caller can see what was passed over and why. `scent` is `null`
-and `via` is empty for an entry file, which no link reached; a file a link reached carries the
-scent of that link and the `via` path it came along. A link whose target resolves outside
-`--root` is never followed, whatever its scent.
+a link queued its target, and a link that queued nothing carries the `reason` the walk read it
+by: `below-threshold`, `out-of-root`, `past-depth`, `already-reached`, `not-kept` or
+`unjudged`, so no caller has to infer why from the scent and the rest of the list. `scent` is
+`null` and `via` is empty for an entry file, which no link reached; a file a link reached
+carries the scent of that link and the `via` path it came along. A link whose target resolves
+outside `--root` is never followed, whatever its scent.
 
 A file earns a place on its own: relevance at or above `--threshold`, or at least one section
 at or above it. A hub is worth walking through and not worth reading, so the entry pages,
@@ -138,17 +140,20 @@ buys one answer per file):
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
           "scent": 0.53,
-          "followed": false
+          "followed": false,
+          "reason": "below-threshold"
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md",
           "scent": 0.44,
-          "followed": false
+          "followed": false,
+          "reason": "below-threshold"
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
           "scent": 0.61,
-          "followed": false
+          "followed": false,
+          "reason": "already-reached"
         }
       ]
     },
@@ -164,7 +169,8 @@ buys one answer per file):
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
           "scent": 0.84,
-          "followed": false
+          "followed": false,
+          "reason": "already-reached"
         },
         … (four more links, elided)
       ]
@@ -282,7 +288,7 @@ which is how `via` and a link's target are spelled within a run.
 | `requested` | `path`, `post_index` | One request for the file, once per post: a page whose sections and links do not fit one request is asked about in several, and each is a record of its own, in the order they were sent. |
 | `answered` | `path`, `latency_ms`, `relevance`, `cached`, `sections`, `links` | The scorer's answer: the file's relevance, a score per heading section and a scent per link, each as the scorer gave it. `cached` is `true` when the answer came off the disk, and `latency_ms` is what the call that bought it took — whenever that was, so a warm replay can be told from a cold one. |
 | `admitted` | `source`, `target`, `scent` | A link queued its target, at `scent` of the source's path score. |
-| `pruned` | `source`, `target`, `scent`, `reason` | Either a link that queued nothing — `below_threshold`, `not_kept`, `unjudged`, `out_of_root`, `max_depth`, `already_reached`, `ignored` — or a path the walk queued and then dropped: `beam`, `max_files`. |
+| `pruned` | `source`, `target`, `scent`, `reason` | Either a link that queued nothing — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`, `already-reached`, `ignored` — or a path the walk queued and then dropped: `beam`, `max-files`. The same reasons a reading list spells out on a link ([#50](https://github.com/mikekelly/s1m/issues/50)) |
 | `result` | `path`, `relevance`, `earned_a_place` | The file was visited, with the reading list's own verdict on it: relevance or a section at or above `--threshold`. |
 
 A path can be admitted and pruned later, by `beam` or by `max_files`: both budgets are read when
@@ -362,9 +368,19 @@ heading, reads `(preamble)` where the heading would be.
 `tree` is the walk as it happened: every file it visited — the `results` and the `walked` alike
 — and beneath each one every link the model judged, in the order the frontier would have taken
 them, highest scent first, ties broken by path. Each link line carries the scent it was given
-and what the walk did about it: `followed` when it queued the link's target, `pruned` when it
-did not, which is a scent below `--threshold`, a target outside `--root`, one past
-`--max-depth`, or one already reached.
+and what the walk did about it, in one of three marks:
+
+| Mark | The link |
+| --- | --- |
+| `followed` | queued its target, which is why the target is a line below it |
+| `already reached` | points at a file the walk already had — an entry file, or a page another link reached first — so queueing it would add nothing |
+| `pruned` | queued nothing for any other reason: a scent below `--threshold`, a target outside `--root`, one past `--max-depth`, or a link the model named no scent for |
+
+The last two are the difference the JSON spells out as a link's `reason`, and the distinction
+matters because the two lines look identical otherwise: `pruned` is a page the walk dropped, and
+`already reached` is a page it may already be holding above
+([#50](https://github.com/mikekelly/s1m/issues/50)). Before that change both printed `pruned`,
+which is what misled two analyses of runs like the one below.
 
 ```bash
 s1m --format tree "how do I cut a release and publish the package" \
@@ -376,17 +392,17 @@ how do I cut a release and publish the package (useful-for); 6 files visited, 0 
 
 eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.76
   eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.89; relevance 0.76
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.61
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.61
     eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.53
     eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.44
   eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.80; relevance 0.60
-    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.92
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.81
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  already reached; scent 0.92
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.81
     ...
   eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  followed; scent 0.75; relevance 0.66
-    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.93
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  already reached; scent 0.93
     eval/wikis/llm-wiki-manager/wiki/concepts/template-system.md  followed; scent 0.65; relevance 0.29
-      eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.85
+      eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.85
       ...
     ...
   eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.67; relevance 0.56
@@ -396,15 +412,16 @@ eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.76
 
 The `...` lines are links the walk passed over, elided here; the run prints every one of them.
 The tree is where the walk's own answers show. `release.md` is the best page in the list and the
-entry follows the link at 0.89; `dogfooding.md`'s stronger-looking link to it, at 0.92, is
-`pruned`, because the file had already been reached and a file is visited once, along the best
-path found to it. The other pruned lines are links the model scored below `--threshold`, which
-is why six files are where the walk spent its calls. A tree with more files on it than the list
-has is the cutoff at work: `node-version-and-types.md` at 0.56 and `template-system.md` at 0.29
-are walked rather than returned, and they are here because the links under them are how the walk
-reached the rest of the wiki. Roots are the files no link reached: the entry files the caller
-named, marked `entry file`. A link whose target the model never judged prints `scent unknown` —
-such a link can never be followed, and a 0.00 would read as a judgment when none was made.
+entry follows the link at 0.89; `dogfooding.md`'s stronger-looking link to it, at 0.92, says
+`already reached`, because the file had already been reached and a file is visited once, along
+the best path found to it. The lines marked `pruned` are links the model scored below
+`--threshold`, which is why six files are where the walk spent its calls. A tree with more files
+on it than the list has is the cutoff at work: `node-version-and-types.md` at 0.56 and
+`template-system.md` at 0.29 are walked rather than returned, and they are here because the
+links under them are how the walk reached the rest of the wiki. Roots are the files no link
+reached: the entry files the caller named, marked `entry file`. A link whose target the model
+never judged prints `scent unknown` — such a link can never be followed, and a 0.00 would read
+as a judgment when none was made.
 
 Both views round scores to two decimals, because they are for reading: `json` is where the
 model's own number lives. Both are rendered from the reading list alone — `md` from `results`,

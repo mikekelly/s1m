@@ -662,6 +662,16 @@ fn followed(file: &VisitedFile, target: &str) -> bool {
         .followed
 }
 
+/// Why a record's link to `target` queued nothing, or `None` when it queued its
+/// target.
+fn reason(file: &VisitedFile, target: &str) -> Option<Reason> {
+    file.links
+        .iter()
+        .find(|link| link.target == Path::new(target))
+        .unwrap_or_else(|| panic!("no link to {target} in {:?}", judged(file)))
+        .reason
+}
+
 fn link(target: &str, scent: f64, followed: bool) -> Judged {
     (target.to_string(), Some(scent), followed)
 }
@@ -1054,6 +1064,97 @@ async fn a_link_out_of_the_root_is_reported_but_never_followed() {
     assert_eq!(paths(&found), ["index.md", "payments/README.md"]);
     // Not even asked about: it never leaves the machine.
     assert_eq!(scorer.called(), ["index.md", "payments/README.md"]);
+}
+
+/// A link that queued nothing says why on the link itself: the walk's own
+/// reason, so a reader never has to work it out from the scent and which files
+/// the list happens to hold ([#50]).
+///
+/// [#50]: https://github.com/mikekelly/s1m/issues/50
+#[tokio::test]
+async fn a_link_that_queues_nothing_carries_the_walks_reason() {
+    let table: &[(&str, Entry)] = &[
+        // The index names four of the pages it links to: one the walk takes,
+        // one the walk takes to a page it will already hold, one under the
+        // floor, and one out of the root. The rest it links to are left
+        // unjudged.
+        (
+            "index.md",
+            Entry::new(
+                0.9,
+                &[
+                    ("payments/README.md", 0.9),
+                    ("payments/settlement.md", 0.95),
+                    ("notes/ledger.md", 0.4),
+                    ("../outside.md", 0.95),
+                ],
+            ),
+        ),
+        // Settlement is visited first, on the entry's strongest link, so the
+        // README's own link to it queues nothing.
+        (
+            "payments/README.md",
+            Entry::new(
+                0.6,
+                &[
+                    ("payments/settlement.md", 0.9),
+                    ("notes/ledger.md", 0.8),
+                    ("payments/cutoffs.md", 0.9),
+                ],
+            ),
+        ),
+        ("payments/settlement.md", Entry::new(0.8, &[])),
+        ("notes/ledger.md", Entry::new(0.6, &[])),
+        ("payments/cutoffs.md", Entry::new(0.5, &[])),
+        ("../outside.md", Entry::new(1.0, &[])),
+    ];
+
+    let scorer = Fake::new(table);
+    let found = Settings::new(&["index.md"]).run(&scorer).await;
+
+    let index = visited(&found, "index.md");
+    assert_eq!(
+        reason(index, "payments/README.md"),
+        None,
+        "the link queued its target, which `followed` already says"
+    );
+    assert_eq!(reason(index, "payments/settlement.md"), None);
+    assert_eq!(
+        reason(index, "notes/ledger.md"),
+        Some(Reason::BelowThreshold)
+    );
+    assert_eq!(reason(index, "../outside.md"), Some(Reason::OutOfRoot));
+    assert_eq!(
+        reason(index, "payments/missing.md"),
+        Some(Reason::Unjudged),
+        "the scorer named no judgment for the link, so there was nothing to follow"
+    );
+
+    // The README's strongest link points at a page the walk visited on the
+    // entry's own path: it queues nothing, and this is the answer the tree had
+    // no word for before.
+    assert_eq!(
+        reason(
+            visited(&found, "payments/README.md"),
+            "payments/settlement.md"
+        ),
+        Some(Reason::AlreadyReached)
+    );
+
+    // The depth budget is the same answer a hop further out: the page is
+    // judged, its links are not followed, and the reason is the budget.
+    let scorer = Fake::new(table);
+    let found = Settings::new(&["index.md"]).max_depth(1).run(&scorer).await;
+    assert_eq!(
+        reason(visited(&found, "index.md"), "payments/README.md"),
+        None
+    );
+    let readme = visited(&found, "payments/README.md");
+    assert_eq!(reason(readme, "notes/ledger.md"), Some(Reason::PastDepth));
+    assert_eq!(
+        reason(readme, "payments/cutoffs.md"),
+        Some(Reason::PastDepth)
+    );
 }
 
 #[tokio::test]
@@ -1687,6 +1788,11 @@ async fn a_link_the_scorer_kept_is_followed_whatever_its_scent() {
         [link("a.md", 0.9, false), link("b.md", 0.1, true),],
         "the strong link the scorer passed over, and the weak one it kept"
     );
+    assert_eq!(
+        reason(visited(&found, "index.md"), "a.md"),
+        Some(Reason::NotKept),
+        "the scorer's own rule kept it back, and not the caller's floor"
+    );
 }
 
 /// A fan: an entry page that links five leaves, each at its own scent, so a beam
@@ -2062,15 +2168,15 @@ async fn the_trace_is_the_walk_in_the_order_it_happened() {
     // Each link is in the trace with the verdict the walk read it by.
     assert_eq!(traced.link("admitted", "index.md", "a.md")["scent"], 0.9);
     let under = traced.link("pruned", "index.md", "b.md");
-    assert_eq!(under["reason"], "below_threshold");
+    assert_eq!(under["reason"], "below-threshold");
     assert_eq!(under["scent"], 0.4);
     assert_eq!(
         traced.link("pruned", "index.md", "../outside.md")["reason"],
-        "out_of_root"
+        "out-of-root"
     );
     assert_eq!(
         traced.link("pruned", "a.md", "index.md")["reason"],
-        "already_reached",
+        "already-reached",
         "the entry has been visited, and nothing reaches a file twice"
     );
     assert_eq!(
@@ -2308,7 +2414,7 @@ async fn a_link_the_walk_passed_over_is_reported_with_its_reason() {
     );
     assert_eq!(
         traced.link("pruned", "a.md", "c.md")["reason"],
-        json!(Reason::MaxDepth),
+        json!(Reason::PastDepth),
         "a hop past the depth budget is never followed"
     );
     assert_eq!(
@@ -2334,7 +2440,7 @@ async fn a_link_the_scorer_did_not_keep_is_reported_as_kept_back() {
         .await;
 
     let kept_back = traced.link("pruned", "index.md", "a.md");
-    assert_eq!(kept_back["reason"], "not_kept");
+    assert_eq!(kept_back["reason"], "not-kept");
     assert_eq!(
         kept_back["scent"], 0.9,
         "the number is reported as it was answered, whatever decided the link"
@@ -2430,7 +2536,7 @@ async fn the_paths_a_budget_dropped_are_reported() {
         .await;
 
     assert_eq!(
-        traced.targets_with("pruned", "max_files"),
+        traced.targets_with("pruned", "max-files"),
         [
             "leaf-1.md",
             "leaf-2.md",

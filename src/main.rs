@@ -87,13 +87,16 @@ They are what the list was reached through, not pages to read, and `visited`
 counts them and the results together.
 
 --format picks how that list is printed. json is the plan's shape, for a caller
-that parses it. md is what to read, to paste into a task: the files that earned
-a place, each with the lines worth reading, the heading to look for and the
-scores, most relevant first. tree is the walk's link tree: every file it visited,
-walked files included, with every link it judged beneath it, each link with the
-scent the model gave it and whether the walk followed it, so it is plain to see
-what was passed over and how narrowly. Scores print at two decimals in md and
-tree; json keeps the model's own numbers.
+that parses it: each link carries the scent it was given and what the walk did
+about it — `followed`, or a `reason` naming the rule that queued nothing
+(`below-threshold`, `out-of-root`, `past-depth`, `already-reached`, `not-kept`).
+md is what to read, to paste into a task: the files that earned a place, each
+with the lines worth reading, the heading to look for and the scores, most
+relevant first. tree is the walk's link tree: every file it visited, walked files
+included, with every link it judged beneath it, each link marked with the scent
+the model gave it and what the walk did about it — `followed`, `already reached`
+or `pruned` — so it is plain to see what was passed over and how narrowly.
+Scores print at two decimals in md and tree; json keeps the model's own numbers.
 
 --mode picks the criterion Jev judges by (about, useful-for, answers); a
 --criteria FILE replaces it with a criterion of your own: the file's whole
@@ -365,7 +368,7 @@ enum FormatArg {
     /// lines worth reading.
     Md,
     /// The walk's link tree: every file it visited, `walked` included, and
-    /// every judged link with its scent and whether the walk followed it.
+    /// every judged link with its scent and what became of it.
     Tree,
 }
 
