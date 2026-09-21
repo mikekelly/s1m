@@ -56,7 +56,7 @@ flowchart TD
     B -->|budget spent or<br/>queue empty| H
 ```
 
-Each round expands the top-k frontier files concurrently, so latency is one round trip per hop rather than per file.
+Each round expands the top-k frontier files concurrently, so latency is one round trip per hop rather than per file. A round is a concurrency cap and not the visit order: the frontier is one global queue ordered by path score, and a file a round's own answers overtook keeps its place on it rather than being visited ahead of a better path the walk has found ([#41](https://github.com/mikekelly/s1m/issues/41)). The entry files are visited first and are free, so `--max-files` is what the walk spends on the graph beyond them.
 
 ### One request per file
 
@@ -110,7 +110,7 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | --- | --- | --- |
 | `--mode` | `useful-for` | Relevance criterion: `about`, `useful-for`, `answers` |
 | `--criteria` | none | Path to a file whose whole content is the criterion, in place of `--mode`'s |
-| `--max-files` | 25 | Files visited before stopping |
+| `--max-files` | 25 | Files the walk judges beyond the entry files, which are always visited ([#41](https://github.com/mikekelly/s1m/issues/41)) |
 | `--max-depth` | 6 | Link hops from an entry file |
 | `--threshold` | 0.6 | Minimum link scent to queue a target, and minimum relevance or section score that earns a file a place in the output |
 | ~~`--section-threshold`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — sections rank at `--threshold`. |
@@ -128,13 +128,13 @@ flags above. No default moved:
 
 | Flag | Default | What the numbers say |
 | --- | --- | --- |
-| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.64 over 35245 read tokens, 0.5 lifts recall to 0.72 for +39% of the reading, 0.7 drops it to 0.47 for -26% and 0.8 to 0.33 for -69%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
-| `--max-files` | 25 | Not what binds on this corpus: 25 judges 87 files instead of 83 and returns 73 of them instead of 69, for the same mean recall of 0.64 and 40468 read tokens instead of 35245. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
+| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.64 over 35771 read tokens, 0.5 lifts recall to 0.72 for +41% of the reading, 0.7 drops it to 0.47 for -27% and 0.8 to 0.33 for -70%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
+| `--max-files` | 25 | Not what binds on this corpus: 25 judges 87 files instead of 85 and returns 73 of them instead of 71, for the same mean recall of 0.64 and 40468 read tokens instead of 35771. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
 | ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
 | ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 
 Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.18 of
-recall (0.64 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.26 —
+recall (0.64 → 0.46) for -44% of the input tokens, and dropping previews altogether costs 0.26 —
 the frontmatter is the larger half of what a preview buys, `related:` being why (`eval/REPORT.md`,
 the preview experiment).
 
@@ -200,7 +200,7 @@ The tool description agents see should state plainly that s1m reads local files 
 - [ ] Python or TypeScript? Both have TypeSafe SDKs.
 - [x] Does a link preview (title plus first paragraph) improve scent enough to justify the extra
   tokens? **Yes, and the frontmatter is the larger half of it.** At `--max-files` 10 on the eval
-  wiki, dropping the frontmatter costs 0.18 of recall (0.64 → 0.46) for 43% of the input tokens
+  wiki, dropping the frontmatter costs 0.18 of recall (0.64 → 0.46) for 44% of the input tokens
   saved, and dropping previews altogether costs 0.26; on the hub page the frontmatter is what lifts
   the links to two of the wanted pages over `--threshold`. `related:` making every page look
   connected is the opposite failure to the one [#10](https://github.com/mikekelly/s1m/issues/10)

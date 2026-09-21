@@ -55,7 +55,7 @@ right for a first run:
 | --- | --- | --- |
 | `--mode about\|useful-for\|answers` | `useful-for` | Browsing a subject (`about`) or looking for one page that answers a question (`answers`) rather than doing a task |
 | `--criteria FILE` | none | The judgment you need is not one of the three modes; the file's content is the criterion |
-| `--max-files N` | 25 | You want a shorter list, or a wider net |
+| `--max-files N` | 25 | You want a shorter list, or a wider net. It counts the files the walk judges beyond the entry files, which are always visited |
 | `--max-depth N` | 6 | The useful pages are further from the entry than six hops |
 | `--threshold F` | 0.6 | Fewer links followed, or more (`--max-files` binds first on most wikis); it is also the least relevance or section score that earns a file a place in the list |
 | `--format json\|md\|tree` | `json` | `md` to paste the list into your own context — the files that earned a place, with the lines to read; `tree` to see the whole walk, including the hubs it passed through, and why a link was not followed |

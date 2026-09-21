@@ -81,7 +81,8 @@ pub struct Options {
     /// The directory that bounds the walk; a link resolving outside it is never
     /// followed. `None` means the first entry file's directory.
     pub root: Option<PathBuf>,
-    /// Most files visited before the walk stops.
+    /// Most files the walk judges beyond the entry files. The entry files are
+    /// always visited and never count against it.
     pub max_files: usize,
     /// Most link hops from an entry file.
     pub max_depth: usize,

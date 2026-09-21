@@ -147,7 +147,8 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     root: Option<PathBuf>,
 
-    /// Most files visited before the walk stops.
+    /// Most files the walk judges beyond the entry files, which are always
+    /// visited.
     #[arg(long, value_name = "N", default_value_t = MAX_FILES)]
     max_files: usize,
 

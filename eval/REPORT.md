@@ -10,17 +10,17 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 | Price | $0.042 per million input tokens, output free |
 | Walk | `--threshold` 0.6, `--max-depth` 6, 8 frontier files a round |
 | Answers | `eval/cache` |
-| Requests | 561 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
-| Cost | $0.018798 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.121765 |
+| Requests | 567 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
+| Cost | $0.019224 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.123042 |
 
 ## Headline
 
-- **Recall and precision at `--max-files 10`**: mean recall 0.64, mean precision 0.30 — 22 of the 39 wanted pages are in the list the agent opens, over 69 files returned, 3.5 a query — against 0.27 over everything the walk visited: 83 files judged, 69 of them earned a place, and the rest are what the JSON reports as `walked`. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` visits 87 files for the same mean recall (0.64), 73 of which earn a place, so everything below is a statement about the link graph and the threshold, not about the budget.
-- **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.64, at 243070 tokens against 35245 — 6.9× the reading for 0.30 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
-- **What an agent reads**: 35245 tokens for the returned ranges, against 60174 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 17% of the corpus's text; the section scores take 41% off that, and the ranking 90% off reading everything.
-- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.121765. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
-- **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.08 and reading +39%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.18 and reading -26%; 0.8: recall -0.31 and reading -69%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.37 of the time, the ones it passed over 0.11, and 69 links clear the threshold and are still not followed.
-- **The frontmatter earns its tokens**: dropping it from the preview costs 0.18 of recall (0.64 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.26. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
+- **Recall and precision at `--max-files 10`**: mean recall 0.64, mean precision 0.30 — 22 of the 39 wanted pages are in the list the agent opens, over 71 files returned, 3.5 a query — against 0.27 over everything the walk visited: 85 files judged, 71 of them earned a place, and the rest are what the JSON reports as `walked`. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` visits 87 files for the same mean recall (0.64), 73 of which earn a place, so everything below is a statement about the link graph and the threshold, not about the budget.
+- **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.64, at 243070 tokens against 35771 — 6.8× the reading for 0.30 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
+- **What an agent reads**: 35771 tokens for the returned ranges, against 62085 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 18% of the corpus's text; the section scores take 42% off that, and the ranking 90% off reading everything.
+- **What it costs**: $0.019224 for the gold set at `--max-files 10` — $0.000961 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.123042. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
+- **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.08 and reading +41%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.18 and reading -27%; 0.8: recall -0.31 and reading -70%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.37 of the time, the ones it passed over 0.11, and 69 links clear the threshold and are still not followed.
+- **The frontmatter earns its tokens**: dropping it from the preview costs 0.18 of recall (0.64 → 0.46) for -44% of the input tokens, and dropping previews altogether costs 0.26. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
 
 ## How to reproduce
 
@@ -67,14 +67,14 @@ This report goes to stdout without `--out`, and `--out PATH` writes it to a file
 
 ## Results at a fixed file budget
 
-`--max-files` is the number of files the walk may visit, and the walk judges that many before the reading list is asked anything. `Visited` counts the files it judged; `Returned` is the list the agent opens — the ones that earn a place on their own, relevance at or above `--threshold` 0.6 or a section at or above it, most relevant first — and the rest, the entry files, hubs and near-misses, are what the JSON reports as `walked`. Recall is the wanted pages in that list over all of the query's wanted pages, and precision is the wanted pages in it over the files in it; precision (visited) is the same over everything the walk judged, which is the number this harness reported while the list was everything the walk had visited, so the two side by side are what the cutoff bought and cost. At `--max-files 10`: 83 files visited and 69 returned, mean precision 0.30 against 0.27 over everything visited. `read` is what the agent opens — the returned ranges only — and `whole` is those same files read entire.
+`--max-files` is the number of files the walk may judge beyond the entry files, which are always visited, and the walk judges that many before the reading list is asked anything. `Visited` counts the files it judged; `Returned` is the list the agent opens — the ones that earn a place on their own, relevance at or above `--threshold` 0.6 or a section at or above it, most relevant first — and the rest, the entry files, hubs and near-misses, are what the JSON reports as `walked`. Recall is the wanted pages in that list over all of the query's wanted pages, and precision is the wanted pages in it over the files in it; precision (visited) is the same over everything the walk judged, which is the number this harness reported while the list was everything the walk had visited, so the two side by side are what the cutoff bought and cost. At `--max-files 10`: 85 files visited and 71 returned, mean precision 0.30 against 0.27 over everything visited. `read` is what the agent opens — the returned ranges only — and `whole` is those same files read entire.
 
 ### `--max-files 10`
 
 | Query | Gold | Visited | Returned | Found | Recall | Precision | Precision (visited) | Read (tok) | Whole (tok) | Cost | ms/answer |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `release-and-publish` | 2 | 5 | 3 | 1 | 0.50 | 0.33 | 0.40 | 802 | 2279 | $0.001167 | 210 |
-| `init-scaffold` | 3 | 10 | 9 | 3 | 1.00 | 0.33 | 0.30 | 3697 | 7342 | $0.002101 | 181 |
+| `init-scaffold` | 3 | 11 | 10 | 3 | 1.00 | 0.30 | 0.27 | 4223 | 8696 | $0.002427 | 194 |
 | `init-copies` | 2 | 7 | 5 | 2 | 1.00 | 0.40 | 0.29 | 2787 | 3434 | $0.001269 | 176 |
 | `node-runtime-floor` | 1 | 2 | 2 | 1 | 1.00 | 0.50 | 0.50 | 1625 | 2017 | $0.000524 | 206 |
 | `types-alignment` | 1 | 3 | 2 | 1 | 1.00 | 0.50 | 0.33 | 1625 | 2017 | $0.000683 | 162 |
@@ -88,12 +88,12 @@ This report goes to stdout without `--out`, and `--out PATH` writes it to a file
 | `index-tables` | 2 | 1 | 1 | 0 | 0.00 | 0.00 | 0.00 | 628 | 628 | $0.000313 | 255 |
 | `ingest-summary` | 3 | 4 | 2 | 1 | 0.33 | 0.50 | 0.25 | 214 | 884 | $0.000733 | 150 |
 | `raw-immutable` | 2 | 2 | 2 | 1 | 0.50 | 0.50 | 0.50 | 841 | 884 | $0.000347 | 180 |
-| `what-is-it` | 3 | 10 | 9 | 2 | 0.67 | 0.22 | 0.20 | 1679 | 7255 | $0.002150 | 178 |
+| `what-is-it` | 3 | 11 | 10 | 2 | 0.67 | 0.20 | 0.18 | 1679 | 7812 | $0.002250 | 180 |
 | `cli-dispatch` | 1 | 2 | 2 | 1 | 1.00 | 0.50 | 0.50 | 308 | 1003 | $0.000422 | 152 |
 | `template-vars` | 3 | 5 | 5 | 1 | 0.33 | 0.20 | 0.20 | 1693 | 4255 | $0.001012 | 180 |
 | `utils-fs` | 2 | 4 | 4 | 2 | 1.00 | 0.50 | 0.50 | 1777 | 3193 | $0.000777 | 157 |
 | `wiki-log` | 2 | 3 | 2 | 0 | 0.00 | 0.00 | 0.00 | 1203 | 2140 | $0.000760 | 202 |
-| **mean** |  |  |  |  | **0.64** | **0.30** | **0.27** | **35245** | **60174** | **$0.018798** | 186 |
+| **mean** |  |  |  |  | **0.64** | **0.30** | **0.27** | **35771** | **62085** | **$0.019224** | 188 |
 
 ### `--max-files 25`
 
@@ -127,11 +127,11 @@ The keyword baseline is the harness's own keyword ranker, asked for the same num
 
 | Budget | s1m recall | s1m precision | s1m read (tok) | grep recall | grep precision | grep read (tok) |
 | --- | --- | --- | --- | --- | --- | --- |
-| 10 | 0.64 | 0.30 | 35245 | 0.94 | 0.18 | 243070 |
+| 10 | 0.64 | 0.30 | 35771 | 0.94 | 0.18 | 243070 |
 | 25 | 0.64 | 0.30 | 40468 | 1.00 | 0.12 | 326765 |
 | whole corpus | 1.00 | 0.10 | 346160 | | | |
 
-Reading every page for every query finds every wanted page and reads 346160 tokens for the gold set, 9.8× s1m's returned ranges. The precision column is the wanted pages over the 19 pages there are, averaged over the queries: that is what an unranked reader reads.
+Reading every page for every query finds every wanted page and reads 346160 tokens for the gold set, 9.7× s1m's returned ranges. The precision column is the wanted pages over the 19 pages there are, averaged over the queries: that is what an unranked reader reads.
 
 ## The pages no walk reached
 
@@ -191,8 +191,8 @@ The same gold set walked at `--max-files 10` with the link and section threshold
 
 | Threshold | Recall | Precision | Read (tok) | Cost |
 | --- | --- | --- | --- | --- |
-| 0.5 | 0.72 | 0.29 | 48835 | $0.020761 |
-| **0.6** (default) | 0.64 | 0.30 | 35245 | $0.018798 |
+| 0.5 | 0.72 | 0.29 | 50515 | $0.021187 |
+| **0.6** (default) | 0.64 | 0.30 | 35771 | $0.019224 |
 | 0.7 | 0.47 | 0.36 | 26247 | $0.014785 |
 | 0.8 | 0.33 | 0.33 | 10894 | $0.010437 |
 
@@ -202,7 +202,7 @@ A preview carries a target's title, its frontmatter and its first paragraph. The
 
 | Preview policy | Recall | Precision | Read (tok) | Input (tok) | Cost | ms/answer |
 | --- | --- | --- | --- | --- | --- | --- |
-| previews on (default) | 0.64 | 0.30 | 35245 | 447569 | $0.018798 | 186 |
+| previews on (default) | 0.64 | 0.30 | 35771 | 457709 | $0.019224 | 188 |
 | previews, no frontmatter | 0.46 | 0.27 | 32089 | 256959 | $0.010792 | 172 |
 | previews off | 0.38 | 0.29 | 16246 | 167987 | $0.007055 | 178 |
 

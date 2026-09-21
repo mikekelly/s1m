@@ -1,27 +1,44 @@
 //! Best-first traversal of the link graph: the frontier, its budgets, and the
 //! visited set.
 //!
-//! Entry files start on a frontier at path score 1. Each round pops the best
-//! `fanout` files, scores them together, and queues the links that clear the
-//! threshold. A link's scent multiplies into the path score, so an entry's
-//! priority is the score of the best path found to it: long chains of weak
-//! links sink, and a file reached twice keeps its best path and is visited
-//! once.
+//! The entry files the caller named are visited first and are free: each is a
+//! file the caller asked about, and `max_files` — which counts the files the
+//! walk judges *beyond* them — has nothing to say about them. A run at 0 is the
+//! entry files alone.
+//!
+//! Beyond them the walk is one frontier ordered by path score, across rounds
+//! and not within one: nothing reorders the queue per round. A link is admitted
+//! on its own scent — in the root, at or above the threshold, within the depth
+//! budget — and is queued at the score of the path it was found on, the product
+//! of the link scents from an entry file. So a file's priority is the score of
+//! the best path found to it: long chains of weak links sink, a file reached
+//! twice keeps its best path and is visited once, and a link whose own scent
+//! clears the threshold is queued whatever its path score came out as.
 //!
 //! Every entry file is one the caller named: it starts at path score 1, depth
 //! 0, with no scent and no `via`, and nothing can reach a file at a better
 //! score than that.
 //!
-//! The walk is async because the scorer is: a round joins one future per file,
-//! so a round costs one round trip rather than one per file, and the caller
-//! supplies the runtime.
+//! The walk is async because the scorer is: a round scores up to `fanout` files
+//! at once, so a round costs one round trip rather than one per file, and the
+//! caller supplies the runtime. `fanout` is a concurrency cap and nothing else
+//! — the reading list is the one a file-at-a-time walk would produce, because a
+//! round is not a visit:
+//!
+//! - A file is recorded only while it is the best path the walk knows of. After
+//!   each file of a round, a file the round's own answers overtook — one whose
+//!   link was queued at a better score than this file was popped at — goes back
+//!   on the frontier with the answer already bought for it, and is visited when
+//!   it is the best path again. So no file is visited ahead of a better path
+//!   the walk had already found, and no file is asked about twice.
 //!
 //! Determinism is a contract, not a property of the machine that ran it:
 //!
 //! - Ties on path score are broken by path, so the queue order is a function of
 //!   the input alone.
-//! - A round's answers are collected in the order the batch was popped, so the
-//!   result does not depend on which answer arrives first.
+//! - A round's answers are collected in the order the batch was popped and
+//!   recorded in it, so the result does not depend on which answer arrives
+//!   first.
 //! - Nothing is pruned by a file's own relevance: an unhelpful index page still
 //!   passes its links on.
 //!
@@ -64,12 +81,18 @@ pub struct Config<'a> {
     /// The directory that bounds the walk. A link resolving outside it is
     /// reported and never followed.
     pub root: &'a Path,
-    /// Most files visited before the walk stops.
+    /// Most files the walk judges beyond the entry files. The entry files the
+    /// caller named are always visited and are free: this is what the walk may
+    /// spend on the graph past them, so a run at 0 is the entry files alone.
     pub max_files: usize,
     /// Most link hops from an entry file. Entries are at depth 0, so at
     /// `max_depth` 0 only the entries are visited.
     pub max_depth: usize,
-    /// Most files scored in one round; the round waits for the slowest of them.
+    /// Most files scored at once, at least one: a round size of none would be no
+    /// walk at all. A round waits for the slowest of them, so this is a
+    /// concurrency cap and not the reading list: a round of `fanout` files
+    /// leaves the ones it overtook on the frontier for their turn, and a walk
+    /// scores this many files rather than visiting them.
     pub fanout: usize,
     /// Least link scent that queues a target. A Noul near 0.5 means uncertain,
     /// so this is meant to sit above it.
@@ -92,7 +115,8 @@ pub struct Traversal {
     /// The visited files, most relevant first, ties broken by path.
     pub results: Vec<VisitedFile>,
     /// Scorer calls made. A file that failed to parse cost none; a call that
-    /// failed still counts.
+    /// failed still counts. A round buys its files together: a file it bought
+    /// and the budget then stopped short of counts too.
     pub calls: usize,
     /// Files the walk reached but could not score, by path. These do not count
     /// against `max_files` and are not retried.
@@ -212,8 +236,9 @@ pub enum TraverseError {
 
 /// Walks the link graph from the config's entry files.
 ///
-/// Ends when `max_files` files are visited or the frontier is empty, whichever
-/// comes first. A file that cannot be parsed or scored is recorded in
+/// Visits every entry file, then walks on: the walk ends when `max_files` files
+/// beyond the entries are judged, or the frontier is empty, whichever comes
+/// first. A file that cannot be parsed or scored is recorded in
 /// [`Traversal::failed`] and the walk continues, so one broken link does not
 /// cost the reading list.
 pub async fn traverse(
@@ -257,6 +282,10 @@ impl PartialEq for Frontier {
 
 impl Eq for Frontier {}
 
+/// What the walk holds for a file: its parse and its judgment, or why it could
+/// not be had.
+type Answer = Result<(ParsedFile, FileJudgment), Failure>;
+
 /// One walk's state.
 struct Search<'a> {
     config: &'a Config<'a>,
@@ -265,10 +294,19 @@ struct Search<'a> {
     /// Best path found for each file, so a worse path never queues and a file
     /// keeps the best path it was reached by.
     best: HashMap<PathBuf, Frontier>,
-    /// Files already dealt with — visited, or failed and not retried.
+    /// Files already dealt with — visited, or failed and not retried. The entry
+    /// files are here from the start: they are dealt with as the entries they
+    /// were named as, whatever reaches them, and the budget has nothing to say
+    /// about them.
     settled: HashSet<PathBuf>,
+    /// Answers a round bought and did not use, by path: a file the round's own
+    /// answers overtook waits on the frontier with its answer here, so the walk
+    /// asks about a file once whatever the round size.
+    held: HashMap<PathBuf, Answer>,
     results: Vec<VisitedFile>,
     failed: Vec<FailedFile>,
+    /// Files judged beyond the entry files: what `max_files` bounds.
+    spent: usize,
     calls: usize,
 }
 
@@ -280,28 +318,56 @@ impl<'a> Search<'a> {
             frontier: BinaryHeap::new(),
             best: HashMap::new(),
             settled: HashSet::new(),
+            held: HashMap::new(),
             results: Vec::new(),
             failed: Vec::new(),
+            spent: 0,
             calls: 0,
         }
     }
 
     async fn run(mut self) -> Result<Traversal, TraverseError> {
-        self.start()?;
-        while self.results.len() < self.config.max_files {
+        let entries = self.start()?;
+        // The files the caller named are visited first and are free: `max_files`
+        // is what the walk spends beyond them, so a run at 0 is the entry files
+        // alone and still visits every one of them. Scoring them a round at a
+        // time keeps the round trip at one whatever the entry set is.
+        for batch in entries.chunks(self.config.fanout.max(1)) {
+            let answers = self.answers(batch).await;
+            for (entry, answer) in batch.iter().cloned().zip(answers) {
+                self.record(entry, answer);
+            }
+        }
+
+        while self.spent < self.config.max_files {
             let batch = self.next_batch();
             if batch.is_empty() {
                 break;
             }
-            let outcomes = self.score(&batch).await;
-            // A file that failed to parse never reached the scorer, so it was
-            // no call; a call that failed still was one.
-            self.calls += outcomes
-                .iter()
-                .filter(|outcome| !matches!(outcome.as_ref().err(), Some(Failure::Parse(_))))
-                .count();
-            for (entry, outcome) in batch.into_iter().zip(outcomes) {
-                self.record(entry, outcome);
+            let answers = self.answers(&batch).await;
+            for (entry, answer) in batch.into_iter().zip(answers) {
+                // A round is not a visit. The answers of this one can reach a
+                // file that outranks the rest of it — the batch was popped
+                // before they existed — and that file gets its turn first: the
+                // rest goes back on the frontier with the answer just bought
+                // for it, rather than being visited ahead of a better path the
+                // walk already has.
+                if self.overtaken(&entry) {
+                    self.hold(entry, answer);
+                    continue;
+                }
+                self.record(entry, answer);
+            }
+        }
+
+        // A round buys its files together, so the walk can end with an answer it
+        // never used: a better path took the file's place and the budget then
+        // ran out. One that answered is what the walk bought and did not spend;
+        // one that failed is the hole in the ranking it would have been had the
+        // file had its turn, and is reported the same way.
+        for (path, answer) in std::mem::take(&mut self.held) {
+            if let Err(failure) = answer {
+                self.failed.push(FailedFile { path, failure });
             }
         }
 
@@ -314,11 +380,19 @@ impl<'a> Search<'a> {
         })
     }
 
-    /// Puts the entry files on the frontier at path score 1.
+    /// The files the caller named, at path score 1 and ready to visit.
     ///
-    /// An entry file the root's `.s1mignore` matches never reaches the
-    /// frontier, so nothing reads it.
-    fn start(&mut self) -> Result<(), TraverseError> {
+    /// Each is marked dealt with here, before anything is read of it: no link
+    /// can reach an entry file as anything but the entry it was named as, and
+    /// the budget is not spent on one. An entry file the root's `.s1mignore`
+    /// matches never reaches the round, so nothing reads it, and one named twice
+    /// — under two spellings, or twice the same — is visited once.
+    ///
+    /// The batch order is the path's, which is the order the frontier's tie
+    /// break gave them when they were queued together, so the reading list does
+    /// not depend on the order the caller named them in.
+    fn start(&mut self) -> Result<Vec<Frontier>, TraverseError> {
+        let mut entries = Vec::new();
         for path in self.config.entries {
             if path.is_absolute() != self.config.root.is_absolute() {
                 return Err(TraverseError::BaseMismatch {
@@ -330,7 +404,10 @@ impl<'a> Search<'a> {
             if self.config.ignore.matched(&path) {
                 continue;
             }
-            self.enqueue(Frontier {
+            if !self.settled.insert(path.clone()) {
+                continue;
+            }
+            entries.push(Frontier {
                 path,
                 score: 1.0,
                 depth: 0,
@@ -338,36 +415,112 @@ impl<'a> Search<'a> {
                 via: Vec::new(),
             });
         }
-        Ok(())
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        for entry in &entries {
+            self.best.insert(entry.path.clone(), entry.clone());
+        }
+        Ok(entries)
     }
 
     /// One round's work: up to `fanout` files, never more than the budget
     /// leaves room for.
     ///
-    /// An entry that a better path has since overtaken, or whose file is
-    /// already dealt with, is dropped rather than scored, and does not use up a
-    /// place in the round.
+    /// A file that has been dealt with, or that a better path has since
+    /// overtaken, is dropped rather than scored, and does not use up a place in
+    /// the round.
     fn next_batch(&mut self) -> Vec<Frontier> {
         let mut batch = Vec::new();
-        while batch.len() < self.config.fanout
-            && self.results.len() + batch.len() < self.config.max_files
-        {
-            let Some(entry) = self.frontier.pop() else {
+        while batch.len() < self.config.fanout && self.spent + batch.len() < self.config.max_files {
+            let Some(entry) = self.next_pending() else {
                 break;
             };
-            if self.settled.contains(&entry.path) {
-                continue;
-            }
-            if self
-                .best
-                .get(&entry.path)
-                .is_some_and(|best| best.score > entry.score)
-            {
-                continue;
-            }
             batch.push(entry);
         }
         batch
+    }
+
+    /// The frontier's best file, taken off the heap: the ones the walk has
+    /// already dealt with are thrown away as they are met.
+    fn next_pending(&mut self) -> Option<Frontier> {
+        loop {
+            let entry = self.frontier.pop()?;
+            if !self.dealt_with(&entry) {
+                return Some(entry);
+            }
+        }
+    }
+
+    /// Whether the walk has dealt with a frontier entry: its file is visited or
+    /// failed, or a better path to it has been queued since the entry was
+    /// pushed.
+    fn dealt_with(&self, entry: &Frontier) -> bool {
+        self.settled.contains(&entry.path)
+            || self
+                .best
+                .get(&entry.path)
+                .is_some_and(|best| best.score > entry.score)
+    }
+
+    /// Whether the frontier holds a better path than this file's, throwing away
+    /// the entries the walk has dealt with on the way. What a round's own
+    /// answers can do to the rest of the round, and the reason a round is not a
+    /// visit.
+    fn overtaken(&mut self, entry: &Frontier) -> bool {
+        while self.frontier.peek().is_some_and(|top| self.dealt_with(top)) {
+            self.frontier.pop();
+        }
+        self.frontier.peek().is_some_and(|top| top > entry)
+    }
+
+    /// Puts a scored file back on the frontier, keeping the answer: the walk has
+    /// bought that judgment, so the file waits for its turn rather than being
+    /// asked about twice. An answer still held when the walk ends was bought and
+    /// never spent: [`Search::run`] reports the ones that failed and drops the
+    /// rest.
+    fn hold(&mut self, entry: Frontier, answer: Answer) {
+        self.held.insert(entry.path.clone(), answer);
+        self.frontier.push(entry);
+    }
+
+    /// The answers for one round's files, in the order the batch was popped.
+    ///
+    /// A file a round overtook is already answered, and that answer is taken
+    /// here: only the files nobody has answered are scored, together, and the
+    /// answers are put back in batch order, so the order a round committed in
+    /// is the order it popped in whatever order the scorer answered in.
+    async fn answers(&mut self, batch: &[Frontier]) -> Vec<Answer> {
+        let mut answers: Vec<Option<Answer>> = batch
+            .iter()
+            .map(|entry| self.held.remove(&entry.path))
+            .collect();
+        let fresh: Vec<Frontier> = batch
+            .iter()
+            .zip(&answers)
+            .filter(|(_, answer)| answer.is_none())
+            .map(|(entry, _)| entry.clone())
+            .collect();
+        let scored = self.score(&fresh).await;
+        // A file that failed to parse never reached the scorer, so it was no
+        // call; a call that failed still was one.
+        self.calls += scored
+            .iter()
+            .filter(|answer| !matches!(answer.as_ref().err(), Some(Failure::Parse(_))))
+            .count();
+
+        let mut scored = scored.into_iter();
+        for answer in &mut answers {
+            if answer.is_none() {
+                *answer = Some(
+                    scored
+                        .next()
+                        .expect("every file that was asked about has an answer"),
+                );
+            }
+        }
+        answers
+            .into_iter()
+            .map(|answer| answer.expect("every file of a round has an answer"))
+            .collect()
     }
 
     /// Scores one round: one future per file, polled together, so a round costs
@@ -379,7 +532,7 @@ impl<'a> Search<'a> {
     /// preview, its path is not in the request, and the judgment has no question
     /// to answer about it. What comes back is the file's own links minus those,
     /// which is also what the reading list reports.
-    async fn score(&self, batch: &[Frontier]) -> Vec<Result<(ParsedFile, FileJudgment), Failure>> {
+    async fn score(&self, batch: &[Frontier]) -> Vec<Answer> {
         let root = self.config.root;
         let query = self.config.query;
         let ignore = self.config.ignore;
@@ -394,7 +547,7 @@ impl<'a> Search<'a> {
     }
 
     /// Records one answered file and queues its links.
-    fn record(&mut self, entry: Frontier, outcome: Result<(ParsedFile, FileJudgment), Failure>) {
+    fn record(&mut self, entry: Frontier, outcome: Answer) {
         self.settled.insert(entry.path.clone());
         // The record and the expansion use the best path found to the file, not
         // the one it was popped at: an earlier file of this round can have
@@ -413,6 +566,12 @@ impl<'a> Search<'a> {
                 return;
             }
         };
+        // The budget is the files the walk judges beyond the entry files, so a
+        // file that could not be judged cost it nothing; an entry file is not
+        // the budget's business at all.
+        if depth > 0 {
+            self.spent += 1;
+        }
 
         let mut links = judged_links(&file, &judgment);
         for link in &mut links {

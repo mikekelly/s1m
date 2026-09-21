@@ -188,9 +188,9 @@ Both lists are elided for length: the run returns three results and reports two 
 | --- | --- | --- |
 | `--mode` | `useful-for` | What relevance means: `about`, `useful-for` or `answers` |
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
-| `--max-files` | 25 | Files visited before the walk stops. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over four more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
+| `--max-files` | 25 | Files the walk judges beyond the entry files, which are always visited and free. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over two more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.64 to 0.72 for 39% more reading, 0.7 drops it to 0.47 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
+| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.64 to 0.72 for 41% more reading, 0.7 drops it to 0.47 for 27% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | `json` (the list above), `md` (what to read: the results, with the lines worth reading) or `tree` (the walk's link tree, `walked` files included) |
@@ -351,7 +351,7 @@ separates a page which says nothing from one whose own links point at the answer
 ([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
 caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
 is the part of a preview most likely to mislead, and the eval put a number on it: dropping the
-frontmatter costs 0.18 of mean recall (0.64 → 0.46) for 43% of the input tokens saved, and
+frontmatter costs 0.18 of mean recall (0.64 → 0.46) for 44% of the input tokens saved, and
 dropping previews altogether costs 0.26, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
@@ -538,17 +538,17 @@ the same bytes with no key at all, and `--no-cache` with a key buys every judgme
 Its headline, in three lines:
 
 - **Recall and precision at `--max-files` 10**: mean recall 0.64, mean precision 0.30 — 22 of the
-  39 wanted pages, over 69 files returned. The cutoff is what moved them: the walk judged 83
-  files and the list returns the 69 that earned a place, which took precision from 0.27 to 0.30
+  39 wanted pages, over 71 files returned. The cutoff is what moved them: the walk judged 85
+  files and the list returns the 71 that earned a place, which took precision from 0.27 to 0.30
   and cost one wanted page (0.67 → 0.64). The budget is not what binds: the walk runs out of
   links above `--threshold` first, and `--max-files 25` judges 87 files for the same numbers.
-- **What an agent reads**: 35,245 tokens for the returned ranges, against 60,174 for the same
+- **What an agent reads**: 35,771 tokens for the returned ranges, against 62,085 for the same
   files whole and 346,160 for every page on every query. Reading the returned files whole costs
-  17% of the corpus's text; the section scores take 41% off that, and the ranking 90% off reading
+  18% of the corpus's text; the section scores take 42% off that, and the ranking 90% off reading
   everything.
-- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s
+- **What it costs**: $0.019224 for the gold set at `--max-files 10` — $0.000961 a query, at 0.19 s
   an answer. On this wiki the keyword ranker finds more and reads far more — recall 0.94 against
-  s1m's 0.64, at 6.9× the tokens.
+  s1m's 0.64, at 6.8× the tokens.
 
 ## Library
 
