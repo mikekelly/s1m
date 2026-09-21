@@ -57,8 +57,7 @@ right for a first run:
 | `--criteria FILE` | none | The judgment you need is not one of the three modes; the file's content is the criterion |
 | `--max-files N` | 25 | You want a shorter list, or a wider net |
 | `--max-depth N` | 6 | The useful pages are further from the entry than six hops |
-| `--threshold F` | 0.6 | Fewer links followed, or more (`--max-files` binds first on most wikis) |
-| `--seed-grep` | off | Recall matters and pages may be orphaned: adds the query's keyword hits as extra entry points |
+| `--threshold F` | 0.6 | Fewer links followed, or more (`--max-files` binds first on most wikis); it is also the least section score the list keeps |
 | `--format json\|md\|tree` | `json` | `md` to paste the list into your own context; `tree` to see why a link was not followed |
 | `--root DIR` | entry file's directory | The walk should be bounded somewhere else |
 
@@ -80,7 +79,6 @@ A typical run: `s1m "how do I cut a release and publish the package" docs/index.
       "relevance": 0.78,
       "scent": 0.89,
       "via": ["docs/index.md"],
-      "seeded": false,
       "sections": [
         {"heading": "Release", "lines": [12, 26], "score": 0.72}
       ],
@@ -99,10 +97,10 @@ How to act on it:
   that file, not the file. A section's range contains its subsections', so reading a returned
   range reads everything returned inside it.
 - `scent` is the link that reached the file and `via` is the path it came along, so you can see
-  why it is in the list. `seeded` says a keyword hit put it there rather than a link.
+  why it is in the list.
 - `links` is what the walk judged and whether it followed each one — useful when a page you
   expected is missing: it may have been passed over below `--threshold`.
-- A file with no `sections` cleared `--section-threshold`: it is in the ranking but has nothing
+- A file with no `sections` cleared `--threshold`: it is in the ranking but has nothing
   worth quoting.
 
 Exit codes: `0` the walk went beyond the entry files, `1` nothing cleared the threshold (the
@@ -115,9 +113,9 @@ and on a mistake the message names the path or the flag.
   walk visits to the TypeSafe API. Do not point s1m at a knowledge base you are not allowed to
   send to a third party.
 - **A wiki can exclude paths.** A `.s1mignore` in the root, in gitignore syntax, is never read:
-  a matched link target is not sent, not previewed and not followed, a matched page is never a
-  `--seed-grep` hit, and naming one as an entry file exits 2. If a page you want is ignored, do
-  not fight it — tell the person who owns the wiki.
+  a matched link target is not sent, not previewed and not followed, and naming one as an entry
+  file exits 2. If a page you want is ignored, do not fight it — tell the person who owns the
+  wiki.
 - **Repeat runs are free and identical.** Answers are cached on the request that produced them,
   under `$S1M_CACHE_DIR`, else `$XDG_CACHE_HOME/s1m`, else `~/.cache/s1m`. `--no-cache` buys
   everything again; the thresholds are the caller's and never part of a cache key, so tuning one

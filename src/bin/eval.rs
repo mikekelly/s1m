@@ -20,10 +20,9 @@
 //!   bought, requests, questions, input and output tokens, and the latency of
 //!   one answer (not wall time: a round joins its files, so it waits for the
 //!   slowest, not for the sum).
-//! - **A keyword baseline**: the ranker `--seed-grep` uses, read as a reading
-//!   list of whole files. What grep gets without a model.
-//! - **Seeding**, because a walk follows links and some pages nothing links to
-//!   can only be reached by keyword.
+//! - **A keyword baseline**: the harness's own keyword ranker — the query's
+//!   terms counted in every page under the root — read as a reading list of
+//!   whole files. What grep gets without a model.
 //! - **Calibration**: the scent a link was given against what following it
 //!   reached, which is the number that says where `--threshold` belongs.
 //! - **The preview experiment** [#10] deferred: previews off, previews without
@@ -57,13 +56,13 @@ use s1m::ignore::Ignore;
 use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, Scorer, ScorerError};
-use s1m::seed;
 use s1m::traverse::{Config, Failure, traverse};
 
 // ------------------------------------------------------------- what it varies
 
-/// The plan's defaults for what no measurement here is about: the depth limit
-/// and the frontier round.
+/// What no measurement here is about: the depth limit and the frontier round,
+/// the values the CLI walks with. The round size has no flag — it is a
+/// constant in `main.rs` — so the harness carries its own copy.
 const MAX_DEPTH: usize = 6;
 const FANOUT: usize = 8;
 
@@ -72,11 +71,9 @@ const FANOUT: usize = 8;
 /// are in.
 const CHARS_PER_TOKEN: usize = 4;
 
-/// How many keyword hits the seeded run adds: the CLI's `--seed-count` default.
-const SEED_COUNT: usize = 5;
-
-/// The thresholds the sweep walks at, around the CLI's default of `0.6`. The
-/// section threshold follows the link threshold, the way the CLI defaults it.
+/// The thresholds the sweep walks at, around the CLI's default of `0.6`. One
+/// value covers the links and the sections, as the CLI's one `--threshold`
+/// does.
 const SWEEP: [f64; 4] = [0.5, 0.6, 0.7, 0.8];
 
 /// How many bins the calibration tables cut 0 to 1 into.
@@ -360,6 +357,113 @@ fn tokens(chars: usize) -> usize {
     chars.div_ceil(CHARS_PER_TOKEN)
 }
 
+// ------------------------------------------------------- the keyword ranker
+
+/// Shortest query word that counts as a keyword: `we`, `do` and `a` name too
+/// little of a query to be worth a hit.
+const MIN_TERM_LEN: usize = 3;
+
+/// The best `count` pages under `root` for `query`'s keywords, best first,
+/// spelled the way [`Config::entries`] wants its entry files spelled: the root
+/// joined on, the way the caller spells the page it starts from.
+///
+/// Files rank by how many of the query's terms they match, then by how many
+/// hits they have, then by path: a page covering more of the query comes first,
+/// and the answer never depends on the order a directory happened to list its
+/// files in.
+///
+/// The harness's own ranker, the one behind the keyword-baseline rows: no
+/// model, no dependency, no index — the pages under the root are read, the
+/// query's terms counted in each, and the best of them come back. It is
+/// in-process string work, and the control the plan asks the model to beat.
+///
+/// `ignore` is the root's `.s1mignore` ([`s1m::ignore`]): a page it matches is
+/// not a candidate and is not opened.
+///
+/// Only pages with a hit come back, so fewer than `count` is normal. There is
+/// no failure to report: a root that cannot be read has no hits, the way
+/// [`parse::pages`] treats a directory it cannot open.
+fn keyword_hits(root: &Path, query: &str, count: usize, ignore: &Ignore) -> Vec<PathBuf> {
+    let terms = terms(query);
+    if count == 0 || terms.is_empty() {
+        return Vec::new();
+    }
+
+    let mut hits: Vec<Hit> = Vec::new();
+    for page in parse::pages(root) {
+        if ignore.matched(&page) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(root.join(&page)) else {
+            continue;
+        };
+        let text = text.to_lowercase();
+        let mut terms_matched = 0;
+        let mut occurrences = 0;
+        for term in &terms {
+            let found = occurrences_in(&text, term);
+            terms_matched += usize::from(found > 0);
+            occurrences += found;
+        }
+        if terms_matched > 0 {
+            hits.push(Hit {
+                path: page,
+                terms_matched,
+                occurrences,
+            });
+        }
+    }
+
+    hits.sort_by(|a, b| {
+        b.terms_matched
+            .cmp(&a.terms_matched)
+            .then_with(|| b.occurrences.cmp(&a.occurrences))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    hits.truncate(count);
+    hits.into_iter().map(|hit| root.join(hit.path)).collect()
+}
+
+/// One page's score: how many of the query's terms it matches, and how many
+/// times those terms occur in it.
+#[derive(Debug)]
+struct Hit {
+    /// The page, relative to the root it was found under.
+    path: PathBuf,
+    terms_matched: usize,
+    occurrences: usize,
+}
+
+/// The query's keywords: its words of at least [`MIN_TERM_LEN`] characters,
+/// lowercased, in the order they were asked, each one once.
+fn terms(query: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in query.split(|character: char| !character.is_alphanumeric()) {
+        let word = word.to_lowercase();
+        if word.chars().count() < MIN_TERM_LEN || terms.contains(&word) {
+            continue;
+        }
+        terms.push(word);
+    }
+    terms
+}
+
+/// How many whole-word occurrences of `term` are in `text`, ignoring case.
+///
+/// `text` is already lowercased and `term` is a word of alphanumerics, so a
+/// match is a whole word when neither the character before it nor the one after
+/// it is alphanumeric: matching a term anywhere would count `for` inside
+/// `before` and `note` inside `notes`, which is not what the query asked for.
+fn occurrences_in(text: &str, term: &str) -> usize {
+    text.match_indices(term)
+        .filter(|(at, _)| {
+            let before = text[..*at].chars().next_back();
+            let after = text[at + term.len()..].chars().next();
+            !before.is_some_and(char::is_alphanumeric) && !after.is_some_and(char::is_alphanumeric)
+        })
+        .count()
+}
+
 // ------------------------------------------------------------- what it spends
 
 /// What the answers served cost, added up.
@@ -538,8 +642,8 @@ struct Visit {
     path: PathBuf,
     /// What the model made of it; `None` for a run with no model behind it.
     relevance: Option<f64>,
-    /// The scent of the link that reached it: `None` for the entry file and for
-    /// a keyword seed, which no link reached.
+    /// The scent of the link that reached it: `None` for the entry file, which
+    /// no link reached.
     scent: Option<f64>,
     /// The lines the reading list returns: the sections that cleared the
     /// section threshold, as the parser gave them.
@@ -684,30 +788,24 @@ struct Env<'a> {
 }
 
 impl Env<'_> {
-    /// One walk of one query: the scorer its mode needs, the budget, the
-    /// entries and the seeds, and what it cost.
+    /// One walk of one query: the scorer its mode needs, the budget, the page
+    /// the walk starts from, and what it cost.
     async fn walk(
         &self,
         query: &Query,
         budget: usize,
-        seed_count: usize,
         preview: Preview,
         threshold: f64,
     ) -> Result<Run, String> {
         let meter = self.scorer(query, preview)?;
-        // Entries and seeds are spelled the way a caller spells them — the root
-        // joined on, `wiki/index.md` for a root of `wiki` — because that is what
-        // a walk normalises against its root. Everything a walk hands back is
-        // relative to that root, which is how the gold set spells its pages too.
+        // The entry is spelled the way a caller spells it — the root joined on,
+        // `wiki/index.md` for a root of `wiki` — because that is what a walk
+        // normalises against its root. Everything a walk hands back is relative
+        // to that root, which is how the gold set spells its pages too.
         let entries = [self.root.join(query.entry())];
-        let seeds = match seed_count {
-            0 => Vec::new(),
-            count => seed::seed(self.root, &query.query, count, &entries, &self.ignore),
-        };
         let config = Config {
             query: &query.query,
             entries: &entries,
-            seeds: &seeds,
             root: self.root,
             max_files: budget,
             max_depth: MAX_DEPTH,
@@ -807,12 +905,13 @@ impl Env<'_> {
         })
     }
 
-    /// The keyword ranker as a reading list: the hits `--seed-grep` would add,
-    /// read whole because a ranker has no line ranges to offer.
+    /// The keyword ranker as a reading list: the pages a query's keywords hit,
+    /// read whole because a ranker has no line ranges to offer. The hits come
+    /// back against the root, the way the corpus and the gold set spell a page.
     ///
     /// No model, so nothing spent — the control the plan asks the model to beat.
     fn grep(&self, query: &Query, budget: usize) -> Run {
-        let hits: Vec<PathBuf> = seed::seed(self.root, &query.query, budget, &[], &self.ignore)
+        let hits: Vec<PathBuf> = keyword_hits(self.root, &query.query, budget, &self.ignore)
             .iter()
             .map(|hit| parse::relative_to_root(self.root, hit))
             .collect();
@@ -884,8 +983,6 @@ struct Findings {
     budgets: Vec<usize>,
     /// The gold set at each budget, in the same order, per query.
     at: Vec<(usize, Vec<Run>)>,
-    /// The same, with the keyword seeds on.
-    seeded: Vec<(usize, Vec<Run>)>,
     /// The keyword ranker at each budget.
     grep: Vec<(usize, Vec<Run>)>,
     /// The sweep, at the smallest budget.
@@ -956,25 +1053,12 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
             let run = env
-                .walk(query, *budget, 0, PREVIEWS[0], args.threshold)
+                .walk(query, *budget, PREVIEWS[0], args.threshold)
                 .await?;
             total.merge(&run.spent);
             runs.push(run);
         }
         at.push((*budget, runs));
-    }
-
-    let mut seeded: Vec<(usize, Vec<Run>)> = Vec::new();
-    for budget in &budgets {
-        let mut runs = Vec::with_capacity(gold.queries.len());
-        for query in &gold.queries {
-            let run = env
-                .walk(query, *budget, SEED_COUNT, PREVIEWS[0], args.threshold)
-                .await?;
-            total.merge(&run.spent);
-            runs.push(run);
-        }
-        seeded.push((*budget, runs));
     }
 
     let grep: Vec<(usize, Vec<Run>)> = budgets
@@ -994,7 +1078,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for threshold in SWEEP {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, tight, 0, PREVIEWS[0], threshold).await?;
+            let run = env.walk(query, tight, PREVIEWS[0], threshold).await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1008,7 +1092,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for preview in PREVIEWS.iter().skip(1) {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, tight, 0, *preview, args.threshold).await?;
+            let run = env.walk(query, tight, *preview, args.threshold).await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1045,7 +1129,6 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         threshold: args.threshold,
         budgets,
         at,
-        seeded,
         grep,
         sweep,
         previews,
@@ -1106,7 +1189,6 @@ impl Findings {
         self.the_gold_set(out);
         self.at_a_budget(out);
         self.against_grep(out);
-        self.seeding(out);
         self.never_reached(out);
         self.calibration(out);
         self.the_threshold(out);
@@ -1170,7 +1252,7 @@ impl Findings {
         );
         let _ = writeln!(
             out,
-            "| Walk | `--threshold` {}, `--max-depth` {MAX_DEPTH}, `--fanout` {FANOUT} |",
+            "| Walk | `--threshold` {}, `--max-depth` {MAX_DEPTH}, {FANOUT} frontier files a round |",
             self.threshold
         );
         let _ = writeln!(out, "| Answers | {} |", self.cache);
@@ -1201,7 +1283,6 @@ impl Findings {
         let _ = writeln!(out);
 
         let (_, greedy) = self.grep_at(tight);
-        let (_, seeded) = self.seeded_at(tight);
         let wanted = sum(s1m, |run| run.score.gold);
         let _ = writeln!(
             out,
@@ -1232,8 +1313,7 @@ impl Findings {
             "- **The keyword ranker finds more and reads far more**: recall {} against s1m's {}, at \
              {} tokens against {} — {} the reading for {} more of the wanted pages. On a wiki whose \
              pages share their vocabulary with the queries, grep is the stronger recaller and s1m \
-             the cheaper reader; `--seed-grep {SEED_COUNT}` on top of the walk is the middle, at \
-             recall {} and {} tokens.",
+             the cheaper reader.",
             ratio(mean_recall(greedy)),
             ratio(mean_recall(s1m)),
             sum(greedy, |run| run.score.read_tokens),
@@ -1243,8 +1323,6 @@ impl Findings {
                 sum(s1m, |run| run.score.read_tokens) as u64
             ),
             ratio(mean_recall(greedy) - mean_recall(s1m)),
-            ratio(mean_recall(seeded)),
-            sum(seeded, |run| run.score.read_tokens),
         );
         let _ = writeln!(
             out,
@@ -1486,7 +1564,7 @@ impl Findings {
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "The keyword baseline is the ranker `--seed-grep` uses, asked for the same number of \
+            "The keyword baseline is the harness's own keyword ranker, asked for the same number of \
              hits and read whole: it is what a caller with grep and no model gets. Reading the \
              corpus is the floor no ranking can beat on tokens, counted the way the rows above are \
              — over every query, so reading all {} pages once per query.",
@@ -1546,103 +1624,38 @@ impl Findings {
         let _ = writeln!(out);
     }
 
-    /// The pages links cannot reach, and what seeding does about them.
-    fn seeding(&self, out: &mut String) {
-        let _ = writeln!(out, "## Seeding, and the pages links cannot reach");
-        let _ = writeln!(out);
-        let _ = writeln!(
-            out,
-            "A walk follows links, so a page nothing links to is never reached at any budget. \
-             `--seed-grep {SEED_COUNT}` puts the query's keyword hits on the frontier beside the \
-             entry file, and the seeded run reads their sections like any other page's:"
-        );
-        let _ = writeln!(out);
-        head(
-            out,
-            &[
-                "Budget",
-                "Configuration",
-                "Recall",
-                "Precision",
-                "Read (tok)",
-                "Cost",
-            ],
-        );
-        for budget in &self.budgets {
-            let (_, plain) = self.at_budget(*budget);
-            let (_, seeded) = self.seeded_at(*budget);
-            for (label, runs) in [("walk", plain), ("walk + `--seed-grep`", seeded)] {
-                row(
-                    out,
-                    &[
-                        budget.to_string(),
-                        label.to_string(),
-                        ratio(mean_recall(runs)),
-                        ratio(mean_precision(runs)),
-                        sum(runs, |run| run.score.read_tokens).to_string(),
-                        usd(sum_cost(runs)),
-                    ],
-                );
-            }
-        }
-        let _ = writeln!(out);
-        let (_, plain) = self.at_budget(self.budgets[0]);
-        let (_, seeded) = self.seeded_at(self.budgets[0]);
-        let _ = writeln!(
-            out,
-            "The recalled pages are read, not free: at `--max-files {}` the seeded run reads {} \
-             where the walk reads {}, because a seed's sections come back like any other reached \
-             page's. An agent that wants the recall pays for it either way — this is the same \
-             trade as the threshold sweep, made against links instead of scent.",
-            self.budgets[0],
-            sum(seeded, |run| run.score.read_tokens),
-            sum(plain, |run| run.score.read_tokens),
-        );
-        let _ = writeln!(out);
-    }
-
-    /// Which wanted pages no walk returned.
+    /// The pages links cannot reach: a walk follows links, so a page nothing
+    /// links to is never reached however relevant it is, and these are the
+    /// wanted ones no walk returned.
     fn never_reached(&self, out: &mut String) {
+        let _ = writeln!(out, "## The pages links cannot reach");
+        let _ = writeln!(out);
         let wide = self.widest();
-        let (_, plain) = self.at_budget(wide);
-        let (_, seeded) = self.seeded_at(wide);
-        let missed = |runs: &[Run]| -> usize { runs.iter().map(|run| run.score.missed()).sum() };
+        let (_, runs) = self.at_budget(wide);
+        let missed: usize = runs.iter().map(|run| run.score.missed()).sum();
         let _ = writeln!(
             out,
-            "Wanted pages no walk reached at `--max-files {wide}`: {} query/page pairs missed \
-             without seeding, {} with it.",
-            missed(plain),
-            missed(seeded),
+            "Wanted pages no walk reached at `--max-files {wide}`: {missed} query/page pairs missed."
         );
         let _ = writeln!(out);
-        if missed(plain) == 0 {
+        if missed == 0 {
             return;
         }
         head(out, &["Query", "Wanted but not returned"]);
-        for (plain, seeded) in plain.iter().zip(seeded) {
-            if plain.score.missed() == 0 {
+        for run in runs {
+            if run.score.missed() == 0 {
                 continue;
             }
-            let Some(wanted) = self.query(&plain.id).map(Query::expected) else {
+            let Some(wanted) = self.query(&run.id).map(Query::expected) else {
                 continue;
             };
-            let returned = seeded.returned();
             let missing = wanted
                 .iter()
-                .filter(|page| !plain.returned().contains(page.as_path()))
-                .map(|page| {
-                    format!(
-                        "`{}`{}",
-                        page.display(),
-                        match returned.contains(page.as_path()) {
-                            true => " — seeding reaches it",
-                            false => "",
-                        }
-                    )
-                })
+                .filter(|page| !run.returned().contains(page.as_path()))
+                .map(|page| format!("`{}`", page.display()))
                 .collect::<Vec<_>>()
                 .join(", ");
-            row(out, &[format!("`{}`", plain.id), missing]);
+            row(out, &[format!("`{}`", run.id), missing]);
         }
         let _ = writeln!(out);
     }
@@ -2058,13 +2071,6 @@ impl Findings {
 
     fn grep_at(&self, budget: usize) -> &(usize, Vec<Run>) {
         self.grep
-            .iter()
-            .find(|(at, _)| *at == budget)
-            .expect("a measured budget")
-    }
-
-    fn seeded_at(&self, budget: usize) -> &(usize, Vec<Run>) {
-        self.seeded
             .iter()
             .find(|(at, _)| *at == budget)
             .expect("a measured budget")

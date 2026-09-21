@@ -13,26 +13,17 @@
 //! - The plan's `Output` section: the query, the criterion the answers were
 //!   judged against, how many files were visited and how many calls they cost,
 //!   and one entry per visited file with its relevance, the scent of the link
-//!   that reached it, the `via` path, whether it entered the walk as a keyword
-//!   seed, the line ranges worth reading and the outgoing links that were
-//!   judged.
+//!   that reached it, the `via` path, the line ranges worth reading and the
+//!   outgoing links that were judged.
 //! - Sorted by relevance descending, then path. Every path is spelled the way
 //!   the caller spelled its entry files, so `--root wiki` with `wiki/index.md`
 //!   reads `wiki/payments/cutoffs.md` and not `payments/cutoffs.md`. That is
 //!   the spelling the plan's example uses, and the one a caller can hand
 //!   straight back to an editor or another command.
 //! - Sections are the parser's ranges and the model's scores, most useful
-//!   first, with the ones below `section_threshold` left out. A section's range
+//!   first, with the ones below `threshold` left out. A section's range
 //!   contains its subsections', so a caller that reads a returned range has
 //!   read everything returned inside it.
-//!
-//! `--seed-grep` adds the query's keyword hits under the root to the frontier as
-//! extra entry files ([`crate::seed`]), and `--seed-count` says how many. A seed
-//! walks exactly like an entry file, and the reading list says which results
-//! they are with `seeded`. The caller's own entry files are left out of the
-//! hits: they are on the frontier already. Seeding changes nothing about the
-//! exit codes — a seeded run whose links all fell below the threshold still
-//! exits 1, with its seeds in the list.
 //!
 //! What the exit code is:
 //!
@@ -58,7 +49,6 @@ use crate::cache::{Cacheable, CachedScorer};
 use crate::ignore::{Ignore, IgnoreError};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
-use crate::seed;
 use crate::traverse::{
     Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
 };
@@ -66,8 +56,9 @@ use crate::traverse::{
 /// One run's inputs: the flags the CLI carries, with their defaults applied.
 ///
 /// Nothing here has a default of its own. The plan's defaults — `--max-files`
-/// 25, `--max-depth` 6, `--threshold` 0.6, `--fanout` 8, `--root` the first
-/// entry file's directory — belong to the flags that carry them.
+/// 25, `--max-depth` 6, `--threshold` 0.6, `--root` the first entry file's
+/// directory — belong to the flags that carry them; the round size is the
+/// constant `main.rs` hands the walk.
 #[derive(Debug, Clone)]
 pub struct Options {
     /// What the reading list should be useful for, in the asker's own words.
@@ -85,20 +76,9 @@ pub struct Options {
     pub max_depth: usize,
     /// Least link scent that queues a target.
     pub threshold: f64,
-    /// Least section score the reading list keeps. A section the model scored
-    /// below this is dropped from its file's `sections`.
-    ///
-    /// Nothing here has a default of its own: the CLI's `--section-threshold`
-    /// defaults to whatever `--threshold` is, the way the plan's flag table
-    /// says.
-    pub section_threshold: f64,
-    /// Frontier files expanded per round.
+    /// Frontier files expanded per round. The CLI has no flag for it; `main.rs`
+    /// sets it from the plan's constant.
     pub fanout: usize,
-    /// Most keyword hits `--seed-grep` adds as extra entry files under the
-    /// root, or `None` when seeding is off, which is the default. The entry
-    /// files are left out of the hits: they are on the frontier already, so a
-    /// hit on one of them is not an extra entry point.
-    pub seed_grep: Option<usize>,
     /// The criterion the answers were judged against, as the reading list
     /// reports it: the mode's name (`about`, `useful-for`, `answers`), or the
     /// criteria file's path when `--criteria` named one. The scorer is what
@@ -259,12 +239,9 @@ pub struct RankedFile {
     /// The files on the best path to this one, in order and excluding it; empty
     /// for an entry file.
     pub via: Vec<String>,
-    /// Whether this file entered the walk as a `--seed-grep` keyword seed
-    /// rather than as an entry file the caller named or along a link.
-    pub seeded: bool,
-    /// The file's heading sections that cleared `--section-threshold`, most
-    /// useful first and ties broken by the file's own order, each with the line
-    /// range to read.
+    /// The file's heading sections that cleared `threshold`, most useful first
+    /// and ties broken by the file's own order, each with the line range to
+    /// read.
     ///
     /// This is where the caller reads from: the range is the parser's, so the
     /// lines named are the text that was scored, and a section's range contains
@@ -351,7 +328,7 @@ pub enum Error {
 /// The root's `.s1mignore` is read first, and it is what the whole run is
 /// bounded by: an entry file the caller names that matches is
 /// [`Error::Ignored`] rather than a read, and nothing else the walk touches —
-/// a link target, a keyword hit, a link preview — is read if it matches
+/// a link target, a link preview — is read if it matches
 /// ([`crate::ignore`]).
 pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Error> {
     if options.query.trim().is_empty() {
@@ -372,15 +349,9 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         parse::parse(entry, &root)?;
     }
 
-    let seeds = match options.seed_grep {
-        Some(count) => seed::seed(&root, &options.query, count, &options.entries, &ignore),
-        None => Vec::new(),
-    };
-
     let config = Config {
         query: &options.query,
         entries: &options.entries,
-        seeds: &seeds,
         root: &root,
         max_files: options.max_files,
         max_depth: options.max_depth,
@@ -416,8 +387,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
             relevance: file.relevance,
             scent: file.scent,
             via: file.via.iter().map(|via| display(&root, via)).collect(),
-            seeded: file.seeded,
-            sections: ranked_sections(&file.sections, options.section_threshold),
+            sections: ranked_sections(&file.sections, options.threshold),
             links: file
                 .links
                 .into_iter()
@@ -628,9 +598,7 @@ mod tests {
             max_files: 25,
             max_depth: 6,
             threshold: 0.6,
-            section_threshold: 0.6,
             fanout: 8,
-            seed_grep: None,
             mode: "useful-for".to_string(),
         }
     }
@@ -660,7 +628,6 @@ mod tests {
                         "relevance": 0.9,
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md", "tests/fixtures/cli/next.md"],
-                        "seeded": false,
                         "sections": [
                             {"heading": "Deep", "lines": [1, 3], "score": 0.9},
                         ],
@@ -671,7 +638,6 @@ mod tests {
                         "relevance": 0.9,
                         "scent": 0.9,
                         "via": ["tests/fixtures/cli/entry.md"],
-                        "seeded": false,
                         "sections": [
                             {"heading": "Next", "lines": [1, 3], "score": 0.9},
                         ],
@@ -688,7 +654,6 @@ mod tests {
                         "relevance": 0.3,
                         "scent": null,
                         "via": [],
-                        "seeded": false,
                         "sections": [
                             {"heading": "Entry", "lines": [1, 4], "score": 0.9},
                         ],

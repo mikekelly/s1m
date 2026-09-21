@@ -11,7 +11,6 @@ pub mod ignore;
 pub mod jev;
 pub mod parse;
 pub mod scorer;
-pub mod seed;
 pub mod traverse;
 
 /// Test-only helpers shared by the unit tests in more than one module.

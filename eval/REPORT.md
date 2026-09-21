@@ -8,17 +8,17 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 | Gold set | `eval/gold/llm-wiki-manager.json` — 20 queries |
 | Model | jev-1.13.0 |
 | Price | $0.042 per million input tokens, output free |
-| Walk | `--threshold` 0.6, `--max-depth` 6, `--fanout` 8 |
+| Walk | `--threshold` 0.6, `--max-depth` 6, 8 frontier files a round |
 | Answers | `eval/cache` |
-| Requests | 879 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
-| Cost | $0.018798 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.197416 |
+| Requests | 561 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
+| Cost | $0.018798 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.121765 |
 
 ## Headline
 
 - **Recall and precision at `--max-files 10`**: mean recall 0.67, mean precision 0.27 — 23 of the 39 wanted pages, over 83 files returned, 4.2 a query. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` returns 87 files for the same mean recall (0.67), so everything below is a statement about the link graph and the threshold, not about the budget.
-- **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.67, at 243070 tokens against 35245 — 6.9× the reading for 0.27 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader; `--seed-grep 5` on top of the walk is the middle, at recall 0.89 and 94790 tokens.
+- **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.67, at 243070 tokens against 35245 — 6.9× the reading for 0.27 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
 - **What an agent reads**: 35245 tokens for the returned ranges, against 72795 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 21% of the corpus's text; the section scores take 52% off that, and the ranking 90% off reading everything.
-- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.197416. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
+- **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.121765. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
 - **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.06 and reading +39%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.14 and reading -26%; 0.8: recall -0.31 and reading -69%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.37 of the time, the ones it passed over 0.11, and 69 links clear the threshold and are still not followed.
 - **The frontmatter earns its tokens**: dropping it from the preview costs 0.21 of recall (0.67 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.28. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
 
@@ -123,7 +123,7 @@ This report goes to stdout without `--out`, and `--out PATH` writes it to a file
 
 ## Against grep, and against reading the corpus
 
-The keyword baseline is the ranker `--seed-grep` uses, asked for the same number of hits and read whole: it is what a caller with grep and no model gets. Reading the corpus is the floor no ranking can beat on tokens, counted the way the rows above are — over every query, so reading all 19 pages once per query.
+The keyword baseline is the harness's own keyword ranker, asked for the same number of hits and read whole: it is what a caller with grep and no model gets. Reading the corpus is the floor no ranking can beat on tokens, counted the way the rows above are — over every query, so reading all 19 pages once per query.
 
 | Budget | s1m recall | s1m precision | s1m read (tok) | grep recall | grep precision | grep read (tok) |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -133,32 +133,21 @@ The keyword baseline is the ranker `--seed-grep` uses, asked for the same number
 
 Reading every page for every query finds every wanted page and reads 346160 tokens for the gold set, 9.8× s1m's returned ranges. The precision column is the wanted pages over the 19 pages there are, averaged over the queries: that is what an unranked reader reads.
 
-## Seeding, and the pages links cannot reach
+## The pages links cannot reach
 
-A walk follows links, so a page nothing links to is never reached at any budget. `--seed-grep 5` puts the query's keyword hits on the frontier beside the entry file, and the seeded run reads their sections like any other page's:
-
-| Budget | Configuration | Recall | Precision | Read (tok) | Cost |
-| --- | --- | --- | --- | --- | --- |
-| 10 | walk | 0.67 | 0.27 | 35245 | $0.018798 |
-| 10 | walk + `--seed-grep` | 0.89 | 0.21 | 94790 | $0.037446 |
-| 25 | walk | 0.67 | 0.27 | 40468 | $0.019640 |
-| 25 | walk + `--seed-grep` | 0.91 | 0.21 | 96821 | $0.038205 |
-
-The recalled pages are read, not free: at `--max-files 10` the seeded run reads 94790 where the walk reads 35245, because a seed's sections come back like any other reached page's. An agent that wants the recall pays for it either way — this is the same trade as the threshold sweep, made against links instead of scent.
-
-Wanted pages no walk reached at `--max-files 25`: 16 query/page pairs missed without seeding, 5 with it.
+Wanted pages no walk reached at `--max-files 25`: 16 query/page pairs missed.
 
 | Query | Wanted but not returned |
 | --- | --- |
-| `wiki-validation` | `concepts/dogfooding.md` — seeding reaches it |
-| `upgrade-preserves` | `concepts/dogfooding.md` — seeding reaches it, `concepts/template-system.md`, `entities/commands.md` |
-| `flat-entities` | `AGENTS.md` — seeding reaches it, `schema.md` — seeding reaches it |
-| `index-tables` | `AGENTS.md` — seeding reaches it, `concepts/wiki-scripts.md` — seeding reaches it |
-| `ingest-summary` | `AGENTS.md` — seeding reaches it, `schema.md` — seeding reaches it |
-| `raw-immutable` | `schema.md` — seeding reaches it |
+| `wiki-validation` | `concepts/dogfooding.md` |
+| `upgrade-preserves` | `concepts/dogfooding.md`, `concepts/template-system.md`, `entities/commands.md` |
+| `flat-entities` | `AGENTS.md`, `schema.md` |
+| `index-tables` | `AGENTS.md`, `concepts/wiki-scripts.md` |
+| `ingest-summary` | `AGENTS.md`, `schema.md` |
+| `raw-immutable` | `schema.md` |
 | `what-is-it` | `README.md` |
-| `template-vars` | `concepts/init-command.md` — seeding reaches it, `entities/templates.md` |
-| `wiki-log` | `AGENTS.md` — seeding reaches it, `log.md` |
+| `template-vars` | `concepts/init-command.md`, `entities/templates.md` |
+| `wiki-log` | `AGENTS.md`, `log.md` |
 
 ## Calibration: scent against arrival
 

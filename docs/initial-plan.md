@@ -89,7 +89,7 @@ the README's Custom criteria section.
 - A frontier entry's priority is its path score: the product of link scents along the best path found so far, so long chains of weak links fade out.
 - A link is queued only if its scent clears `--threshold`. A Noul near 0.5 means uncertain, not moderately relevant, so the default threshold sits above it, at the knee the evaluation found (0.6: see "Defaults from the evaluation").
 - A file reached by several paths keeps its best path score and is visited once.
-- Optional seeding: `--seed-grep` adds the top keyword hits as extra entry points, which recovers relevant pages that are orphaned or poorly linked.
+- ~~Optional seeding: `--seed-grep` adds the top keyword hits as extra entry points, which recovers relevant pages that are orphaned or poorly linked.~~ Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter.
 
 ### Caching
 
@@ -112,11 +112,11 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | `--criteria` | none | Path to a file whose whole content is the criterion, in place of `--mode`'s |
 | `--max-files` | 25 | Files visited before stopping |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Minimum link scent to queue a target |
-| `--section-threshold` | `--threshold` | Minimum section score to keep in the output |
-| `--fanout` | 8 | Frontier files expanded per round |
+| `--threshold` | 0.6 | Minimum link scent to queue a target, and minimum section score to keep in the output |
+| ~~`--section-threshold`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — sections rank at `--threshold`. |
+| ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
 | `--no-cache` | off | Ignore stored answers and call the model again |
-| `--seed-grep` | off | Add top keyword hits as extra entry points |
+| ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 | `--format` | `json` | `json`, `md` (reading list) or `tree` (annotated link tree for humans) |
 | `--root` | entry file's directory | Links resolving outside it are not followed |
 
@@ -130,8 +130,8 @@ flags above. No default moved:
 | --- | --- | --- |
 | `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.67 over 35245 read tokens, 0.5 lifts recall to 0.72 for +39% of the reading, 0.7 drops it to 0.53 for -26% and 0.8 to 0.36 for -69%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
 | `--max-files` | 25 | Not what binds on this corpus: 25 returns a mean recall of 0.67, the same as 10, over 87 files instead of 83 and 40468 read tokens instead of 35245. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
-| `--fanout` | 8 | Unmeasured: the eval never varied it. It bounds how many frontier files a round expands, so on a corpus this size it moves the round count rather than what clears the threshold |
-| `--seed-grep` | off | Off, as the plan had it: seeding lifts mean recall from 0.67 to 0.89 at `--max-files` 10 (0.91 at 25) and reads 94790 tokens against 35245 — 2.7× the reading for the pages links never reached, plus a keyword pass over every file under the root, per query. An agent that wants that recall asks for it |
+| ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
+| ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 
 Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.21 of
 recall (0.67 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.28 —
@@ -176,7 +176,7 @@ The tool description agents see should state plainly that s1m reads local files 
 
 | Risk | Effect | Mitigation |
 | --- | --- | --- |
-| Recall is bounded by link structure | Orphaned or weakly linked pages are never reached | `--seed-grep`; report unreachable files in a debug mode |
+| Recall is bounded by link structure | Orphaned or weakly linked pages are never reached | ~~`--seed-grep`; report unreachable files in a debug mode~~ Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 | Thresholds are not universal | Too high prunes good trails, too low wastes budget | Calibrated on a labelled wiki by the evaluation ([#12](https://github.com/mikekelly/s1m/issues/12)): 0.6 is the knee there, on 19 pages — a larger corpus is unmeasured |
 | Network dependency | Every cold run needs the TypeSafe API and a key | Cache aggressively; fail fast with a clear error; consider a grep-only fallback |
 | Content leaves the machine | Private wikis are sent to a third party | State it in the README; add an ignore file for sensitive paths |
@@ -217,7 +217,7 @@ Build a small gold set on a real wiki: 20 to 30 queries, each with the files a p
 | 1. Traversal | Frontier queue, budgets, visited set, JSON output, cache | A query on a real wiki returns a stable ranked list |
 | 2. Sections and modes | Per-section scores with line ranges, the three modes, custom criteria | An agent can read only the returned ranges and complete a task |
 | 3. Evaluation | Gold set, calibration curve, tuned default threshold, comparison against grep | Defaults are backed by numbers |
-| 4. Agent packaging | Help text and tool description, `md` and `tree` formats, `--seed-grep`, optional MCP wrapper | Installed and used by an agent with no extra prompting |
+| 4. Agent packaging | Help text and tool description, `md` and `tree` formats, ~~`--seed-grep`~~ (struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter), optional MCP wrapper | Installed and used by an agent with no extra prompting |
 
 ## Sources
 

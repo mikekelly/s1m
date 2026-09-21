@@ -31,8 +31,8 @@
 //! by path, which is what a caller reading top-down wants.
 //!
 //! `tree` is the walk's own order, as far as the reading list can carry it. The
-//! files no link reached — the entry files and the `--seed-grep` seeds — are the
-//! roots, by path, which is the order the frontier holds them at path score 1.
+//! files no link reached — the entry files — are the roots, by path, which is
+//! the order the frontier holds them at path score 1.
 //! Under a file, its judged links come in the order the frontier would have
 //! taken them: highest scent first, ties broken by path, which is [`crate`]'s
 //! own tie-break and total, so the tree never depends on the order answers
@@ -86,7 +86,7 @@ impl Format {
 /// heading to read from, in the order the caller should read them. The links
 /// the walk judged are [`tree`]'s, and the model's own numbers are the JSON's.
 ///
-/// A file with nothing above the section threshold says so rather than printing
+/// A file with nothing above the threshold says so rather than printing
 /// no sections at all, which would read as a file with no sections in it.
 fn md(list: &ReadingList) -> String {
     let mut out = String::new();
@@ -107,7 +107,7 @@ fn md(list: &ReadingList) -> String {
         let _ = writeln!(out, "{}", reached(file));
         let _ = writeln!(out);
         if file.sections.is_empty() {
-            let _ = writeln!(out, "- nothing above --section-threshold");
+            let _ = writeln!(out, "- nothing above --threshold");
         }
         for section in &file.sections {
             let _ = writeln!(out, "- {}", section_line(section));
@@ -156,32 +156,27 @@ fn tree(list: &ReadingList) -> String {
     out
 }
 
-/// What a root's line says about it: an entry file the caller named or a
-/// `--seed-grep` keyword seed, for the files no link reached.
+/// What a root's line says about it: an entry file the caller named, for the
+/// files no link reached.
 ///
 /// A result whose `via` names a file this list does not have is a root too —
-/// [`parent`] has no link to nest it under — and saying it was an entry file
-/// would be a provenance it does not have. It gets the line [`md`] prints for
-/// the same file instead: the relevance, the scent of the link that reached it
-/// and the path it came along.
+/// [`parent`] has no link to nest it under — and calling it an entry file would
+/// be a provenance it does not have. It gets the line [`md`] prints for the
+/// same file instead: the relevance, the scent of the link that reached it and
+/// the path it came along.
 fn root_line(root: &RankedFile) -> String {
     if !root.via.is_empty() {
         return reached(root);
     }
-    let entry = if root.seeded {
-        "keyword seed"
-    } else {
-        "entry file"
-    };
-    format!("{entry}; relevance {:.2}", root.relevance)
+    format!("entry file; relevance {:.2}", root.relevance)
 }
 
 /// One file's line, then the links it judged: a link this file followed to a
 /// target it reached nests that target's own subtree beneath it, and every
 /// other link is a line with nothing under it.
 ///
-/// `annotation` is the file's own line — its entry or seed or the scent of the
-/// link that reached it, plus its relevance — because the line a reached file
+/// `annotation` is the file's own line — its entry, or the scent of the link
+/// that reached it, plus its relevance — because the line a reached file
 /// is printed on *is* the link that reached it: one line per judged link, and
 /// one per visited file, as the plan asks.
 fn node(
@@ -248,8 +243,8 @@ fn child<'a>(
 /// The file a result's `via` path says reached it, when that file was visited
 /// and judges a followed link to it.
 ///
-/// A result with no such parent is a root of the tree: an entry file or a seed,
-/// which no link reached, and — for a reading list a caller built itself, or one
+/// A result with no such parent is a root of the tree: an entry file, which no
+/// link reached, and — for a reading list a caller built itself, or one
 /// whose walk reported a path it did not visit — a result that would otherwise
 /// be dropped from the tree rather than printed as a line of its own.
 fn parent<'a>(file: &RankedFile, index: &HashMap<&str, &'a RankedFile>) -> Option<&'a RankedFile> {
@@ -281,20 +276,12 @@ fn queued(file: &RankedFile) -> Vec<&RankedLink> {
 }
 
 /// What put a file in the reading list: the relevance the model gave it, and
-/// the link path that reached it — or, for a file no link reached, whether it
-/// was an entry file the caller named or a `--seed-grep` keyword seed.
+/// the link path that reached it — or, for a file no link reached, that it was
+/// an entry file the caller named.
 fn reached(file: &RankedFile) -> String {
     let mut line = format!("relevance {:.2}", file.relevance);
     if file.via.is_empty() {
-        let _ = write!(
-            line,
-            "; {}",
-            if file.seeded {
-                "keyword seed"
-            } else {
-                "entry file"
-            }
-        );
+        let _ = write!(line, "; entry file");
         return line;
     }
     if let Some(scent) = file.scent {
@@ -366,7 +353,6 @@ mod tests {
             relevance,
             scent: None,
             via: Vec::new(),
-            seeded: false,
             sections: Vec::new(),
             links: Vec::new(),
         }
@@ -380,16 +366,9 @@ mod tests {
             relevance,
             scent: Some(scent),
             via: reached_via.iter().map(|path| path.to_string()).collect(),
-            seeded: false,
             sections: Vec::new(),
             links: Vec::new(),
         }
-    }
-
-    /// The same file as a `--seed-grep` keyword seed.
-    fn seed(mut file: RankedFile) -> RankedFile {
-        file.seeded = true;
-        file
     }
 
     /// The same file with the sections a caller reads from.
@@ -464,7 +443,7 @@ relevance 0.62; entry file
 
     /// The list is what an agent reads and acts on, so it is titled with the
     /// query and says which criterion judged it and what the run cost — and a
-    /// file with nothing above the section threshold says that, rather than
+    /// file with nothing above the threshold says that, rather than
     /// printing as a file with no sections in it.
     #[test]
     fn md_says_when_no_section_cleared_the_threshold() {
@@ -481,7 +460,7 @@ Criterion: useful-for; 1 file visited, 1 call
 
 relevance 0.42; entry file
 
-- nothing above --section-threshold
+- nothing above --threshold
 "
         );
     }
@@ -582,13 +561,12 @@ wiki/index.md  entry file; relevance 0.62
         );
     }
 
-    /// The roots are what no link reached: the caller's entry files and the
-    /// `--seed-grep` hits, by path — the order the frontier holds them, all at
-    /// path score 1. A result whose `via` names no visited file is printed as a
-    /// root rather than dropped, which is what keeps the tree total for a
-    /// reading list a caller assembled itself — and it keeps the `via` and the
-    /// scent it does have, the way `md` prints them, rather than claiming a
-    /// provenance it does not.
+    /// The roots are what no link reached: the caller's entry files, by path —
+    /// the order the frontier holds them, all at path score 1. A result whose
+    /// `via` names no visited file is printed as a root rather than dropped,
+    /// which is what keeps the tree total for a reading list a caller assembled
+    /// itself — and it keeps the `via` and the scent it does have, the way `md`
+    /// prints them, rather than claiming a provenance it does not.
     #[test]
     fn tree_starts_from_every_file_no_link_reached() {
         let list = list(vec![
@@ -597,8 +575,8 @@ wiki/index.md  entry file; relevance 0.62
                 &[("wiki/notes/ledger.md", Some(0.31), false)],
             ),
             // Not in path order in the list, so the sort is what puts it first.
+            entry("wiki/index.md", 0.62),
             entry("wiki/payments/README.md", 0.81),
-            seed(entry("wiki/index.md", 0.62)),
         ]);
 
         assert_eq!(
@@ -606,7 +584,7 @@ wiki/index.md  entry file; relevance 0.62
             "\
 settlement timing (useful-for); 3 files visited, 3 calls
 
-wiki/index.md  keyword seed; relevance 0.62
+wiki/index.md  entry file; relevance 0.62
 wiki/notes/scratch.md  relevance 0.44; scent 0.90; via `wiki/absent.md`
   wiki/notes/ledger.md  pruned; scent 0.31
 wiki/payments/README.md  entry file; relevance 0.81

@@ -24,15 +24,14 @@ use s1m::jev::{self, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 
-/// The plan's defaults for the budgets, and the seed count
-/// [#14](https://github.com/mikekelly/s1m/issues/14) asks for. They live on the
-/// flags that carry them rather than in the library: nothing below the CLI has a
-/// default of its own.
+/// The plan's defaults for the budgets. They live on the flags that carry them
+/// rather than in the library: nothing below the CLI has a default of its own.
+/// [`FANOUT`] is the exception — the round size is the walk's, and the CLI has
+/// no flag for it, so this constant is where it is handed over.
 const MAX_FILES: usize = 25;
 const MAX_DEPTH: usize = 6;
 const THRESHOLD: f64 = 0.6;
 const FANOUT: usize = 8;
-const SEED_COUNT: usize = 5;
 
 /// The one paragraph that says what s1m is, for `--help`: the same wording the
 /// README opens with and `SKILL.md` carries, so a person or an agent that meets
@@ -61,9 +60,8 @@ The reading list goes to stdout as JSON by default: most relevant first, then
 by path, and every path in it spelled the way the entry files were. Each result
 carries the ranges worth reading: one entry per heading section, with the lines
 to read, the score it was judged at, and the sections below
---section-threshold left out. A result with a via path was reached along a
-link; one without is an entry file, and `seeded` says whether --seed-grep put
-it on the frontier.
+--threshold left out. A result with a via path was reached along a link; one
+without is an entry file.
 
 --format picks how that list is printed. json is the plan's shape, for a caller
 that parses it. md is the same list to read or paste: each file with the lines
@@ -80,9 +78,8 @@ reports the path as `mode`.
 
 A `.s1mignore` in the root holds the paths that are never read, in gitignore
 syntax (`private/`, `*.key.md`, `!keep.md`). A link whose target it matches is
-not sent to the model, not previewed and not followed; a page it matches is not
-seeded by --seed-grep; and an entry file it matches is an error rather than a
-silent read.
+not sent to the model, not previewed and not followed; and an entry file it
+matches is an error rather than a silent read.
 
 Exit codes:
   0  the walk reached files beyond the entry files
@@ -140,33 +137,10 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = MAX_DEPTH)]
     max_depth: usize,
 
-    /// Least link scent that queues a target, 0 to 1.
+    /// Least link scent that queues a target, 0 to 1. The sections the reading
+    /// list keeps are the ones that clear it too.
     #[arg(long, value_name = "SCENT", default_value_t = THRESHOLD, value_parser = threshold)]
     threshold: f64,
-
-    /// Least section score the reading list keeps, 0 to 1; a section below it is
-    /// left out. Defaults to --threshold.
-    #[arg(long, value_name = "SCORE", value_parser = threshold)]
-    section_threshold: Option<f64>,
-
-    /// Frontier files expanded per round.
-    #[arg(long, value_name = "N", default_value_t = FANOUT)]
-    fanout: usize,
-
-    /// Add the top keyword hits under the root as extra entry files, so pages
-    /// that are orphaned or weakly linked are still reached. The hits enter the
-    /// walk like entry files, and the reading list marks them with `seeded`.
-    #[arg(long)]
-    seed_grep: bool,
-
-    /// How many keyword hits `--seed-grep` adds.
-    #[arg(
-        long,
-        value_name = "N",
-        default_value_t = SEED_COUNT,
-        requires = "seed_grep"
-    )]
-    seed_count: usize,
 
     /// Call Jev for every file, ignoring the answers already on disk.
     #[arg(long)]
@@ -260,10 +234,6 @@ impl Cli {
     /// because the scorer is what carries the criterion; it is filled in once
     /// one has been built, from `--criteria`'s file when there is one and
     /// `--mode` otherwise.
-    ///
-    /// `--section-threshold` defaults to `--threshold`, which is the plan's
-    /// flag table and is resolved here because it is one flag's value standing
-    /// in for another's, not a constant.
     fn options(&self) -> Options {
         Options {
             query: self.query.clone().unwrap_or_default(),
@@ -272,9 +242,7 @@ impl Cli {
             max_files: self.max_files,
             max_depth: self.max_depth,
             threshold: self.threshold,
-            section_threshold: self.section_threshold.unwrap_or(self.threshold),
-            fanout: self.fanout,
-            seed_grep: self.seed_grep.then_some(self.seed_count),
+            fanout: FANOUT,
             mode: String::new(),
         }
     }
