@@ -3,10 +3,10 @@
 //!
 //! Runs cost money and take minutes, so the pass is resumable — and what it
 //! must not do is buy the same run twice. A run already recorded in this
-//! directory is not made again, and neither is one the [ledger](crate::ledger)
-//! says was bought and measured anywhere else on the machine. Before buying
-//! anything, the pass prices what it owes and stops when that is more than this
-//! harness spends without being told to.
+//! directory at the tier the pass asks for is not made again, and neither is one
+//! the [ledger](crate::ledger) says was bought and measured anywhere else on the
+//! machine. Before buying anything, the pass prices what it owes and stops when
+//! that is more than this harness spends without being told to.
 //!
 //! The rows are flushed one at a time for the same reason.
 
@@ -1616,6 +1616,10 @@ mod tests {
             // what a screening pass writes, and one run at two tiers is two
             // entries.
             listed(WIKI, "explore", Some("haiku"), Some(true)),
+            // A model recorded against a condition that takes none: this
+            // harness writes `s1m` entries with no model, so only a line from
+            // somewhere else looks like this, and it is still the s1m run.
+            listed(WIKI, "s1m", Some("haiku"), Some(true)),
         ]);
 
         // A run is read back at the model the pass asks for — held to the
@@ -1641,6 +1645,10 @@ mod tests {
         assert!(
             !known(Some("sonnet"), "explore"),
             "another model is another measurement"
+        );
+        assert!(
+            known(Some("haiku"), "s1m"),
+            "a model on a condition that takes none is not another s1m run"
         );
 
         // This directory's rows are its own record, and hold whatever revision
