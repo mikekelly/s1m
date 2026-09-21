@@ -128,13 +128,13 @@ flags above. No default moved:
 
 | Flag | Default | What the numbers say |
 | --- | --- | --- |
-| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.67 over 35245 read tokens, 0.5 lifts recall to 0.72 for +39% of the reading, 0.7 drops it to 0.53 for -26% and 0.8 to 0.36 for -69%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
-| `--max-files` | 25 | Not what binds on this corpus: 25 returns a mean recall of 0.67, the same as 10, over 87 files instead of 83 and 40468 read tokens instead of 35245. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
+| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.64 over 35245 read tokens, 0.5 lifts recall to 0.72 for +39% of the reading, 0.7 drops it to 0.47 for -26% and 0.8 to 0.33 for -69%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
+| `--max-files` | 25 | Not what binds on this corpus: 25 judges 87 files instead of 83 and returns 73 of them instead of 69, for the same mean recall of 0.64 and 40468 read tokens instead of 35245. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
 | ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
 | ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 
-Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.21 of
-recall (0.67 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.28 —
+Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.18 of
+recall (0.64 → 0.46) for -43% of the input tokens, and dropping previews altogether costs 0.26 —
 the frontmatter is the larger half of what a preview buys, `related:` being why (`eval/REPORT.md`,
 the preview experiment).
 
@@ -200,8 +200,8 @@ The tool description agents see should state plainly that s1m reads local files 
 - [ ] Python or TypeScript? Both have TypeSafe SDKs.
 - [x] Does a link preview (title plus first paragraph) improve scent enough to justify the extra
   tokens? **Yes, and the frontmatter is the larger half of it.** At `--max-files` 10 on the eval
-  wiki, dropping the frontmatter costs 0.21 of recall (0.67 → 0.46) for 43% of the input tokens
-  saved, and dropping previews altogether costs 0.28; on the hub page the frontmatter is what lifts
+  wiki, dropping the frontmatter costs 0.18 of recall (0.64 → 0.46) for 43% of the input tokens
+  saved, and dropping previews altogether costs 0.26; on the hub page the frontmatter is what lifts
   the links to two of the wanted pages over `--threshold`. `related:` making every page look
   connected is the opposite failure to the one [#10](https://github.com/mikekelly/s1m/issues/10)
   feared. Previews therefore ship whole, with no caller flag (`eval/REPORT.md`, the preview
