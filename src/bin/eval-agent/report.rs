@@ -343,7 +343,6 @@ mod tests {
             condition: condition.to_string(),
             repeat: 0,
             ok: true,
-            error: None,
             metrics: BTreeMap::from([
                 ("recall".to_string(), recall),
                 ("precision".to_string(), 0.5),
@@ -485,5 +484,23 @@ mod tests {
             report.contains("| Largest strongly connected component | 800 |"),
             "{report}"
         );
+    }
+
+    /// A condition that failed part way through a pass must say so: a mean
+    /// over the runs that worked, beside the count of the ones that did not.
+    #[test]
+    fn a_condition_that_failed_says_how_often() {
+        let mut failed = row("one", "how-to", "s1m", 0.0);
+        failed.ok = false;
+        failed.metrics.clear();
+        failed.detail = Some(serde_json::json!({"error": "s1m exited 2: /a/page.md"}));
+        let rows = vec![row("one", "how-to", "s1m", 1.0), failed];
+
+        let report = render(&aggregate(&rows), None, &method()).expect("a report");
+        assert!(report.contains("| `s1m` | 2 (1 failed) |"), "{report}");
+        // The run that failed is counted, not averaged: one good run of 1.00.
+        assert!(report.contains("| 2 (1 failed) | 1.00 |"), "{report}");
+        // And nothing from the failed row's raw half is in the report.
+        assert!(!report.contains("page.md"), "{report}");
     }
 }

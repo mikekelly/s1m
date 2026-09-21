@@ -25,11 +25,12 @@ pub const RAW: &str = "raw";
 /// What the cold s1m runs buy their judgments into, under `--out`.
 pub const COLD_CACHE: &str = "cold-cache";
 
-/// The parent agent's prompt. The query and the entry page are substituted in;
-/// nothing else about the wiki is.
+/// The parent agent's prompt. The query and the entry pages are substituted
+/// in; nothing else about the wiki is.
 pub const EXPLORE_PROMPT: &str = "\
 Use the Explore agent to answer this query from the wiki in the current \
-directory, starting at its entry page <entry>: <query>
+directory, starting at these pages: <entry>
+The query: <query>
 Reply with the answer, and then a JSON array of the relative paths of the files \
 the Explore agent relied on.";
 
@@ -57,7 +58,8 @@ pub struct Options {
     pub repeats: usize,
     pub conditions: Vec<String>,
     pub cache_dir: Option<PathBuf>,
-    pub entry: String,
+    /// The pages a query with no entry of its own starts from.
+    pub entry: Vec<String>,
     pub model: String,
     pub s1m: PathBuf,
     pub claude: PathBuf,
@@ -153,9 +155,12 @@ pub fn run(options: &Options) -> Result<(), String> {
         ..options.clone()
     };
     for condition in &options.conditions {
-        if !crate::row::CONDITIONS.contains(&condition.as_str()) {
+        if !crate::row::CONDITIONS.contains(&condition.as_str())
+            && threshold_of(condition).is_none()
+        {
             return Err(format!(
-                "no condition named {condition:?}: it is one of {}",
+                "no condition named {condition:?}: it is one of {}, or \
+                 `s1m-t<N>` for s1m at threshold N",
                 crate::row::CONDITIONS.join(", ")
             ));
         }
@@ -238,10 +243,16 @@ pub fn method(options: &Options) -> Method {
 fn measure(options: &Options, query: &Query, job: &Job, rows: &[Row]) -> Row {
     let outcome = match job.condition.as_str() {
         "explore" => explore_condition(options, query, job),
-        "s1m" => s1m_condition(options, query, job, false),
-        "s1m-cold" => s1m_condition(options, query, job, true),
+        "s1m" => s1m_condition(options, query, job, false, None),
+        "s1m-cold" => s1m_condition(options, query, job, true, None),
         "s1m-agent" => s1m_agent_condition(options, query, job, rows),
-        other => Err(format!("no condition named {other:?}")),
+        other => match threshold_of(other) {
+            // A threshold variant is s1m at its defaults but one, warm: the
+            // report shows it beside the defaults, and nothing is bought twice
+            // to get it.
+            Some(threshold) => s1m_condition(options, query, job, false, Some(threshold)),
+            None => Err(format!("no condition named {other:?}")),
+        },
     };
     match outcome {
         Ok((metrics, detail)) => Row {
@@ -250,10 +261,13 @@ fn measure(options: &Options, query: &Query, job: &Job, rows: &[Row]) -> Row {
             condition: job.condition.clone(),
             repeat: job.repeat,
             ok: true,
-            error: None,
             metrics,
             detail: Some(detail),
         },
+        // A run that failed is a row with no metrics: nothing is averaged from
+        // it, and what went wrong goes in the raw half with everything else
+        // that may name a file — an API error quotes the request that caused
+        // it, and a process error quotes its own stderr.
         Err(error) => {
             eprintln!("eval-agent: {} {}: {error}", query.id, job.condition);
             Row {
@@ -262,9 +276,8 @@ fn measure(options: &Options, query: &Query, job: &Job, rows: &[Row]) -> Row {
                 condition: job.condition.clone(),
                 repeat: job.repeat,
                 ok: false,
-                error: Some(error),
                 metrics: BTreeMap::new(),
-                detail: None,
+                detail: Some(serde_json::json!({ "error": error })),
             }
         }
     }
@@ -275,9 +288,9 @@ type Measured = (BTreeMap<String, f64>, serde_json::Value);
 /// The Explore condition: a parent agent that hands the query to the built-in
 /// Explore subagent, measured on the subagent's own tokens.
 fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Measured, String> {
-    let entry = query.entry(&options.entry);
+    let entries = query.entries(&options.entry);
     let prompt = EXPLORE_PROMPT
-        .replace("<entry>", entry)
+        .replace("<entry>", &entries.join(", "))
         .replace("<query>", &query.query);
     let agent = agent_run(options, query, job, &prompt, EXPLORE_TOOLS)?;
 
@@ -322,8 +335,9 @@ fn s1m_condition(
     query: &Query,
     job: &Job,
     cold: bool,
+    threshold: Option<f64>,
 ) -> Result<Measured, String> {
-    let entry = query.entry(&options.entry);
+    let entries = query.entries(&options.entry);
     // A cold run buys every judgment, and buys it into a cache directory of its
     // own so that what it spent can be read back afterwards: `--no-cache`
     // stores nothing, and s1m's JSON reports the calls it made but not the
@@ -340,17 +354,26 @@ fn s1m_condition(
             .unwrap_or_else(|| options.out.join("cache"))
     };
     fs::create_dir_all(&cache).map_err(|error| format!("{}: {error}", cache.display()))?;
+    // What the cache already holds: whatever is there afterwards and was not
+    // here before is what this run bought, and the only place its tokens are
+    // written down.
+    let before = judgments(&cache);
 
     let stdout = raw_path(options, query, job, "json");
     let stderr = raw_path(options, query, job, "stderr");
-    let mut arguments = vec![
-        query.query.clone(),
-        entry.to_string(),
+    let mut arguments = vec![query.query.clone()];
+    // s1m takes the entry files as its positional arguments, after the query.
+    arguments.extend(entries.iter().map(|entry| entry.to_string()));
+    arguments.extend([
         "--root".to_string(),
         ".".to_string(),
         "--format".to_string(),
         "json".to_string(),
-    ];
+    ]);
+    if let Some(threshold) = threshold {
+        arguments.push("--threshold".to_string());
+        arguments.push(threshold.to_string());
+    }
     // The gold set says what relevance means for a query, and s1m takes it.
     if let Some(mode) = &query.mode {
         arguments.push("--mode".to_string());
@@ -387,28 +410,33 @@ fn s1m_condition(
     metrics.insert("agent_read_tokens".to_string(), list.read_tokens as f64);
     metrics.insert("wall_ms".to_string(), wall.as_millis() as f64);
     metrics.insert("jev_calls".to_string(), list.calls as f64);
+    // A warm run usually buys nothing, and then this is zero; a warm run at
+    // another threshold walks somewhere the cache has not been, and what it
+    // bought there is real money and is counted.
+    let spent = jev_spent(&cache, &before);
+    metrics.insert("jev_input_tokens".to_string(), spent.0 as f64);
+    metrics.insert("jev_output_tokens".to_string(), spent.1 as f64);
+    metrics.insert("jev_cost_usd".to_string(), spent.2);
+    metrics.insert("cost_usd".to_string(), spent.2);
+    if let Some(threshold) = threshold {
+        metrics.insert("threshold".to_string(), threshold);
+    }
     if cold {
-        let spent = jev_spent(&cache);
-        metrics.insert("jev_input_tokens".to_string(), spent.0 as f64);
-        metrics.insert("jev_output_tokens".to_string(), spent.1 as f64);
-        metrics.insert("jev_cost_usd".to_string(), spent.2);
-        metrics.insert("cost_usd".to_string(), spent.2);
         // A cold run is the only one that leaves the shared cache able to serve
         // the warm run that follows it.
         if let Some(shared) = &options.cache_dir {
             merge_cache(&cache, shared);
         }
-    } else {
-        metrics.insert("cost_usd".to_string(), 0.0);
     }
 
     Ok((
         metrics,
         serde_json::json!({
             "query": query.query,
-            "entry": entry,
+            "entry": entries,
             "command": arguments,
             "cold": cold,
+            "threshold": threshold,
             "files": list.files,
             "wanted": query.wanted,
             "read_chars": list.read_chars,
@@ -616,6 +644,16 @@ fn transcript_path(options: &Options, session: &str, agent: &str) -> Option<Path
     None
 }
 
+/// The threshold a condition names, or `None` when it names none.
+///
+/// `s1m-t0.4` is s1m at its defaults but `--threshold 0.4`. The report shows it
+/// as its own condition, which is why the threshold is in the name: one run
+/// directory can hold several, and each is averaged on its own.
+pub fn threshold_of(condition: &str) -> Option<f64> {
+    let value: f64 = condition.strip_prefix("s1m-t")?.parse().ok()?;
+    (0.0..=1.0).contains(&value).then_some(value)
+}
+
 /// Recall and precision of `returned` against `wanted`, under a name prefix.
 fn score(
     metrics: &mut BTreeMap<String, f64>,
@@ -655,15 +693,30 @@ fn tokens(metrics: &mut BTreeMap<String, f64>, prefix: &str, usage: Usage) {
     );
 }
 
-/// What the judgments in one cache directory cost: input tokens, output tokens
+/// The judgments a cache directory holds, by name. The names are the hashes of
+/// the requests that produced them, so a name that was not there before a run
+/// is an answer that run bought.
+fn judgments(cache: &Path) -> BTreeSet<std::ffi::OsString> {
+    fs::read_dir(cache.join("judgments"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect()
+}
+
+/// What the judgments bought since `before` cost: input tokens, output tokens
 /// and the input at the list price.
-fn jev_spent(cache: &Path) -> (u64, u64, f64) {
+fn jev_spent(cache: &Path, before: &BTreeSet<std::ffi::OsString>) -> (u64, u64, f64) {
     let mut input = 0;
     let mut output = 0;
     let Ok(entries) = fs::read_dir(cache.join("judgments")) else {
         return (0, 0, 0.0);
     };
     for entry in entries.flatten() {
+        if before.contains(&entry.file_name()) {
+            continue;
+        }
         let Ok(text) = fs::read_to_string(entry.path()) else {
             continue;
         };
@@ -802,7 +855,6 @@ mod tests {
             condition: "explore".to_string(),
             repeat: 0,
             ok: true,
-            error: None,
             metrics: BTreeMap::from([("recall".to_string(), 1.0)]),
             detail: Some(serde_json::json!({"query": "q"})),
         };
@@ -812,6 +864,115 @@ mod tests {
         assert_eq!(
             read_rows(out.path()).expect("two rows"),
             vec![row.clone(), row]
+        );
+    }
+
+    /// `s1m-t0.4` is s1m at threshold 0.4. Anything else that starts the same
+    /// way is not a condition, and saying so beats running the defaults under
+    /// a name that claims otherwise.
+    #[test]
+    fn a_condition_can_name_a_threshold() {
+        assert_eq!(threshold_of("s1m-t0.4"), Some(0.4));
+        assert_eq!(threshold_of("s1m-t0"), Some(0.0));
+        assert_eq!(threshold_of("s1m-t1"), Some(1.0));
+        assert_eq!(threshold_of("s1m"), None);
+        assert_eq!(threshold_of("s1m-cold"), None);
+        assert_eq!(threshold_of("s1m-tlow"), None);
+        // A scent is 0 to 1, so a threshold outside it names nothing.
+        assert_eq!(threshold_of("s1m-t1.5"), None);
+        assert_eq!(threshold_of("s1m-t-0.2"), None);
+    }
+
+    /// Only what a run bought is counted: a cache that already held an answer
+    /// was paid for by whoever bought it first.
+    #[test]
+    fn only_the_judgments_a_run_bought_are_counted() {
+        let cache = TempDir::new("jev");
+        let judgment = |input: u64, output: u64| {
+            format!(
+                r#"{{"format":3,"judgment":{{}},"detail":{{"input_tokens":{input},"output_tokens":{output}}}}}"#
+            )
+        };
+        cache.write("judgments/old.json", &judgment(1000, 10));
+        let before = judgments(cache.path());
+        cache.write("judgments/new.json", &judgment(5000, 300));
+
+        let (input, output, cost) = jev_spent(cache.path(), &before);
+        assert_eq!((input, output), (5000, 300));
+        // 5000 input tokens at the list price in `src/jev.rs`.
+        assert!((cost - 5000.0 / 1_000_000.0 * s1m::jev::PRICE_PER_MTOK).abs() < 1e-12);
+
+        // Nothing bought is nothing owed.
+        let after = judgments(cache.path());
+        assert_eq!(jev_spent(cache.path(), &after), (0, 0, 0.0));
+    }
+
+    /// s1m can fail part way through a walk — a judgment the API refuses is
+    /// exit 2 with the reason on stderr. That run is a row with no metrics and
+    /// its reason in the raw half, never in the numbers: an API error quotes
+    /// the request that caused it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_run_is_a_row_with_no_metrics_and_its_reason_in_detail() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let wiki = TempDir::new("failed-wiki");
+        wiki.write("index.md", "# Index\n");
+        let out = TempDir::new("failed-out");
+        let fake = TempDir::new("failed-s1m");
+        fake.write(
+            "s1m",
+            "#!/bin/sh\necho 's1m: /a/page.md could not be judged: max_tokens_exceeded' >&2\nexit 2\n",
+        );
+        let binary = fake.path().join("s1m");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("an executable");
+
+        let options = Options {
+            wiki: wiki.path().to_path_buf(),
+            gold: PathBuf::new(),
+            out: out.path().to_path_buf(),
+            repeats: 1,
+            conditions: vec!["s1m".to_string()],
+            cache_dir: None,
+            entry: vec!["index.md".to_string()],
+            model: "sonnet".to_string(),
+            s1m: binary,
+            claude: PathBuf::from("claude"),
+            transcripts: None,
+            cold_repeats: 0,
+            queries: Vec::new(),
+            timeout: Duration::from_secs(30),
+        };
+        fs::create_dir_all(out.path().join(RAW)).expect("a raw directory");
+        let query = &gold().queries[0];
+        let job = Job {
+            query: 0,
+            condition: "s1m".to_string(),
+            repeat: 0,
+        };
+
+        let row = measure(&options, query, &job, &[]);
+        assert!(!row.ok);
+        assert!(row.metrics.is_empty(), "{:?}", row.metrics);
+        let reason = row.detail.as_ref().expect("the raw half")["error"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+        assert!(reason.contains("s1m exited 2"), "{reason}");
+        assert!(reason.contains("max_tokens_exceeded"), "{reason}");
+
+        // And it is a run that has happened: a resumed pass does not pay for
+        // it again.
+        append(out.path(), &row).expect("a row");
+        let done: BTreeSet<(String, String, usize)> = read_rows(out.path())
+            .expect("one row")
+            .iter()
+            .map(Row::key)
+            .collect();
+        assert!(
+            pending(&gold(), &options.conditions, 1, 0, &done)
+                .iter()
+                .all(|job| job.query != 0)
         );
     }
 }

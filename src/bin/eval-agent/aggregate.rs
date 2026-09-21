@@ -164,7 +164,6 @@ mod tests {
             condition: condition.to_string(),
             repeat,
             ok: true,
-            error: None,
             metrics: BTreeMap::from([("recall".to_string(), recall)]),
             detail: Some(serde_json::json!({"query": "the query text"})),
         }
@@ -205,8 +204,8 @@ mod tests {
     fn a_failed_run_is_counted_but_never_averaged() {
         let mut failed = row("one", "how-to", "explore", 1, 0.0);
         failed.ok = false;
-        failed.error = Some("the agent timed out".to_string());
         failed.metrics.clear();
+        failed.detail = Some(serde_json::json!({"error": "the agent timed out"}));
         let rows = vec![row("one", "how-to", "explore", 0, 1.0), failed];
 
         let explore = &aggregate(&rows).conditions["explore"];

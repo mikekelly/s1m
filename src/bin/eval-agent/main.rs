@@ -74,9 +74,10 @@ struct RunArgs {
     /// directory under --out.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
-    /// The page a query with no `entry` of its own starts from.
-    #[arg(long, default_value = "index.md")]
-    entry: String,
+    /// The page a query with no `entry` of its own starts from. Repeat it for
+    /// a wiki with several ways in; the default is the `index.md` convention.
+    #[arg(long, default_values_t = [String::from("index.md")])]
+    entry: Vec<String>,
     /// The model the agent runs on.
     #[arg(long, default_value = "sonnet")]
     model: String,
@@ -114,10 +115,12 @@ enum Command {
         #[arg(long)]
         out: PathBuf,
         /// The page depth is measured from, relative to the wiki root, for a
-        /// wiki whose root holds neither `index.md` nor `README.md`. The
-        /// report says only that an entry page was given, never which.
+        /// wiki whose root holds neither `index.md` nor `README.md`. Repeat it
+        /// for a wiki with several ways in: every one of them is at depth
+        /// zero. The report says only that an entry page was given, never
+        /// which.
         #[arg(long)]
-        entry: Option<String>,
+        entry: Vec<String>,
     },
     /// Every query under every condition, one JSONL row a run.
     Run(RunArgs),
@@ -146,7 +149,7 @@ fn main() {
 
 fn dispatch(command: Command) -> Result<(), String> {
     match command {
-        Command::GraphStats { wiki, out, entry } => graph_stats(&wiki, &out, entry.as_deref()),
+        Command::GraphStats { wiki, out, entry } => graph_stats(&wiki, &out, &entry),
         Command::Run(RunArgs {
             wiki,
             gold,
@@ -193,7 +196,7 @@ fn beside_me() -> PathBuf {
 fn graph_stats(
     wiki: &std::path::Path,
     out: &std::path::Path,
-    entry: Option<&str>,
+    entry: &[String],
 ) -> Result<(), String> {
     let stats = graph::collect(wiki, entry)?;
     std::fs::create_dir_all(out).map_err(|error| format!("{}: {error}", out.display()))?;

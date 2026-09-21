@@ -32,9 +32,10 @@ pub struct Query {
     pub category: Option<String>,
     /// The query, in the words the caller would use.
     pub query: String,
-    /// The page a caller would start from, relative to the wiki root.
+    /// The page or pages a caller would start from, relative to the wiki
+    /// root. A wiki need not have one way in, and a walk takes a set.
     #[serde(default)]
-    pub entry: Option<String>,
+    pub entry: Option<Entries>,
     /// What relevance means for it: `about`, `useful-for` or `answers`. s1m is
     /// run under it; the agent conditions have no such flag.
     #[serde(default)]
@@ -45,16 +46,38 @@ pub struct Query {
     pub wanted: Vec<String>,
 }
 
+/// One entry page or several: a gold set may spell either, because most wikis
+/// have one way in and some have several.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Entries {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl Entries {
+    fn pages(&self) -> Vec<&str> {
+        match self {
+            Entries::One(page) => vec![page.as_str()],
+            Entries::Many(pages) => pages.iter().map(String::as_str).collect(),
+        }
+    }
+}
+
 impl Query {
     /// The category this query is grouped under.
     pub fn category(&self) -> &str {
         self.category.as_deref().unwrap_or(UNCATEGORISED)
     }
 
-    /// The page the walk starts from: the query's own, else the default the
+    /// The pages the walk starts from: the query's own, else the ones the
     /// caller passed.
-    pub fn entry<'a>(&'a self, fallback: &'a str) -> &'a str {
-        self.entry.as_deref().unwrap_or(fallback)
+    pub fn entries<'a>(&'a self, fallback: &'a [String]) -> Vec<&'a str> {
+        let named = self.entry.as_ref().map(Entries::pages).unwrap_or_default();
+        if named.is_empty() {
+            return fallback.iter().map(String::as_str).collect();
+        }
+        named
     }
 
     /// The pages this query wants, deduplicated.
@@ -134,7 +157,10 @@ mod tests {
             BTreeSet::from([PathBuf::from("a.md")])
         );
         assert_eq!(old.queries[0].category(), UNCATEGORISED);
-        assert_eq!(old.queries[0].entry("fallback.md"), "index.md");
+        assert_eq!(
+            old.queries[0].entries(&["fallback.md".to_string()]),
+            vec!["index.md"]
+        );
 
         let new = load(
             r#"{"queries": [{"id": "one", "category": "how-to", "query": "q",
@@ -143,13 +169,19 @@ mod tests {
         )
         .expect("the private spelling");
         assert_eq!(new.queries[0].category(), "how-to");
-        assert_eq!(new.queries[0].entry("fallback.md"), "docs/start.md");
+        assert_eq!(
+            new.queries[0].entries(&["fallback.md".to_string()]),
+            vec!["docs/start.md"]
+        );
         assert_eq!(new.queries[0].wanted().len(), 2);
 
         // A query with no entry of its own takes the caller's default.
         let bare = load(r#"{"queries": [{"id": "one", "query": "q", "wanted": ["a.md"]}]}"#)
             .expect("the smallest gold set that means anything");
-        assert_eq!(bare.queries[0].entry("fallback.md"), "fallback.md");
+        assert_eq!(
+            bare.queries[0].entries(&["fallback.md".to_string()]),
+            vec!["fallback.md"]
+        );
     }
 
     #[test]
@@ -184,5 +216,50 @@ mod tests {
         // Naming nothing keeps everything.
         gold.only(&[]).expect("no filter");
         assert_eq!(gold.queries.len(), 2);
+    }
+
+    /// A wiki need not have one way in. A query may name several entry pages,
+    /// as one string or as an array, and a query that names none takes the
+    /// caller's.
+    #[test]
+    fn a_query_may_name_a_set_of_entry_pages() {
+        let one = load(
+            r#"{"queries": [{"id": "a", "query": "q", "entry": "index.md",
+            "wanted": ["a.md"]}]}"#,
+        )
+        .expect("one entry page");
+        assert_eq!(one.queries[0].entries(&fallback()), vec!["index.md"]);
+
+        let many = load(
+            r#"{"queries": [{"id": "a", "query": "q",
+            "entry": ["docs/start.md", "ops/start.md"], "wanted": ["a.md"]}]}"#,
+        )
+        .expect("two entry pages");
+        assert_eq!(
+            many.queries[0].entries(&fallback()),
+            vec!["docs/start.md", "ops/start.md"]
+        );
+
+        let none = load(r#"{"queries": [{"id": "a", "query": "q", "wanted": ["a.md"]}]}"#)
+            .expect("no entry page of its own");
+        assert_eq!(
+            none.queries[0].entries(&fallback()),
+            vec!["one.md", "two.md"]
+        );
+
+        // A query whose entry is an empty array names none of its own.
+        let empty = load(
+            r#"{"queries": [{"id": "a", "query": "q", "entry": [],
+            "wanted": ["a.md"]}]}"#,
+        )
+        .expect("an empty set");
+        assert_eq!(
+            empty.queries[0].entries(&fallback()),
+            vec!["one.md", "two.md"]
+        );
+    }
+
+    fn fallback() -> Vec<String> {
+        vec!["one.md".to_string(), "two.md".to_string()]
     }
 }

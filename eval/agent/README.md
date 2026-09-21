@@ -73,9 +73,12 @@ The format the existing `eval` binary reads, plus a `category`:
   both binaries read one file, because each ignores the fields it does not
   know. `eval/gold/llm-wiki-manager.json` carries categories and still
   reproduces the older `eval` report byte for byte.
-- `entry` is per query and is the page the walk starts from. A query without
-  one falls back to `--entry`, which defaults to `index.md`. A wiki with no
-  page of that name must set one or the other.
+- `entry` is per query and is the page the walk starts from. It may be one
+  path or an array of them — a wiki need not have one way in — and a query
+  without it falls back to `--entry`, which defaults to `index.md` and may be
+  repeated. A wiki with no page of that name must set one or the other. s1m
+  takes the whole set as its entry files, and the Explore prompt names them
+  all as the pages to start from.
 - `mode` is passed to s1m as `--mode`; the agent conditions have no such flag.
 
 ## The conditions
@@ -85,6 +88,7 @@ The format the existing `eval` binary reads, plus a `category`:
 | `explore` | `claude -p` in the wiki directory, asked to hand the query to the built-in Explore subagent | the **subagent's** tokens, turns, wall time and the files it opened, with the parent's tokens beside them |
 | `s1m` | the `s1m` binary at its defaults from the wiki directory, against `--cache-dir` | wall time, the files and ranges it returned, and what opening those ranges would cost an agent |
 | `s1m-cold` | the same, against a cache directory of its own | the same, plus the judgments it bought: Jev tokens and their cost |
+| `s1m-t<N>` | s1m at its defaults but `--threshold N`, warm only — `s1m-t0.4` is one | the same as `s1m`, so the report can show one threshold variant beside the defaults |
 | `s1m-agent` | `claude -p` handed s1m's reading list and told to open only what it needs | the agent's tokens, wall time and the files it opened |
 
 `s1m-agent` is the comparison that puts like with like: the same agent, the
@@ -99,8 +103,16 @@ entries it wrote. Those entries are then copied into `--cache-dir`, which is
 why the warm run that follows costs nothing: cache entries are keyed by the
 request that produced them, so a copied answer is the same answer.
 
-`--cold-repeats` (default 1) is how many repeats are also measured cold. Every
-cold run is bought again, so this is the flag that decides what a pass costs.
+`--cold-repeats` (default 1) is how many repeats of `s1m` are also measured
+cold. Every cold run is bought again, so this is the flag that decides what a
+pass costs. A `s1m-t<N>` condition is never measured cold: it is there to show
+what the threshold does, not what a first walk costs.
+
+Every s1m run is priced by what it bought: the judgments in the cache
+directory afterwards that were not there before, at the list price in
+`src/jev.rs`. A warm run at the defaults has usually bought nothing, so it
+costs nothing; a warm run at another threshold walks where the cache has not
+been, and what it bought there is counted.
 
 ### How the Explore subagent is isolated
 
@@ -145,5 +157,10 @@ the answer, not the first.
   `agent_cost_share_usd` apportions it by tokens, which is an estimate and not
   a price. For `s1m-cold` the cost is Jev's, at the list price in `src/jev.rs`.
 - **Wall time** is one machine on one network.
-- A run that failed is written as a row with `ok: false` and left out of every
-  average, so a broken harness does not read as a bad method.
+- A run that failed is written as a row with `ok: false` and **no metrics**,
+  and is left out of every average, so a broken harness does not read as a bad
+  method. The report counts it in the condition's `Runs` cell — `3 (1 failed)`
+  — and nothing more: what went wrong is under `detail.error` in the raw row,
+  because an error message quotes requests, paths and stderr. s1m failing part
+  way through a walk is the case this exists for: a page the judgment API
+  refuses is exit 2, and the rest of the pass carries on.

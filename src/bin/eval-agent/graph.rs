@@ -108,7 +108,7 @@ pub const BUCKETS: [(&str, usize, usize); 8] = [
 /// Every page is parsed once and every link looked up in a map of the pages, so
 /// the cost is linear in the text and the links: a wiki of a few thousand pages
 /// is one pass, not a pass per page.
-pub fn collect(root: &Path, entry: Option<&str>) -> Result<GraphStats, String> {
+pub fn collect(root: &Path, entries: &[String]) -> Result<GraphStats, String> {
     let pages = parse::pages(root);
     if pages.is_empty() {
         return Err(format!(
@@ -175,19 +175,22 @@ pub fn collect(root: &Path, entry: Option<&str>) -> Result<GraphStats, String> {
 
     let edges = out.iter().map(Vec::len).sum();
     let incoming = in_degrees(&out);
-    // A page the caller named wins over a convention, and one the wiki does
+    // The pages the caller named win over a convention, and one the wiki does
     // not hold is a mistake rather than a wiki nothing can reach.
-    let entry = match entry {
-        Some(page) => {
+    let entry = if entries.is_empty() {
+        ENTRY_CONVENTIONS.into_iter().find_map(|convention| {
+            let at = *index.get(Path::new(convention))?;
+            Some((Entry::Convention(convention.to_string()), vec![at]))
+        })
+    } else {
+        let mut starts = Vec::with_capacity(entries.len());
+        for page in entries {
             let at = *index
                 .get(Path::new(page))
                 .ok_or_else(|| format!("{page}: not a page under {}", root.display()))?;
-            Some((Entry::Given, at))
+            starts.push(at);
         }
-        None => ENTRY_CONVENTIONS.into_iter().find_map(|convention| {
-            let at = *index.get(Path::new(convention))?;
-            Some((Entry::Convention(convention.to_string()), at))
-        }),
+        Some((Entry::Given, starts))
     };
     Ok(GraphStats {
         pages: pages.len(),
@@ -203,10 +206,11 @@ pub fn collect(root: &Path, entry: Option<&str>) -> Result<GraphStats, String> {
     })
 }
 
-/// How far every page sits from the entry page, breadth first: one hop count
-/// per page, and a page no link chain reaches counts as unreachable.
-fn depth(out: &[Vec<usize>], entry: Option<(Entry, usize)>) -> Depth {
-    let Some((entry, at)) = entry else {
+/// How far every page sits from the entry pages, breadth first: one hop count
+/// per page, every entry page at zero, and a page no link chain from any of
+/// them reaches counts as unreachable.
+fn depth(out: &[Vec<usize>], entry: Option<(Entry, Vec<usize>)>) -> Depth {
+    let Some((entry, starts)) = entry else {
         return Depth {
             entry: None,
             histogram: BTreeMap::new(),
@@ -214,8 +218,13 @@ fn depth(out: &[Vec<usize>], entry: Option<(Entry, usize)>) -> Depth {
         };
     };
     let mut hops = vec![usize::MAX; out.len()];
-    hops[at] = 0;
-    let mut queue = VecDeque::from([at]);
+    let mut queue = VecDeque::new();
+    for at in starts {
+        if hops[at] == usize::MAX {
+            hops[at] = 0;
+            queue.push_back(at);
+        }
+    }
     let mut histogram = BTreeMap::new();
     let mut reached = 0;
     while let Some(page) = queue.pop_front() {
@@ -461,7 +470,7 @@ mod tests {
     #[test]
     fn counts_pages_words_headings_and_links() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), &[]).expect("a wiki of five pages");
 
         assert_eq!(stats.pages, 5);
         // Counted by hand: 13 + 5 + 6 + 4 + 2 tokens.
@@ -486,7 +495,7 @@ mod tests {
     #[test]
     fn describes_both_degree_distributions_and_counts_orphans() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), &[]).expect("a wiki of five pages");
 
         // Out-degrees, by hand: index 3, a 1, b 0, c 1, d 0.
         assert_eq!(
@@ -520,7 +529,7 @@ mod tests {
     #[test]
     fn measures_depth_from_the_entry_page_and_the_largest_cycle() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), &[]).expect("a wiki of five pages");
 
         assert_eq!(
             stats.depth.entry,
@@ -539,7 +548,7 @@ mod tests {
         let wiki = TempDir::new("graph-readme");
         wiki.write("README.md", "# Readme\n\nSee [a](a.md).\n");
         wiki.write("a.md", "# A\n");
-        let stats = collect(wiki.path(), None).expect("a wiki of two pages");
+        let stats = collect(wiki.path(), &[]).expect("a wiki of two pages");
         assert_eq!(
             stats.depth.entry,
             Some(Entry::Convention("README.md".to_string()))
@@ -548,7 +557,7 @@ mod tests {
 
         let neither = TempDir::new("graph-no-entry");
         neither.write("a.md", "# A\n");
-        let stats = collect(neither.path(), None).expect("a wiki of one page");
+        let stats = collect(neither.path(), &[]).expect("a wiki of one page");
         assert_eq!(stats.depth.entry, None);
         // With no entry page nothing is reached, and the histogram is empty.
         assert_eq!(stats.depth.unreachable, 1);
@@ -560,7 +569,7 @@ mod tests {
     #[test]
     fn the_table_is_numbers_and_fixed_words() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), &[]).expect("a wiki of five pages");
         let table = table(&stats);
 
         assert!(table.contains("| Pages | 5 |"), "{table}");
@@ -597,11 +606,12 @@ mod tests {
         wiki.write("b.md", "# B\n");
 
         // Without one, nothing is reachable: neither convention is there.
-        let found = collect(wiki.path(), None).expect("a wiki of three pages");
+        let found = collect(wiki.path(), &[]).expect("a wiki of three pages");
         assert_eq!(found.depth.entry, None);
         assert_eq!(found.depth.unreachable, 3);
 
-        let given = collect(wiki.path(), Some("docs/start.md")).expect("the page it was given");
+        let given =
+            collect(wiki.path(), &["docs/start.md".to_string()]).expect("the page it was given");
         assert_eq!(given.depth.entry, Some(Entry::Given));
         assert_eq!(given.depth.histogram, BTreeMap::from([(0, 1), (1, 1)]));
         assert_eq!(given.depth.unreachable, 1);
@@ -614,7 +624,39 @@ mod tests {
 
         // A page the wiki does not hold is the caller's mistake, not an
         // unreachable wiki.
-        let error = collect(wiki.path(), Some("docs/absent.md")).expect_err("no such page");
+        let error =
+            collect(wiki.path(), &["docs/absent.md".to_string()]).expect_err("no such page");
         assert!(error.contains("not a page"), "{error}");
+    }
+
+    /// A wiki with several ways in is measured from all of them at once: every
+    /// given page is at depth zero, and what none of them reaches is what is
+    /// unreachable.
+    #[test]
+    fn depth_can_be_measured_from_a_set_of_entry_pages() {
+        let wiki = TempDir::new("graph-entries");
+        wiki.write("docs/start.md", "# Start\n\nSee [a](../a.md).\n");
+        wiki.write("ops/start.md", "# Ops\n");
+        wiki.write("a.md", "# A\n");
+        wiki.write("b.md", "# B\n");
+
+        let given = collect(
+            wiki.path(),
+            &["docs/start.md".to_string(), "ops/start.md".to_string()],
+        )
+        .expect("two entry pages");
+        assert_eq!(given.depth.entry, Some(Entry::Given));
+        // Both given pages are at zero, `a.md` one hop from one of them.
+        assert_eq!(given.depth.histogram, BTreeMap::from([(0, 2), (1, 1)]));
+        assert_eq!(given.depth.unreachable, 1);
+
+        // One page of the set that is not there is still the caller's mistake.
+        assert!(
+            collect(
+                wiki.path(),
+                &["docs/start.md".to_string(), "gone.md".to_string()]
+            )
+            .is_err()
+        );
     }
 }

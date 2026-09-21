@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 /// The conditions a run can measure, as the `--conditions` flag spells them.
+/// `s1m-t<N>` — s1m at threshold N — is accepted too, and is not a fixed name.
 pub const CONDITIONS: [&str; 3] = ["explore", "s1m", "s1m-agent"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -23,10 +24,10 @@ pub struct Row {
     /// Which pass over the gold set this was, from 0.
     pub repeat: usize,
     /// Whether the run produced a measurement. A failed run is written too, so
-    /// that a resumed run does not try it again forever.
+    /// that a resumed run does not try it again forever; it carries no metrics,
+    /// and what went wrong is under `detail`, because an error message quotes
+    /// requests, paths and stderr.
     pub ok: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
     /// Everything a report may print, by name.
     pub metrics: BTreeMap<String, f64>,
     /// Everything it may not: this half never leaves `--out`.
