@@ -35,12 +35,13 @@ const LABEL_LIMIT: usize = 64;
 
 /// The metrics the results table shows, in order, with the heading each one
 /// prints under. A metric no condition measured is left out of the table.
-const COLUMNS: [(&str, &str); 8] = [
+const COLUMNS: [(&str, &str); 9] = [
     ("recall", "Recall"),
     ("precision", "Precision"),
     ("agent_read_tokens", "Agent tokens"),
     ("agent_total_tokens", "Billed tokens"),
     ("files_opened", "Files opened"),
+    ("parent_tool_uses", "Parent tools"),
     ("cost_usd", "Cost (USD)"),
     ("wall_ms", "Wall (ms)"),
     ("jev_cost_usd", "Jev cost (USD)"),
@@ -94,7 +95,15 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         "| Conditions | {} |\n",
         method.conditions.join(", ")
     ));
-    out.push_str(&format!("| Agent model | `{}` |\n", method.claude_model));
+    // A run that named no model is a run whose models Claude Code chose, and
+    // the subagent's may not be the parent's; the rows record what answered.
+    out.push_str(&match method.claude_model.as_str() {
+        crate::run::DEFAULT_MODEL => "| Agent model | Claude Code's own: no \
+             `--model` flag was passed, so the parent and its subagent each \
+             took their default |\n"
+            .to_string(),
+        model => format!("| Agent model | `{model}` |\n"),
+    });
     out.push_str(&format!(
         "| Agent flags | {} |\n",
         flags(&method.claude_flags)
@@ -694,5 +703,31 @@ mod tests {
         // only one run carried says which.
         assert!(report.contains("| 0.50 ± 0.71 |"), "{report}");
         assert!(report.contains("0.002000 (n=1)"), "{report}");
+    }
+
+    /// Naming a model measures that model; naming none measures the one
+    /// Claude Code would have used, subagent included. The method table has to
+    /// say which of the two this was, because the numbers mean different
+    /// things.
+    #[test]
+    fn the_method_says_whether_a_model_was_asked_for() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let aggregates = aggregate(&rows);
+
+        let named = render(&aggregates, None, &method()).expect("a named model");
+        assert!(
+            named.contains("| Agent model | `claude-sonnet-5` |"),
+            "{named}"
+        );
+
+        let default = Method {
+            claude_model: crate::run::DEFAULT_MODEL.to_string(),
+            ..method()
+        };
+        let report = render(&aggregates, None, &default).expect("no model named");
+        assert!(
+            report.contains("no `--model` flag"),
+            "the table does not say the models were Claude Code's own:\n{report}"
+        );
     }
 }

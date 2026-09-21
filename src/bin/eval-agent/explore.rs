@@ -10,7 +10,7 @@
 //! stream's per-message usage is the usage *so far*, so its output token counts
 //! are partial.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,10 @@ pub struct StreamSummary {
     pub parent_files_read: Vec<PathBuf>,
     /// Tools the parent used itself, the subagent's not counted.
     pub parent_tool_uses: usize,
+    /// The same, by tool name: which tools the parent reached for, and how
+    /// often. A parent that is meant to hand the work to a subagent and goes
+    /// looking itself says so here.
+    pub parent_tools: BTreeMap<String, usize>,
 }
 
 /// One spawned subagent, as the stream's task events describe it.
@@ -181,6 +185,9 @@ pub fn summarise_stream(stream: &str, wiki: &Path) -> Result<StreamSummary, Stri
                     continue;
                 }
                 summary.parent_tool_uses += 1;
+                if let Some(name) = block["name"].as_str() {
+                    *summary.parent_tools.entry(name.to_string()).or_insert(0) += 1;
+                }
                 if block["name"].as_str() == Some("Read")
                     && let Some(path) = block["input"]["file_path"].as_str()
                 {
@@ -441,6 +448,12 @@ mod tests {
             vec![PathBuf::from("notes/parent.md")]
         );
         assert_eq!(summary.parent_tool_uses, 2);
+        // By name, so a parent that was meant to delegate and went looking
+        // itself is visible in the row rather than only in the transcript.
+        assert_eq!(
+            summary.parent_tools,
+            BTreeMap::from([("Agent".to_string(), 1), ("Read".to_string(), 1)])
+        );
         assert_eq!(summary.model.as_deref(), Some("claude-sonnet-5"));
 
         assert_eq!(

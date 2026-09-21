@@ -78,9 +78,12 @@ struct RunArgs {
     /// a wiki with several ways in; the default is the `index.md` convention.
     #[arg(long, default_values_t = [String::from("index.md")])]
     entry: Vec<String>,
-    /// The model the agent runs on.
-    #[arg(long, default_value = "sonnet")]
-    model: String,
+    /// The model the agent runs on. With none named, no `--model` reaches
+    /// Claude Code and every agent in the run — the subagent included — takes
+    /// its own default; the models that answered are recorded per run either
+    /// way.
+    #[arg(long)]
+    model: Option<String>,
     /// The s1m binary. Defaults to the one beside this one.
     #[arg(long)]
     s1m: Option<PathBuf>,

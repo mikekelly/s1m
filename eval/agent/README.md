@@ -28,6 +28,8 @@ cargo run --release --bin eval-agent -- run \
   --wiki /path/to/wiki --gold /path/to/gold.json --out /path/to/run-dir \
   --repeats 3 --conditions explore,s1m,s1m-agent \
   --cache-dir /path/to/s1m-cache
+# --model MODEL pins every agent in the run to MODEL; leave it off to measure
+# whatever Claude Code would have used.
 
 # 3. The committed half.
 cargo run --release --bin eval-agent -- report \
@@ -85,7 +87,7 @@ The format the existing `eval` binary reads, plus a `category`:
 
 | Condition | What runs | What is measured |
 | --- | --- | --- |
-| `explore` | `claude -p` in the wiki directory, asked to hand the query to the built-in Explore subagent | the **subagent's** tokens, turns, wall time and the files it opened, with the parent's tokens beside them |
+| `explore` | `claude -p` in the wiki directory with `Task` as its only tool, so its one way to answer is the built-in Explore subagent | the **subagent's** tokens, turns, wall time and the files it opened, with the parent's tokens beside them |
 | `s1m` | the `s1m` binary at its defaults from the wiki directory, against `--cache-dir` | wall time, the files and ranges it returned, and what opening those ranges would cost an agent |
 | `s1m-cold` | the same, against a cache directory of its own | the same, plus the judgments it bought: Jev tokens and their cost |
 | `s1m-t<N>` | s1m at its defaults but `--threshold N`, warm only — `s1m-t0.4` is one | the same as `s1m`, so the report can show one threshold variant beside the defaults |
@@ -150,12 +152,30 @@ the parent had done the work. A parent that spawned some other kind of
 subagent is failed for the same reason.
 
 The agent runs with `--safe-mode` — no `CLAUDE.md`, plugins, hooks, MCP
-servers or custom agents from wherever the wiki happens to live — with
-`--tools` and `--allowedTools` set to `Read,Glob,Grep,Task` (the last is what
-lets it spawn the subagent), and `--permission-prompts none` so that anything
-which would prompt is denied rather than hanging. A parent that hands work to
-a backgrounded subagent answers twice, so the **last** result in the stream is
-the answer, not the first.
+servers or custom agents from wherever the wiki happens to live — and
+`--permission-prompts none`, so anything that would prompt is denied rather
+than hanging. A parent that hands work to a backgrounded subagent answers
+twice, so the **last** result in the stream is the answer, not the first.
+
+**The parent's only tool is `Task`.** Given the read-only tools as well it
+does not delegate: it explores, about twenty reads and greps a run, and what
+gets measured is a parent wearing a subagent's name. With `--tools Task
+--allowedTools Task` the only way it can answer is to hand the whole task
+over, and it is asked to reply with the subagent's answer and JSON array
+exactly as written. `parent_tool_uses` is recorded as a metric on every agent
+run and printed in the report as *Parent tools*: on this condition it should
+be 1 — the one `Task` call — and anything more says the parent did work of its
+own that is being counted as the Explore agent's. The per-name breakdown is in
+the raw row under `detail.parent_tools`. `s1m-agent` keeps `--tools Read`: it
+was handed the list, and there is nothing to delegate.
+
+**No `--model` unless you name one.** A model named on the command line is
+inherited by every agent in the run, so `--model sonnet` measures Sonnet
+exploring rather than what Claude Code would have sent. With `--model` left
+off, no flag is passed, each agent takes its own default, and the method table
+says so. What actually answered is read back per run either way, and the
+parent's model and the subagent's are recorded separately:
+`detail.model_asked_for`, `detail.parent_model`, `detail.agent_model`.
 
 ## What the numbers mean
 

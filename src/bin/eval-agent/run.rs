@@ -27,12 +27,18 @@ pub const COLD_CACHE: &str = "cold-cache";
 
 /// The parent agent's prompt. The query and the entry pages are substituted
 /// in; nothing else about the wiki is.
+///
+/// The parent has one tool, so it cannot answer this itself: it delegates, and
+/// what it is asked for is the subagent's answer unchanged. Anything it added
+/// of its own would be a second agent's work counted as the first's.
 pub const EXPLORE_PROMPT: &str = "\
-Use the Explore agent to answer this query from the wiki in the current \
-directory, starting at these pages: <entry>
+Hand this whole task to the Explore agent and do no searching yourself.
+Its task: answer this query from the wiki in the current directory, starting \
+at these pages: <entry>
 The query: <query>
-Reply with the answer, and then a JSON array of the relative paths of the files \
-the Explore agent relied on.";
+Tell it to end its report with a JSON array of the relative paths of the files \
+it relied on. When it reports back, reply with its answer and that JSON array \
+exactly as it wrote them, and add nothing of your own.";
 
 /// The same, for an agent handed s1m's reading list instead of a wiki to walk.
 pub const S1M_AGENT_PROMPT: &str = "\
@@ -43,9 +49,15 @@ Answer this query, opening only the files you need: <query>
 Reply with the answer, and then a JSON array of the relative paths of the files \
 you relied on.";
 
-/// The tools the Explore condition runs under: read-only, plus the one that
-/// spawns the subagent.
-pub const EXPLORE_TOOLS: &str = "Read,Glob,Grep,Task";
+/// The tools the Explore condition's parent runs under: the one that spawns a
+/// subagent, and nothing else.
+///
+/// A parent that can read is a parent that explores. Given the read-only tools
+/// as well, it did the work itself — about twenty reads and greps a run — and
+/// what got measured was a parent with a subagent's name on it. With only
+/// `Task`, delegation is the only way it can answer, and the tokens counted
+/// against the Explore agent are the Explore agent's.
+pub const EXPLORE_TOOLS: &str = "Task";
 /// The tools an agent handed a reading list runs under: it was given the files,
 /// so it has no need to search for them.
 pub const S1M_AGENT_TOOLS: &str = "Read";
@@ -60,7 +72,8 @@ pub struct Options {
     pub cache_dir: Option<PathBuf>,
     /// The pages a query with no entry of its own starts from.
     pub entry: Vec<String>,
-    pub model: String,
+    /// The model to run the agent on, `None` for whatever Claude Code uses.
+    pub model: Option<String>,
     pub s1m: PathBuf,
     pub claude: PathBuf,
     pub transcripts: Option<PathBuf>,
@@ -234,6 +247,9 @@ pub fn write_aggregates(options: &Options, rows: &[Row]) -> Result<(), String> {
     Ok(())
 }
 
+/// What the method table says when no model was asked for.
+pub const DEFAULT_MODEL: &str = "default";
+
 /// The agent's flags, as the report prints them.
 pub fn method_flags() -> Vec<String> {
     vec![
@@ -253,7 +269,10 @@ pub fn method(options: &Options) -> Method {
     Method {
         repeats: options.repeats,
         conditions: options.conditions.clone(),
-        claude_model: options.model.clone(),
+        claude_model: options
+            .model
+            .clone()
+            .unwrap_or_else(|| DEFAULT_MODEL.to_string()),
         claude_flags: method_flags(),
         s1m_flags: vec!["--format json".to_string(), "--root .".to_string()],
         explore_prompt: EXPLORE_PROMPT.to_string(),
@@ -333,6 +352,10 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
     );
     metrics.insert("tasks".to_string(), agent.tasks as f64);
     metrics.insert("explore_tasks".to_string(), agent.explore_tasks as f64);
+    metrics.insert(
+        "parent_tool_uses".to_string(),
+        agent.parent_tool_uses as f64,
+    );
     metrics.insert("wall_ms".to_string(), agent.wall_ms as f64);
     metrics.insert("cost_usd".to_string(), agent.cost_usd);
     metrics.insert(
@@ -541,6 +564,10 @@ fn s1m_agent_condition(
 
 /// What one `claude -p` run reported, whichever condition asked for it.
 struct AgentRun {
+    /// The parent's own tool calls: a parent that was told to delegate and
+    /// went looking itself is a measurement of the wrong thing, and this is
+    /// the number that says so.
+    parent_tool_uses: usize,
     files_relied: Vec<PathBuf>,
     /// Whether the answer carried a list of files at all.
     relied_parsed: bool,
@@ -571,22 +598,7 @@ fn agent_run(
 ) -> Result<AgentRun, String> {
     let stdout = raw_path(options, query, job, "stream.jsonl");
     let stderr = raw_path(options, query, job, "stderr");
-    let arguments = vec![
-        "-p".to_string(),
-        prompt.to_string(),
-        "--output-format".to_string(),
-        "stream-json".to_string(),
-        "--verbose".to_string(),
-        "--model".to_string(),
-        options.model.clone(),
-        "--safe-mode".to_string(),
-        "--tools".to_string(),
-        tools.to_string(),
-        "--allowedTools".to_string(),
-        tools.to_string(),
-        "--permission-prompts".to_string(),
-        "none".to_string(),
-    ];
+    let arguments = claude_arguments(prompt, tools, options.model.as_deref());
 
     let started = Instant::now();
     let status = spawn(
@@ -651,7 +663,7 @@ fn agent_run(
     let relied = explore::files_relied_on(&summary.answer, &options.wiki);
     let relied_parsed = relied.is_some();
     let files_relied = relied.unwrap_or_default();
-    let (agent, files_read, turns, tool_uses, model) = if transcripts.is_empty() {
+    let (agent, files_read, turns, tool_uses, agent_model) = if transcripts.is_empty() {
         // Nothing was spawned: the agent that ran is the parent, and the
         // stream carries what it opened.
         (
@@ -659,7 +671,7 @@ fn agent_run(
             summary.parent_files_read.clone(),
             0,
             summary.parent_tool_uses,
-            summary.model.clone(),
+            None,
         )
     } else {
         let mut usage = Usage::default();
@@ -678,6 +690,7 @@ fn agent_run(
     };
 
     Ok(AgentRun {
+        parent_tool_uses: summary.parent_tool_uses,
         files_relied: files_relied.clone(),
         relied_parsed,
         files_read: files_read.clone(),
@@ -705,7 +718,13 @@ fn agent_run(
             "files_read": files_read,
             "wanted": query.wanted,
             "relied_parsed": relied_parsed,
-            "model": model.unwrap_or_else(|| options.model.clone()),
+            // Three different things, and the point of the run is that they
+            // can differ: what was asked for, what the parent answered on, and
+            // what the subagent answered on.
+            "model_asked_for": options.model,
+            "parent_model": summary.model,
+            "agent_model": agent_model,
+            "parent_tools": summary.parent_tools,
             "session_id": summary.session_id,
             "tasks": summary.tasks,
             "subagent_usage_source": if transcripts.is_empty() { "stream" } else { "transcript" },
@@ -741,6 +760,32 @@ fn transcript_path(options: &Options, session: &str, agent: &str) -> Option<Path
         }
     }
     None
+}
+
+/// The flags one `claude -p` run is made with.
+pub fn claude_arguments(prompt: &str, tools: &str, model: Option<&str>) -> Vec<String> {
+    let mut arguments = vec!["-p".to_string(), prompt.to_string()];
+    // A model named here is inherited by every agent in the run, the subagent
+    // included, so naming one measures that model rather than the one Claude
+    // Code would have used. With none named, no flag is passed and the models
+    // that answered are read back from the stream and the transcripts.
+    if let Some(model) = model {
+        arguments.push("--model".to_string());
+        arguments.push(model.to_string());
+    }
+    arguments.extend([
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--safe-mode".to_string(),
+        "--tools".to_string(),
+        tools.to_string(),
+        "--allowedTools".to_string(),
+        tools.to_string(),
+        "--permission-prompts".to_string(),
+        "none".to_string(),
+    ]);
+    arguments
 }
 
 /// The subagent this harness measures: Claude Code's built-in read-only
@@ -1074,7 +1119,7 @@ mod tests {
             conditions: vec!["s1m".to_string()],
             cache_dir: None,
             entry: vec!["index.md".to_string()],
-            model: "sonnet".to_string(),
+            model: None,
             s1m: binary,
             claude: PathBuf::from("claude"),
             transcripts: None,
@@ -1126,7 +1171,7 @@ mod tests {
             conditions: vec!["s1m".to_string()],
             cache_dir: None,
             entry: vec!["index.md".to_string()],
-            model: "sonnet".to_string(),
+            model: None,
             s1m: PathBuf::from("s1m"),
             claude: PathBuf::from("claude"),
             transcripts: None,
@@ -1329,5 +1374,36 @@ mod tests {
             .expect("a reason")
             .to_string();
         assert!(reason.contains(EXPLORE_AGENT), "{reason}");
+    }
+
+    /// A model named on the command line is inherited by every agent in the
+    /// run, subagents included, so naming one measures that model rather than
+    /// the one Claude Code would have used. With none named, no flag is passed
+    /// and the resolved models are read back from the run.
+    #[test]
+    fn a_model_is_only_asked_for_when_one_was_named() {
+        let named = claude_arguments("ask", "Task", Some("sonnet"));
+        let at = named
+            .iter()
+            .position(|flag| flag == "--model")
+            .expect("the flag");
+        assert_eq!(named[at + 1], "sonnet");
+
+        let default = claude_arguments("ask", "Task", None);
+        assert!(!default.contains(&"--model".to_string()), "{default:?}");
+
+        // Whatever else changes, the run is non-interactive, streamed, and
+        // held to the tools it was given.
+        for arguments in [&named, &default] {
+            assert_eq!(arguments[0], "-p");
+            assert_eq!(arguments[1], "ask");
+            assert!(arguments.contains(&"--verbose".to_string()));
+            assert!(arguments.contains(&"stream-json".to_string()));
+            assert_eq!(
+                arguments.iter().filter(|flag| *flag == "Task").count(),
+                2,
+                "--tools and --allowedTools both name them: {arguments:?}"
+            );
+        }
     }
 }
