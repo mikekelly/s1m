@@ -4,6 +4,13 @@
 //! read: `category`, which the report groups by, and `wanted` as another
 //! spelling of `expected`. Both binaries ignore fields they do not know, so one
 //! file feeds both.
+//!
+//! A wanted page may also be spelled as an object naming the part of it that
+//! answers — a `heading` or `lines` the `eval` harness counts section recall
+//! over ([#58]) — and this harness reads the page and scores it at file level,
+//! which is the question it asks: which pages a run should have returned.
+//!
+//! [#58]: https://github.com/mikekelly/s1m/issues/58
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -43,7 +50,29 @@ pub struct Query {
     /// The pages a person would want, relative to the wiki root. `expected` is
     /// the same field under the name the committed gold set uses.
     #[serde(alias = "expected")]
-    pub wanted: Vec<String>,
+    pub wanted: Vec<Entry>,
+}
+
+/// One wanted page: its path, or an object naming the part of it that answers.
+///
+/// The object is the `eval` harness's label for where in the page the answer
+/// is — its `heading`, its `lines`, or neither — and it is a page here: this
+/// harness measures whole files, so the label is read and the page is scored.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum Entry {
+    Page(String),
+    Part { path: String },
+}
+
+impl Entry {
+    /// The page this entry wants, as the gold set spells it.
+    pub fn path(&self) -> &str {
+        match self {
+            Entry::Page(path) => path,
+            Entry::Part { path } => path,
+        }
+    }
 }
 
 /// One entry page or several: a gold set may spell either, because most wikis
@@ -82,7 +111,16 @@ impl Query {
 
     /// The pages this query wants, deduplicated.
     pub fn wanted(&self) -> BTreeSet<PathBuf> {
-        self.wanted.iter().map(PathBuf::from).collect()
+        self.wanted
+            .iter()
+            .map(|entry| PathBuf::from(entry.path()))
+            .collect()
+    }
+
+    /// The pages this query wants, in the gold set's own order: what a raw row
+    /// records of the labels it was measured against.
+    pub fn pages(&self) -> Vec<&str> {
+        self.wanted.iter().map(Entry::path).collect()
     }
 }
 
@@ -181,6 +219,39 @@ mod tests {
         assert_eq!(
             bare.queries[0].entries(&["fallback.md".to_string()]),
             vec!["fallback.md"]
+        );
+    }
+
+    /// A wanted page may name the part of it that answers — the `eval`
+    /// harness's section label ([#58]) — and this harness reads the page: the
+    /// question it asks is which files a run should have returned.
+    #[test]
+    fn a_wanted_page_may_name_the_part_of_it_that_answers() {
+        let labelled = load(
+            r#"{"queries": [{"id": "one", "query": "q", "expected": [
+                "a.md",
+                {"path": "b.md", "heading": "Current policy"},
+                {"path": "c.md", "lines": [12, 24]}]}]}"#,
+        )
+        .expect("the labelled spelling");
+        assert_eq!(
+            labelled.queries[0].wanted(),
+            BTreeSet::from([
+                PathBuf::from("a.md"),
+                PathBuf::from("b.md"),
+                PathBuf::from("c.md"),
+            ])
+        );
+        assert_eq!(
+            labelled.queries[0].pages(),
+            vec!["a.md", "b.md", "c.md"],
+            "a raw row records the pages, in the gold set's own order"
+        );
+
+        // A part that names no page names nothing to measure.
+        assert!(
+            load(r#"{"queries": [{"id": "a", "query": "q", "wanted": [{"heading": "x"}]}]}"#)
+                .is_err()
         );
     }
 

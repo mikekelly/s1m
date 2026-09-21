@@ -16,6 +16,7 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 ## Headline
 
 - **Recall and precision at `--max-files 10`**: mean recall 0.83, mean precision 0.27 — 32 of the 39 wanted pages are in the list the agent opens, over 126 files returned, 6.3 a query — against 0.19 over everything the walk visited: 186 files judged, 126 of them earned a place, and the rest are what the JSON reports as `walked`. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` visits 213 files for the same mean recall (0.83), 144 of which earn a place, so everything below is a statement about the link graph and the threshold, not about the budget.
+- **Section recall**: 0.74 — 27 of the 39 wanted parts the gold set labels are covered by the ranges the list returns, against 0.83 of the 32 wanted pages in the list at all, for 3054 lines returned. A part is the heading or line range an entry names, and an entry that names none is wanted whole, so its part is its page; where the two numbers differ, the list returned a page with nothing to read in it, or ranges that miss the part the label points at.
 - **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.83, at 243070 tokens against 44906 — 5.4× the reading for 0.11 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
 - **What an agent reads**: 44906 tokens for the returned ranges, against 120322 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 35% of the corpus's text; the section scores take 63% off that, and the ranking 87% off reading everything.
 - **What it costs**: $0.045945 for the gold set at `--max-files 10` — $0.002297 a query, at 0.20 s an answer, $0.051264 at `--max-files 25`; every answer this report used, at the price above, $0.754844. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
@@ -38,90 +39,90 @@ This report goes to stdout without `--out`, and `--out PATH` writes it to a file
 
 ## The gold set
 
-20 queries, written by reading the wiki: for each, the pages a person with that task would want open. `mode` is the criterion the query is judged by, `entry` the page a caller would start from. Labels are the queries' own — a page that is useful but unlisted costs precision, and no label says a page is useless — so precision is a lower bound.
+20 queries, written by reading the wiki: for each, the pages a person with that task would want open. `mode` is the criterion the query is judged by, `entry` the page a caller would start from. Labels are the queries' own — a page that is useful but unlisted costs precision, and no label says a page is useless — so precision is a lower bound. An entry that names a heading or lines is a page whose answer lives in part of it ([#58]), and those are the parts **Section recall** below is counted over: a page named on its own is wanted whole, so its part is its page.
 
 <details><summary>The queries</summary>
 
 | Query | Mode | Entry | Wanted | Why |
 | --- | --- | --- | --- | --- |
-| **how do I cut a release and publish the package** | `useful-for` | `index.md` | `concepts/release.md`, `concepts/node-version-and-types.md` | release.md is the wiki's page on releasing (it points at RELEASING.md for the runbook); node-version-and-types.md covers the release workflow's Node pin and the gate chain a release runs. |
-| **how does init scaffold a wiki into a new project** | `useful-for` | `index.md` | `concepts/init-command.md`, `entities/commands.md`, `concepts/template-system.md` | init-command.md is the flow, commands.md the module it lives in, template-system.md what it copies. |
-| **which files does init copy into a consumer project** | `answers` | `index.md` | `concepts/template-system.md`, `entities/templates.md` | templates/ is the scaffold source of truth; template-system.md is why and how it is copied. |
-| **what node version must consumers run the CLI on** | `answers` | `index.md` | `concepts/node-version-and-types.md` | The runtime floor (engines.node) against the development pin (.nvmrc) is one page. |
-| **why must @types/node match the .nvmrc major** | `answers` | `index.md` | `concepts/node-version-and-types.md` | Same page as the floor, asked for the rule rather than the number. |
-| **what validates wiki pages before a commit lands** | `useful-for` | `index.md` | `concepts/wiki-scripts.md`, `concepts/dogfooding.md` | wiki-scripts.md is the lint/build/check subcommands; dogfooding.md is the pre-commit and pre-push hooks that run them. |
+| **how do I cut a release and publish the package** | `useful-for` | `index.md` | `concepts/release.md`: lines 14–20, `concepts/node-version-and-types.md`: Current policy | release.md is the wiki's page on releasing (it points at RELEASING.md for the runbook); node-version-and-types.md covers the release workflow's Node pin and the gate chain a release runs. |
+| **how does init scaffold a wiki into a new project** | `useful-for` | `index.md` | `concepts/init-command.md`: Scaffold steps, `entities/commands.md`: lines 13–20, `concepts/template-system.md`: Directory layout | init-command.md is the flow, commands.md the module it lives in, template-system.md what it copies. |
+| **which files does init copy into a consumer project** | `answers` | `index.md` | `concepts/template-system.md`: Directory layout, `entities/templates.md`: Directory layout | templates/ is the scaffold source of truth; template-system.md is why and how it is copied. |
+| **what node version must consumers run the CLI on** | `answers` | `index.md` | `concepts/node-version-and-types.md`: Current policy | The runtime floor (engines.node) against the development pin (.nvmrc) is one page. |
+| **why must @types/node match the .nvmrc major** | `answers` | `index.md` | `concepts/node-version-and-types.md`: @types/node alignment | Same page as the floor, asked for the rule rather than the number. |
+| **what validates wiki pages before a commit lands** | `useful-for` | `index.md` | `concepts/wiki-scripts.md`: Commands, `concepts/dogfooding.md`: Validation | wiki-scripts.md is the lint/build/check subcommands; dogfooding.md is the pre-commit and pre-push hooks that run them. |
 | **how does the wiki stay in sync with code changes** | `useful-for` | `index.md` | `concepts/dogfooding.md` | The maintenance-trigger workflow and code_refs are the answer, and dogfooding.md is where it is described. |
-| **which tests exercise the compiled CLI binary** | `answers` | `index.md` | `concepts/e2e-tests.md`, `concepts/unit-tests.md` | e2e-tests.md runs the built binary; unit-tests.md says which of its script tests invoke dist/bin/cli.js. |
-| **how do I run the unit test suite** | `answers` | `index.md` | `concepts/unit-tests.md` | One command and the config it reads. |
-| **how does upgrade refresh an existing wiki without overwriting user pages** | `answers` | `index.md` | `concepts/dogfooding.md`, `concepts/template-system.md`, `entities/commands.md` | The refreshed/preserved table is in dogfooding.md, the meta-path list that decides it in template-system.md, and the pipeline in commands.md. |
-| **what is the layout of the package source** | `about` | `index.md` | `concepts/repo-layout.md` | The table of bin/, src/, templates/, test/ and the dogfooded wiki. |
-| **why is the entities directory flat with no subdirectories** | `answers` | `index.md` | `AGENTS.md`, `schema.md` | The scope-tag convention is stated in AGENTS.md §3a and specified in schema.md's flat namespace section. |
-| **what generates the index.md tables** | `answers` | `index.md` | `AGENTS.md`, `concepts/wiki-scripts.md` | AGENTS.md says never to hand-edit them and names build; wiki-scripts.md documents the subcommand. |
-| **how do I add a summary page for an ingested source artifact** | `useful-for` | `index.md` | `AGENTS.md`, `schema.md`, `raw/raw.md` | The ingest workflow is in AGENTS.md §7 and schema.md, with the raw tree's hub page as where the artifact goes. |
-| **where do immutable source artifacts live** | `answers` | `index.md` | `raw/raw.md`, `schema.md` | raw/raw.md is the hub of the immutable tree; schema.md gives the directory layout and the never-edit rule. |
+| **which tests exercise the compiled CLI binary** | `answers` | `index.md` | `concepts/e2e-tests.md`: Test files, `concepts/unit-tests.md`: Script test coverage | e2e-tests.md runs the built binary; unit-tests.md says which of its script tests invoke dist/bin/cli.js. |
+| **how do I run the unit test suite** | `answers` | `index.md` | `concepts/unit-tests.md`: lines 30–36 | One command and the config it reads. |
+| **how does upgrade refresh an existing wiki without overwriting user pages** | `answers` | `index.md` | `concepts/dogfooding.md`: Refreshing after template changes, `concepts/template-system.md`: Templates vs consumer output, `entities/commands.md`: lines 13–20 | The refreshed/preserved table is in dogfooding.md, the meta-path list that decides it in template-system.md, and the pipeline in commands.md. |
+| **what is the layout of the package source** | `about` | `index.md` | `concepts/repo-layout.md`: Package source | The table of bin/, src/, templates/, test/ and the dogfooded wiki. |
+| **why is the entities directory flat with no subdirectories** | `answers` | `index.md` | `AGENTS.md`: §3a Scope-tag convention, `schema.md`: Flat entities/ namespace | The scope-tag convention is stated in AGENTS.md §3a and specified in schema.md's flat namespace section. |
+| **what generates the index.md tables** | `answers` | `index.md` | `AGENTS.md`: Gotchas, `concepts/wiki-scripts.md`: Commands | AGENTS.md says never to hand-edit them and names build; wiki-scripts.md documents the subcommand. |
+| **how do I add a summary page for an ingested source artifact** | `useful-for` | `index.md` | `AGENTS.md`: Ingest (a new artifact lands in raw/), `schema.md`: Ingest, `raw/raw.md` | The ingest workflow is in AGENTS.md §7 and schema.md, with the raw tree's hub page as where the artifact goes. |
+| **where do immutable source artifacts live** | `answers` | `index.md` | `raw/raw.md`, `schema.md`: Directory Layout | raw/raw.md is the hub of the immutable tree; schema.md gives the directory layout and the never-edit rule. |
 | **what is llm-wiki-manager for** | `about` | `index.md` | `README.md`, `concepts/repo-layout.md`, `concepts/dogfooding.md` | README.md is the human entry point; repo-layout.md and dogfooding.md say what the package is and what it is a consumer of. |
-| **which module dispatches CLI subcommands** | `answers` | `index.md` | `entities/cli.md` | The dispatch table names the handler module for each subcommand. |
-| **how are template variables interpolated during scaffolding** | `answers` | `index.md` | `concepts/template-system.md`, `entities/templates.md`, `concepts/init-command.md` | template-system.md has interpolate() and the variable list, init-command.md gathers the values, templates.md has the file set. |
-| **what does src/utils/fs.ts handle** | `answers` | `index.md` | `entities/utils.md`, `concepts/template-system.md` | utils.md is the scope overview with the exports; template-system.md is the part of it that copies and interpolates. |
-| **what does the wiki log record** | `answers` | `index.md` | `log.md`, `AGENTS.md` | log.md is the append-only record itself; AGENTS.md documents the entries it takes (ingest, query, lint, maintenance). |
+| **which module dispatches CLI subcommands** | `answers` | `index.md` | `entities/cli.md`: Command dispatch | The dispatch table names the handler module for each subcommand. |
+| **how are template variables interpolated during scaffolding** | `answers` | `index.md` | `concepts/template-system.md`: Interpolation, `entities/templates.md`: Directory layout, `concepts/init-command.md`: Prompts and variables | template-system.md has interpolate() and the variable list, init-command.md gathers the values, templates.md has the file set. |
+| **what does src/utils/fs.ts handle** | `answers` | `index.md` | `entities/utils.md`: fs.ts — scaffold and config, `concepts/template-system.md`: Interpolation | utils.md is the scope overview with the exports; template-system.md is the part of it that copies and interpolates. |
+| **what does the wiki log record** | `answers` | `index.md` | `log.md`, `AGENTS.md`: §7 The three workflows | log.md is the append-only record itself; AGENTS.md documents the entries it takes (ingest, query, lint, maintenance). |
 
 </details>
 
 ## Results at a fixed file budget
 
-`--max-files` is the number of files the walk may judge beyond the entry files, which are always visited, and the walk judges that many before the reading list is asked anything. `Visited` counts the files it judged; `Returned` is the list the agent opens — the ones that earn a place on their own, relevance at or above `--threshold` 0.6 or a section at or above it, most relevant first — and the rest, the entry files, hubs and near-misses, are what the JSON reports as `walked`. Recall is the wanted pages in that list over all of the query's wanted pages, and precision is the wanted pages in it over the files in it; precision (visited) is the same over everything the walk judged, which is the number this harness reported while the list was everything the walk had visited, so the two side by side are what the cutoff bought and cost. At `--max-files 10`: 186 files visited and 126 returned, mean precision 0.27 against 0.19 over everything visited. `read` is what the agent opens — the returned ranges only — and `whole` is those same files read entire.
+`--max-files` is the number of files the walk may judge beyond the entry files, which are always visited, and the walk judges that many before the reading list is asked anything. `Visited` counts the files it judged; `Returned` is the list the agent opens — the ones that earn a place on their own, relevance at or above `--threshold` 0.6 or a section at or above it, most relevant first — and the rest, the entry files, hubs and near-misses, are what the JSON reports as `walked`. Recall is the wanted pages in that list over all of the query's wanted pages, and precision is the wanted pages in it over the files in it; precision (visited) is the same over everything the walk judged, which is the number this harness reported while the list was everything the walk had visited, so the two side by side are what the cutoff bought and cost. `Sections` is how many of those wanted pages the list also gave something to read in — the returned ranges overlapping the part of the page the gold entry names, its whole page where it names none — over one part a wanted page, and `Section recall` that count over `Gold`. It is never above recall: a part cannot be returned without its page. At `--max-files 10`: 186 files visited and 126 returned, mean precision 0.27 against 0.19 over everything visited. `read` is what the agent opens — the returned ranges only — and `whole` is those same files read entire; `Lines` is the same reading in line numbers, counted once where ranges overlap.
 
 ### `--max-files 10`
 
-| Query | Gold | Visited | Returned | Found | Recall | Precision | Precision (visited) | Read (tok) | Whole (tok) | Cost | ms/answer |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `release-and-publish` | 2 | 7 | 5 | 1 | 0.50 | 0.20 | 0.29 | 85 | 4677 | $0.002005 | 197 |
-| `init-scaffold` | 3 | 11 | 10 | 3 | 1.00 | 0.30 | 0.27 | 2210 | 7812 | $0.002617 | 183 |
-| `init-copies` | 2 | 11 | 10 | 2 | 1.00 | 0.20 | 0.18 | 1992 | 8008 | $0.002517 | 196 |
-| `node-runtime-floor` | 1 | 11 | 6 | 1 | 1.00 | 0.17 | 0.09 | 1491 | 5886 | $0.002749 | 185 |
-| `types-alignment` | 1 | 11 | 6 | 1 | 1.00 | 0.17 | 0.09 | 1231 | 5886 | $0.002806 | 200 |
-| `wiki-validation` | 2 | 11 | 8 | 2 | 1.00 | 0.25 | 0.18 | 3325 | 9326 | $0.002856 | 199 |
-| `wiki-code-sync` | 1 | 11 | 8 | 1 | 1.00 | 0.12 | 0.09 | 5218 | 8551 | $0.002761 | 206 |
-| `compiled-cli-tests` | 2 | 11 | 6 | 2 | 1.00 | 0.33 | 0.18 | 1990 | 6314 | $0.002670 | 217 |
-| `run-unit-tests` | 1 | 11 | 7 | 1 | 1.00 | 0.14 | 0.09 | 1093 | 7909 | $0.002729 | 218 |
-| `upgrade-preserves` | 3 | 8 | 4 | 3 | 1.00 | 0.75 | 0.38 | 1482 | 2991 | $0.001868 | 201 |
-| `source-layout` | 1 | 11 | 8 | 1 | 1.00 | 0.12 | 0.09 | 4665 | 7124 | $0.002667 | 219 |
-| `flat-entities` | 2 | 1 | 0 | 0 | 0.00 | 0.00 | 0.00 | 0 | 0 | $0.000358 | 225 |
-| `index-tables` | 2 | 9 | 6 | 2 | 1.00 | 0.33 | 0.22 | 7420 | 8502 | $0.002437 | 202 |
-| `ingest-summary` | 3 | 10 | 4 | 3 | 1.00 | 0.75 | 0.30 | 4911 | 5581 | $0.002430 | 158 |
-| `raw-immutable` | 2 | 2 | 2 | 1 | 0.50 | 0.50 | 0.50 | 267 | 884 | $0.000392 | 167 |
-| `what-is-it` | 3 | 11 | 9 | 2 | 0.67 | 0.22 | 0.18 | 2611 | 7255 | $0.002680 | 209 |
-| `cli-dispatch` | 1 | 6 | 4 | 1 | 1.00 | 0.25 | 0.17 | 727 | 3204 | $0.001755 | 170 |
-| `template-vars` | 3 | 11 | 8 | 3 | 1.00 | 0.38 | 0.27 | 362 | 6989 | $0.002551 | 182 |
-| `utils-fs` | 2 | 11 | 10 | 2 | 1.00 | 0.20 | 0.18 | 1855 | 8515 | $0.002549 | 221 |
-| `wiki-log` | 2 | 11 | 5 | 0 | 0.00 | 0.00 | 0.00 | 1971 | 4908 | $0.002548 | 267 |
-| **mean** |  |  |  |  | **0.83** | **0.27** | **0.19** | **44906** | **120322** | **$0.045945** | 203 |
+| Query | Gold | Visited | Returned | Found | Recall | Sections | Section recall | Precision | Precision (visited) | Read (tok) | Lines | Whole (tok) | Cost | ms/answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `release-and-publish` | 2 | 7 | 5 | 1 | 0.50 | 0/2 | 0.00 | 0.20 | 0.29 | 85 | 6 | 4677 | $0.002005 | 197 |
+| `init-scaffold` | 3 | 11 | 10 | 3 | 1.00 | 2/3 | 0.67 | 0.30 | 0.27 | 2210 | 174 | 7812 | $0.002617 | 183 |
+| `init-copies` | 2 | 11 | 10 | 2 | 1.00 | 2/2 | 1.00 | 0.20 | 0.18 | 1992 | 141 | 8008 | $0.002517 | 196 |
+| `node-runtime-floor` | 1 | 11 | 6 | 1 | 1.00 | 1/1 | 1.00 | 0.17 | 0.09 | 1491 | 92 | 5886 | $0.002749 | 185 |
+| `types-alignment` | 1 | 11 | 6 | 1 | 1.00 | 1/1 | 1.00 | 0.17 | 0.09 | 1231 | 80 | 5886 | $0.002806 | 200 |
+| `wiki-validation` | 2 | 11 | 8 | 2 | 1.00 | 2/2 | 1.00 | 0.25 | 0.18 | 3325 | 226 | 9326 | $0.002856 | 199 |
+| `wiki-code-sync` | 1 | 11 | 8 | 1 | 1.00 | 1/1 | 1.00 | 0.12 | 0.09 | 5218 | 359 | 8551 | $0.002761 | 206 |
+| `compiled-cli-tests` | 2 | 11 | 6 | 2 | 1.00 | 2/2 | 1.00 | 0.33 | 0.18 | 1990 | 113 | 6314 | $0.002670 | 217 |
+| `run-unit-tests` | 1 | 11 | 7 | 1 | 1.00 | 1/1 | 1.00 | 0.14 | 0.09 | 1093 | 71 | 7909 | $0.002729 | 218 |
+| `upgrade-preserves` | 3 | 8 | 4 | 3 | 1.00 | 2/3 | 0.67 | 0.75 | 0.38 | 1482 | 114 | 2991 | $0.001868 | 201 |
+| `source-layout` | 1 | 11 | 8 | 1 | 1.00 | 1/1 | 1.00 | 0.12 | 0.09 | 4665 | 307 | 7124 | $0.002667 | 219 |
+| `flat-entities` | 2 | 1 | 0 | 0 | 0.00 | 0/2 | 0.00 | 0.00 | 0.00 | 0 | 0 | 0 | $0.000358 | 225 |
+| `index-tables` | 2 | 9 | 6 | 2 | 1.00 | 2/2 | 1.00 | 0.33 | 0.22 | 7420 | 525 | 8502 | $0.002437 | 202 |
+| `ingest-summary` | 3 | 10 | 4 | 3 | 1.00 | 3/3 | 1.00 | 0.75 | 0.30 | 4911 | 353 | 5581 | $0.002430 | 158 |
+| `raw-immutable` | 2 | 2 | 2 | 1 | 0.50 | 1/2 | 0.50 | 0.50 | 0.50 | 267 | 20 | 884 | $0.000392 | 167 |
+| `what-is-it` | 3 | 11 | 9 | 2 | 0.67 | 1/3 | 0.33 | 0.22 | 0.18 | 2611 | 195 | 7255 | $0.002680 | 209 |
+| `cli-dispatch` | 1 | 6 | 4 | 1 | 1.00 | 1/1 | 1.00 | 0.25 | 0.17 | 727 | 46 | 3204 | $0.001755 | 170 |
+| `template-vars` | 3 | 11 | 8 | 3 | 1.00 | 2/3 | 0.67 | 0.38 | 0.27 | 362 | 26 | 6989 | $0.002551 | 182 |
+| `utils-fs` | 2 | 11 | 10 | 2 | 1.00 | 2/2 | 1.00 | 0.20 | 0.18 | 1855 | 90 | 8515 | $0.002549 | 221 |
+| `wiki-log` | 2 | 11 | 5 | 0 | 0.00 | 0/2 | 0.00 | 0.00 | 0.00 | 1971 | 116 | 4908 | $0.002548 | 267 |
+| **mean** |  |  |  |  | **0.83** |  | **0.74** | **0.27** | **0.19** | **44906** | **3054** | **120322** | **$0.045945** | 203 |
 
 ### `--max-files 25`
 
-| Query | Gold | Visited | Returned | Found | Recall | Precision | Precision (visited) | Read (tok) | Whole (tok) | Cost | ms/answer |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| `release-and-publish` | 2 | 7 | 5 | 1 | 0.50 | 0.20 | 0.29 | 85 | 4677 | $0.002005 | 197 |
-| `init-scaffold` | 3 | 14 | 13 | 3 | 1.00 | 0.23 | 0.21 | 6714 | 13768 | $0.003300 | 199 |
-| `init-copies` | 2 | 14 | 12 | 2 | 1.00 | 0.17 | 0.14 | 3209 | 11502 | $0.003179 | 205 |
-| `node-runtime-floor` | 1 | 11 | 6 | 1 | 1.00 | 0.17 | 0.09 | 1491 | 5886 | $0.002749 | 185 |
-| `types-alignment` | 1 | 12 | 7 | 1 | 1.00 | 0.14 | 0.08 | 1385 | 8317 | $0.003053 | 208 |
-| `wiki-validation` | 2 | 13 | 9 | 2 | 1.00 | 0.22 | 0.15 | 5591 | 11592 | $0.003189 | 199 |
-| `wiki-code-sync` | 1 | 13 | 10 | 1 | 1.00 | 0.10 | 0.08 | 7913 | 11374 | $0.003065 | 196 |
-| `compiled-cli-tests` | 2 | 13 | 7 | 2 | 1.00 | 0.29 | 0.15 | 1990 | 7703 | $0.003058 | 211 |
-| `run-unit-tests` | 1 | 12 | 7 | 1 | 1.00 | 0.14 | 0.08 | 1093 | 7909 | $0.002904 | 214 |
-| `upgrade-preserves` | 3 | 8 | 4 | 3 | 1.00 | 0.75 | 0.38 | 1482 | 2991 | $0.001868 | 201 |
-| `source-layout` | 1 | 16 | 12 | 1 | 1.00 | 0.08 | 0.06 | 10154 | 12826 | $0.003623 | 212 |
-| `flat-entities` | 2 | 1 | 0 | 0 | 0.00 | 0.00 | 0.00 | 0 | 0 | $0.000358 | 225 |
-| `index-tables` | 2 | 9 | 6 | 2 | 1.00 | 0.33 | 0.22 | 7420 | 8502 | $0.002437 | 202 |
-| `ingest-summary` | 3 | 10 | 4 | 3 | 1.00 | 0.75 | 0.30 | 4911 | 5581 | $0.002430 | 158 |
-| `raw-immutable` | 2 | 2 | 2 | 1 | 0.50 | 0.50 | 0.50 | 267 | 884 | $0.000392 | 167 |
-| `what-is-it` | 3 | 16 | 12 | 2 | 0.67 | 0.17 | 0.12 | 7308 | 12509 | $0.003623 | 190 |
-| `cli-dispatch` | 1 | 6 | 4 | 1 | 1.00 | 0.25 | 0.17 | 727 | 3204 | $0.001755 | 170 |
-| `template-vars` | 3 | 14 | 9 | 3 | 1.00 | 0.33 | 0.21 | 765 | 9421 | $0.003180 | 189 |
-| `utils-fs` | 2 | 11 | 10 | 2 | 1.00 | 0.20 | 0.18 | 1855 | 8515 | $0.002549 | 221 |
-| `wiki-log` | 2 | 11 | 5 | 0 | 0.00 | 0.00 | 0.00 | 1971 | 4908 | $0.002548 | 267 |
-| **mean** |  |  |  |  | **0.83** | **0.25** | **0.17** | **66331** | **152069** | **$0.051264** | 202 |
+| Query | Gold | Visited | Returned | Found | Recall | Sections | Section recall | Precision | Precision (visited) | Read (tok) | Lines | Whole (tok) | Cost | ms/answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `release-and-publish` | 2 | 7 | 5 | 1 | 0.50 | 0/2 | 0.00 | 0.20 | 0.29 | 85 | 6 | 4677 | $0.002005 | 197 |
+| `init-scaffold` | 3 | 14 | 13 | 3 | 1.00 | 2/3 | 0.67 | 0.23 | 0.21 | 6714 | 482 | 13768 | $0.003300 | 199 |
+| `init-copies` | 2 | 14 | 12 | 2 | 1.00 | 2/2 | 1.00 | 0.17 | 0.14 | 3209 | 227 | 11502 | $0.003179 | 205 |
+| `node-runtime-floor` | 1 | 11 | 6 | 1 | 1.00 | 1/1 | 1.00 | 0.17 | 0.09 | 1491 | 92 | 5886 | $0.002749 | 185 |
+| `types-alignment` | 1 | 12 | 7 | 1 | 1.00 | 1/1 | 1.00 | 0.14 | 0.08 | 1385 | 87 | 8317 | $0.003053 | 208 |
+| `wiki-validation` | 2 | 13 | 9 | 2 | 1.00 | 2/2 | 1.00 | 0.22 | 0.15 | 5591 | 401 | 11592 | $0.003189 | 199 |
+| `wiki-code-sync` | 1 | 13 | 10 | 1 | 1.00 | 1/1 | 1.00 | 0.10 | 0.08 | 7913 | 566 | 11374 | $0.003065 | 196 |
+| `compiled-cli-tests` | 2 | 13 | 7 | 2 | 1.00 | 2/2 | 1.00 | 0.29 | 0.15 | 1990 | 113 | 7703 | $0.003058 | 211 |
+| `run-unit-tests` | 1 | 12 | 7 | 1 | 1.00 | 1/1 | 1.00 | 0.14 | 0.08 | 1093 | 71 | 7909 | $0.002904 | 214 |
+| `upgrade-preserves` | 3 | 8 | 4 | 3 | 1.00 | 2/3 | 0.67 | 0.75 | 0.38 | 1482 | 114 | 2991 | $0.001868 | 201 |
+| `source-layout` | 1 | 16 | 12 | 1 | 1.00 | 1/1 | 1.00 | 0.08 | 0.06 | 10154 | 712 | 12826 | $0.003623 | 212 |
+| `flat-entities` | 2 | 1 | 0 | 0 | 0.00 | 0/2 | 0.00 | 0.00 | 0.00 | 0 | 0 | 0 | $0.000358 | 225 |
+| `index-tables` | 2 | 9 | 6 | 2 | 1.00 | 2/2 | 1.00 | 0.33 | 0.22 | 7420 | 525 | 8502 | $0.002437 | 202 |
+| `ingest-summary` | 3 | 10 | 4 | 3 | 1.00 | 3/3 | 1.00 | 0.75 | 0.30 | 4911 | 353 | 5581 | $0.002430 | 158 |
+| `raw-immutable` | 2 | 2 | 2 | 1 | 0.50 | 1/2 | 0.50 | 0.50 | 0.50 | 267 | 20 | 884 | $0.000392 | 167 |
+| `what-is-it` | 3 | 16 | 12 | 2 | 0.67 | 1/3 | 0.33 | 0.17 | 0.12 | 7308 | 534 | 12509 | $0.003623 | 190 |
+| `cli-dispatch` | 1 | 6 | 4 | 1 | 1.00 | 1/1 | 1.00 | 0.25 | 0.17 | 727 | 46 | 3204 | $0.001755 | 170 |
+| `template-vars` | 3 | 14 | 9 | 3 | 1.00 | 2/3 | 0.67 | 0.33 | 0.21 | 765 | 58 | 9421 | $0.003180 | 189 |
+| `utils-fs` | 2 | 11 | 10 | 2 | 1.00 | 2/2 | 1.00 | 0.20 | 0.18 | 1855 | 90 | 8515 | $0.002549 | 221 |
+| `wiki-log` | 2 | 11 | 5 | 0 | 0.00 | 0/2 | 0.00 | 0.00 | 0.00 | 1971 | 116 | 4908 | $0.002548 | 267 |
+| **mean** |  |  |  |  | **0.83** |  | **0.74** | **0.25** | **0.17** | **66331** | **4613** | **152069** | **$0.051264** | 202 |
 
 ## Against grep, and against reading the corpus
 
@@ -184,14 +185,14 @@ The walk's own decision, in the same terms: the links it followed reach a wanted
 
 ## The default threshold
 
-The same gold set walked at `--max-files 10` with the link and section thresholds moved together, the way the CLI defaults them. These are judgments the runs above already made wherever the threshold never changed which page was worth visiting, so most of this table costs nothing.
+The same gold set walked at `--max-files 10` with the link and section thresholds moved together, the way the CLI defaults them. These are judgments the runs above already made wherever the threshold never changed which page was worth visiting, so most of this table costs nothing. `Section recall` and `Lines` are the two columns this is tuned against ([#58]): recall says whether the page is in the list at all, and the pair says whether what is returned is the part that answers — a threshold that keeps recall and takes lines without losing parts is reading less of the same pages, and one that loses parts is cutting the answer.
 
-| Threshold | Recall | Precision | Read (tok) | Cost |
-| --- | --- | --- | --- | --- |
-| 0.5 | 0.86 | 0.21 | 56454 | $0.048598 |
-| **0.6** (default) | 0.83 | 0.27 | 44906 | $0.045945 |
-| 0.7 | 0.63 | 0.41 | 25649 | $0.035831 |
-| 0.8 | 0.52 | 0.40 | 18124 | $0.027811 |
+| Threshold | Recall | Section recall | Precision | Read (tok) | Lines | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.5 | 0.86 | 0.74 | 0.21 | 56454 | 3725 | $0.048598 |
+| **0.6** (default) | 0.83 | 0.74 | 0.27 | 44906 | 3054 | $0.045945 |
+| 0.7 | 0.63 | 0.59 | 0.41 | 25649 | 1731 | $0.035831 |
+| 0.8 | 0.52 | 0.50 | 0.40 | 18124 | 1225 | $0.027811 |
 
 ## The preview experiment: frontmatter
 
@@ -346,21 +347,21 @@ The walk asks three things of every file — how far the file itself serves `que
 - **`reader-action`** and **`answer-bearing`** re-ask the file question, and with it the Score ladder: how much of the file a reader would read, and how much of what `query` needs is in the file itself rather than in the pages it links to.
 - **`reader`** is the cross-cutting one, and the only one that is not question wording alone: it defines the reader once in the state — an agent that must complete `query` by reading pages — and every question names it instead of spelling the reader out, with a verb where "useful" was. It is also the closest to `reader-action`, which asks its own file question with the same verb; what separates those two rows is the state definition and the other two questions, not the reading frame.
 
-The default row is the section question [#52] decided on, so the registers below it are measured on top of a walk that already has it. Where that decision's own reading came from is `docs/spike-notes.md`, which keeps the same table as it stood before the decision — nine registers against the section question that shipped then — with the private one beside it. `section-legacy` is the one row here that asks the words that shipped before the change: it is the walk the rest of this report was made on until the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files 10`, against the default's 0.83 / 0.27 for 44,906 — the same wanted pages, four fifths of the reading.
+The default row is the section question [#52] decided on, so the registers below it are measured on top of a walk that already has it. Where that decision's own reading came from is `docs/spike-notes.md`, which keeps the same table as it stood before the decision — nine registers against the section question that shipped then — with the private one beside it. `section-legacy` is the one row here that asks the words that shipped before the change: it is the walk the rest of this report was made on until the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files 10`, against the default's 0.83 / 0.27 for 44,906 — the same wanted pages, two thirds of the reading. Whether the reading it cut was the right reading is what the columns added for [#58] answer: `section-legacy` returns 0.78 of the wanted parts for 4479 lines, and the default 0.74 for 3054.
 
-| Wording | Recall | Precision | Read (tok) | Returned | Input (tok) | Cost | Requests | Req/answer |
-| --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| what ships (default) | 0.83 | 0.27 | 44906 | 126 | 1093921 | $0.045945 | 186 | 1.00 |
-| navigator | 0.61 | 0.34 | 17083 | 50 | 355245 | $0.014920 | 57 | 1.00 |
-| path | 0.72 | 0.24 | 27956 | 99 | 703203 | $0.029535 | 112 | 1.00 |
-| sharp-no | 0.82 | 0.25 | 44950 | 129 | 1078519 | $0.045298 | 186 | 1.00 |
-| rules | 0.72 | 0.21 | 35003 | 114 | 903271 | $0.037937 | 131 | 1.00 |
-| section-legacy | 0.83 | 0.26 | 68663 | 129 | 1057882 | $0.044431 | 181 | 1.00 |
-| reader-action | 0.78 | 0.41 | 46782 | 79 | 1085297 | $0.045582 | 184 | 1.00 |
-| answer-bearing | 0.74 | 0.42 | 47127 | 71 | 1088126 | $0.045701 | 184 | 1.00 |
-| reader | 0.70 | 0.27 | 37568 | 86 | 555427 | $0.023328 | 88 | 1.00 |
+| Wording | Recall | Section recall | Precision | Read (tok) | Lines | Returned | Input (tok) | Cost | Requests | Req/answer |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| what ships (default) | 0.83 | 0.74 | 0.27 | 44906 | 3054 | 126 | 1093921 | $0.045945 | 186 | 1.00 |
+| navigator | 0.61 | 0.55 | 0.34 | 17083 | 1150 | 50 | 355245 | $0.014920 | 57 | 1.00 |
+| path | 0.72 | 0.62 | 0.24 | 27956 | 1902 | 99 | 703203 | $0.029535 | 112 | 1.00 |
+| sharp-no | 0.82 | 0.72 | 0.25 | 44950 | 3027 | 129 | 1078519 | $0.045298 | 186 | 1.00 |
+| rules | 0.72 | 0.62 | 0.21 | 35003 | 2355 | 114 | 903271 | $0.037937 | 131 | 1.00 |
+| section-legacy | 0.83 | 0.78 | 0.26 | 68663 | 4479 | 129 | 1057882 | $0.044431 | 181 | 1.00 |
+| reader-action | 0.78 | 0.74 | 0.41 | 46782 | 3184 | 79 | 1085297 | $0.045582 | 184 | 1.00 |
+| answer-bearing | 0.74 | 0.72 | 0.42 | 47127 | 3214 | 71 | 1088126 | $0.045701 | 184 | 1.00 |
+| reader | 0.70 | 0.68 | 0.27 | 37568 | 2464 | 86 | 555427 | $0.023328 | 88 | 1.00 |
 
-`Returned` is the files that earned a place in the reading list, which is the list an agent reads and the one precision is over: a register that leaves recall where it was and returns fewer files is one whose sections and Scores stopped vouching for pages the walk still reached, and that is a cheaper list with the same wanted pages in it. `Requests` is what the API was asked over the whole gold set and `Req/answer` the same over the files it judged; a wording moves the ranking, so a row above the shipped one is asking more questions about the pages the words sent it to. The register each name sends is in `src/jev.rs` (`Wording`), sentence for sentence, and is held there by a test: what is measured here is what a reviewer can read. `--wording` on the CLI is the one way to ask for one.
+`Returned` is the files that earned a place in the reading list, which is the list an agent reads and the one precision is over: a register that leaves recall where it was and returns fewer files is one whose sections and Scores stopped vouching for pages the walk still reached, and that is a cheaper list with the same wanted pages in it. `Section recall` and `Lines` say what that cheaper list kept: the labelled parts of those pages the returned ranges cover, and the lines they span, so a row that returns fewer files and the same parts is reading less of the same pages, and one that loses parts is reading around the answer ([#58]). `Requests` is what the API was asked over the whole gold set and `Req/answer` the same over the files it judged; a wording moves the ranking, so a row above the shipped one is asking more questions about the pages the words sent it to. The register each name sends is in `src/jev.rs` (`Wording`), sentence for sentence, and is held there by a test: what is measured here is what a reviewer can read. `--wording` on the CLI is the one way to ask for one.
 
 Recall per query, the queries the shipped walk found least first:
 
@@ -388,11 +389,38 @@ Recall per query, the queries the shipped walk found least first:
 | `wiki-validation` | 2 | `useful-for` | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
 | **mean** |  |  | **0.83** | **0.61** | **0.72** | **0.82** | **0.72** | **0.83** | **0.78** | **0.74** | **0.70** |
 
+Section recall and the same lines per query, the walk that ships against `section-legacy`, the queries the section question lost the most parts on first — a query the two rows agree on is one whose cut reading was not read for:
+
+| Query | Gold | Mode | Section recall: default | Section recall: section-legacy | Lines: default | Lines: section-legacy |
+| --- | --- | --- | --- | --- | --- | --- |
+| `release-and-publish` | 2 | `useful-for` | 0.00 | 0.50 | 6 | 37 |
+| `init-scaffold` | 3 | `useful-for` | 0.67 | 1.00 | 174 | 281 |
+| `upgrade-preserves` | 3 | `answers` | 0.67 | 1.00 | 114 | 181 |
+| `cli-dispatch` | 1 | `answers` | 1.00 | 1.00 | 46 | 95 |
+| `compiled-cli-tests` | 2 | `answers` | 1.00 | 1.00 | 113 | 293 |
+| `flat-entities` | 2 | `answers` | 0.00 | 0.00 | 0 | 0 |
+| `index-tables` | 2 | `answers` | 1.00 | 1.00 | 525 | 531 |
+| `ingest-summary` | 3 | `useful-for` | 1.00 | 1.00 | 353 | 353 |
+| `init-copies` | 2 | `answers` | 1.00 | 1.00 | 141 | 263 |
+| `node-runtime-floor` | 1 | `answers` | 1.00 | 1.00 | 92 | 195 |
+| `raw-immutable` | 2 | `answers` | 0.50 | 0.50 | 20 | 54 |
+| `run-unit-tests` | 1 | `answers` | 1.00 | 1.00 | 71 | 229 |
+| `source-layout` | 1 | `about` | 1.00 | 1.00 | 307 | 214 |
+| `template-vars` | 3 | `answers` | 0.67 | 0.67 | 26 | 272 |
+| `types-alignment` | 1 | `answers` | 1.00 | 1.00 | 80 | 119 |
+| `utils-fs` | 2 | `answers` | 1.00 | 1.00 | 90 | 228 |
+| `wiki-code-sync` | 1 | `useful-for` | 1.00 | 1.00 | 359 | 492 |
+| `wiki-log` | 2 | `answers` | 0.00 | 0.00 | 116 | 250 |
+| `wiki-validation` | 2 | `useful-for` | 1.00 | 1.00 | 226 | 265 |
+| `what-is-it` | 3 | `about` | 0.33 | 0.00 | 195 | 127 |
+| **mean** |  |  | **0.74** | **0.78** | **3054** | **4479** |
+
 ## What these numbers are not
 
 - **The corpus is thin.** 19 pages, so a budget of 25 can hold the corpus and the wider budget stops being a ranking question. The differences between configurations here are indicative, not a tuning set; nothing in this report should be treated as more than a direction on a wiki this size.
 - **The labels are one reader's.** A page that is useful and unlisted counts against precision, so precision is a lower bound and recall is only as good as the list. The wanted sets were written from the wiki's own pages, not from a task run against it.
 - **A hit is not an answer.** Recall counts the files the reading list returned, not whether an agent could do the task with them: a wanted page the walk reached but that earned no place on its own is not in that list, so it counts as missed. `read` counts characters at 4, not what a tokeniser would charge.
+- **A section hit is not coverage.** Section recall counts a labelled part the returned ranges overlap, so a range that covers one line of a labelled section is counted like the range that covers all of it, and a part is only as good as the label a person wrote. It cannot be above recall, and both are one reader's judgement of what the answer is.
 - **One model, one day.** Jev moves its numbers between identical requests, which is why every number here comes from the committed cache: rerun without it and the rankings hold while the numbers underneath them shift (`docs/spike-notes.md`).
 
 ## The committed cache

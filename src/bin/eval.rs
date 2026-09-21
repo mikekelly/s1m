@@ -16,6 +16,12 @@
 //!   twice — over the returned list, and over every file the walk judged, which
 //!   is what it was while the list returned all of them — and the pair, with
 //!   the wanted pages the cutoff drops, is what the cutoff bought and cost.
+//! - **Section recall** beside them, and the lines the list returns: a gold
+//!   entry may name a heading or a line range, the part of the page that
+//!   answers ([#58]), and this is how many of those parts the returned ranges
+//!   cover. A page returned with nothing to read is in the file list and not in
+//!   this one; an entry that names no part is wanted whole, so its recall is
+//!   the file's, and the pair reads as what the section scores cut.
 //! - **Tokens the agent reads**, counted at [`CHARS_PER_TOKEN`] — the rule the
 //!   spike set its caps with, because nothing here tokenises. Three sets: the
 //!   returned line ranges, the same files whole, and the whole corpus. The
@@ -44,6 +50,7 @@
 //!
 //! [#10]: https://github.com/mikekelly/s1m/issues/10
 //! [#11]: https://github.com/mikekelly/s1m/issues/11
+//! [#58]: https://github.com/mikekelly/s1m/issues/58
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -330,12 +337,80 @@ struct Query {
     mode: String,
     /// The entry file, relative to the wiki root.
     entry: String,
-    /// The pages a person would want, relative to the wiki root, most wanted
-    /// first.
-    expected: Vec<String>,
+    /// The pages a person would want, most wanted first: a path for a page
+    /// wanted whole, or an object naming the part of it that answers ([#58]).
+    expected: Vec<Expected>,
     /// Why those pages, for whoever audits the labels.
     #[serde(default)]
     note: Option<String>,
+    /// Every wanted page with the lines that answer resolved against the wiki:
+    /// what [`Query::expected`] says, read once at load. Skipped by serde
+    /// because it is the wiki's answer to the labels, not a label of its own.
+    #[serde(skip)]
+    wanted: Vec<Wanted>,
+}
+
+/// One entry of a gold set's wanted pages: a page, or the part of a page that
+/// answers the query.
+///
+/// A page is file-level scoring, which is what every gold set written before
+/// [#58] means. A part is the same page with a reading question attached: the
+/// `heading` whose section answers — resolved against the parser the walk uses,
+/// its subsections included — or the `lines` that do, 1-based and inclusive as
+/// the parser gives them. One or the other, never both: a label names where the
+/// answer is, and there is one answer.
+///
+/// [#58]: https://github.com/mikekelly/s1m/issues/58
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+enum Expected {
+    Page(String),
+    Part {
+        path: String,
+        #[serde(default)]
+        heading: Option<String>,
+        #[serde(default)]
+        lines: Option<[usize; 2]>,
+    },
+}
+
+impl Expected {
+    /// The page this entry wants, which is what file-level recall counts.
+    fn path(&self) -> &str {
+        match self {
+            Expected::Page(path) => path,
+            Expected::Part { path, .. } => path,
+        }
+    }
+}
+
+/// The label as the report spells it: the page, and the part of it named.
+impl std::fmt::Display for Expected {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expected::Page(path) => write!(out, "`{path}`"),
+            Expected::Part {
+                path,
+                heading: Some(heading),
+                ..
+            } => write!(out, "`{path}`: {heading}"),
+            Expected::Part {
+                path,
+                lines: Some([first, last]),
+                ..
+            } => write!(out, "`{path}`: lines {first}–{last}"),
+            Expected::Part { path, .. } => write!(out, "`{path}`"),
+        }
+    }
+}
+
+/// One wanted page and the lines of it that answer the query.
+#[derive(Debug, Clone, PartialEq)]
+struct Wanted {
+    page: PathBuf,
+    /// 1-based and inclusive, as the parser gives them: the page's whole body
+    /// when the entry names no part of it.
+    lines: [usize; 2],
 }
 
 impl Query {
@@ -348,10 +423,83 @@ impl Query {
         PathBuf::from(&self.entry)
     }
 
-    /// The pages this query wants.
+    /// The pages this query wants, however each entry named them.
     fn expected(&self) -> BTreeSet<PathBuf> {
-        self.expected.iter().map(PathBuf::from).collect()
+        self.expected
+            .iter()
+            .map(|entry| PathBuf::from(entry.path()))
+            .collect()
     }
+
+    /// The pages this query wants and the lines of each that answer: what
+    /// section recall is counted over, one part a wanted page.
+    fn wanted(&self) -> &[Wanted] {
+        &self.wanted
+    }
+
+    /// Resolves the labels against the wiki: a page named on its own is wanted
+    /// whole, a heading is the section it opens, and lines are read as written.
+    ///
+    /// Every label is checked, because a label that names no heading, or lines
+    /// the page does not have, would otherwise read as a page nothing recalled
+    /// rather than as the mistake it is.
+    fn resolve(&self, corpus: &Corpus) -> Result<Vec<Wanted>, String> {
+        self.expected
+            .iter()
+            .map(|entry| {
+                let page = PathBuf::from(entry.path());
+                let lines = match entry {
+                    Expected::Page(_) => whole_page(corpus, &page),
+                    Expected::Part { heading, lines, .. } => match (heading, lines) {
+                        (Some(heading), None) => corpus
+                            .section(&page, heading)
+                            .map_err(|error| format!("{}: {error}", self.id))?,
+                        (None, Some([first, last])) => named_lines(corpus, &page, *first, *last)
+                            .map_err(|error| format!("{}: {error}", self.id))?,
+                        (Some(_), Some(_)) => {
+                            return Err(format!(
+                                "{}: {} names a heading and lines; one or the other",
+                                self.id,
+                                page.display()
+                            ));
+                        }
+                        (None, None) => {
+                            return Err(format!(
+                                "{}: {} names neither a heading nor lines",
+                                self.id,
+                                page.display()
+                            ));
+                        }
+                    },
+                };
+                Ok(Wanted { page, lines })
+            })
+            .collect()
+    }
+}
+
+/// Every line of a page the wiki holds: what an entry naming no part of it
+/// wants.
+fn whole_page(corpus: &Corpus, page: &Path) -> [usize; 2] {
+    [1, corpus.lines_of(page)]
+}
+
+/// The lines a label names, checked against the page they are written in.
+fn named_lines(
+    corpus: &Corpus,
+    page: &Path,
+    first: usize,
+    last: usize,
+) -> Result<[usize; 2], String> {
+    let lines = corpus.lines_of(page);
+    if first < 1 || first > last || last > lines {
+        return Err(format!(
+            "{} has {} lines, so {first}–{last} is not a range in it",
+            page.display(),
+            lines
+        ));
+    }
+    Ok([first, last])
 }
 
 /// The criterion a mode name picks, spelled as the plan's Relevance modes table
@@ -375,7 +523,7 @@ impl Gold {
     fn load(file: &Path, corpus: &Corpus) -> Result<Gold, String> {
         let text =
             fs::read_to_string(file).map_err(|error| format!("{}: {error}", file.display()))?;
-        let gold: Gold =
+        let mut gold: Gold =
             serde_json::from_str(&text).map_err(|error| format!("{}: {error}", file.display()))?;
         if gold.queries.is_empty() {
             return Err(format!("{}: no queries", file.display()));
@@ -402,8 +550,8 @@ impl Gold {
                 return Err(format!("{}: no expected pages", query.id));
             }
             let mut wanted = BTreeSet::new();
-            for page in &query.expected {
-                let page = PathBuf::from(page);
+            for entry in &query.expected {
+                let page = PathBuf::from(entry.path());
                 if !corpus.has(&page) {
                     return Err(format!(
                         "{}: expected page {} is not under {}",
@@ -420,6 +568,12 @@ impl Gold {
                     ));
                 }
             }
+        }
+        // The labels are read against the wiki last, so a set with a page the
+        // wiki does not hold is that mistake's error and not a heading's.
+        for query in &mut gold.queries {
+            let wanted = query.resolve(corpus)?;
+            query.wanted = wanted;
         }
         Ok(gold)
     }
@@ -464,14 +618,15 @@ impl Corpus {
         self.text.contains_key(page)
     }
 
-    /// The characters in `page`'s `ranges` — 1-based and inclusive, as the
-    /// parser gives them — counted once where ranges overlap.
+    /// What `page`'s `ranges` cover: the characters in them and the lines they
+    /// span, each counted once — 1-based and inclusive, as the parser gives
+    /// them.
     ///
     /// A section's range contains its subsections', so overlapping ranges are
     /// the normal case and the union is what a reader actually reads.
-    fn chars_in(&self, page: &Path, ranges: &[[usize; 2]]) -> usize {
+    fn reading(&self, page: &Path, ranges: &[[usize; 2]]) -> Reading {
         let Some(source) = self.text.get(page) else {
-            return 0;
+            return Reading::default();
         };
         let lines: Vec<&str> = source.split_inclusive('\n').collect();
         let mut counted = vec![false; lines.len()];
@@ -482,12 +637,45 @@ impl Corpus {
                 }
             }
         }
-        lines
+        let mut reading = Reading::default();
+        for (line, counted) in lines.iter().zip(&counted) {
+            if *counted {
+                reading.chars += line.chars().count();
+                reading.lines += 1;
+            }
+        }
+        reading
+    }
+
+    /// The lines of `page`'s section under `heading`, as the parser the walk
+    /// uses gives them: the heading's own line through its last, so a section
+    /// covers its subsections.
+    ///
+    /// A heading no section has, or two sections share, is a label that names
+    /// nothing rather than a range to guess at.
+    fn section(&self, page: &Path, heading: &str) -> Result<[usize; 2], String> {
+        let parsed = parse::parse(self.root.join(page), &self.root)
+            .map_err(|error| format!("{}: {error}", page.display()))?;
+        let mut named = parsed
+            .sections
             .iter()
-            .zip(&counted)
-            .filter(|(_, counted)| **counted)
-            .map(|(line, _)| line.chars().count())
-            .sum()
+            .filter(|section| section.heading.as_deref() == Some(heading));
+        let section = named
+            .next()
+            .ok_or_else(|| format!("{} has no heading named {heading:?}", page.display()))?;
+        if named.next().is_some() {
+            return Err(format!(
+                "{} has two headings named {heading:?}; name lines instead",
+                page.display()
+            ));
+        }
+        Ok(section.lines)
+    }
+
+    /// How many lines one page has, counted the way the parser counts them: a
+    /// trailing newline does not open a line of its own.
+    fn lines_of(&self, page: &Path) -> usize {
+        self.text.get(page).map_or(0, |text| text.lines().count())
     }
 
     /// Every character in one page.
@@ -498,6 +686,22 @@ impl Corpus {
     /// Every character in the wiki.
     fn chars(&self) -> usize {
         self.text.values().map(|text| text.chars().count()).sum()
+    }
+}
+
+/// What a page's ranges cover: the characters in them and the lines they span.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Reading {
+    chars: usize,
+    lines: usize,
+}
+
+impl std::iter::Sum for Reading {
+    fn sum<I: Iterator<Item = Reading>>(readings: I) -> Reading {
+        readings.fold(Reading::default(), |total, reading| Reading {
+            chars: total.chars + reading.chars,
+            lines: total.lines + reading.lines,
+        })
     }
 }
 
@@ -842,6 +1046,16 @@ struct Score {
     returned: usize,
     /// How many of the returned files it wanted.
     found: usize,
+    /// How many of the wanted pages it wanted *and* gave the agent something of
+    /// to read in: the labelled part of the page, the returned ranges
+    /// overlapping it.
+    ///
+    /// The question file-level recall does not ask. A page the list returned
+    /// with no range above the section threshold is in [`Score::found`] and not
+    /// here, and so is one whose ranges miss the section the query's label
+    /// names; one part a wanted page, so this is over [`Score::gold`] the way
+    /// recall is.
+    parts_found: usize,
     /// How many of the files the walk judged it wanted, returned or walked.
     ///
     /// Not [`Score::found`] by another name: the walk can reach a wanted page
@@ -851,6 +1065,10 @@ struct Score {
     reached: usize,
     /// Tokens an agent reads when it opens the returned ranges.
     read_tokens: usize,
+    /// The lines those ranges span, counted once where they overlap: the same
+    /// reading as [`Score::read_tokens`], in the unit a section question is
+    /// asked in.
+    read_lines: usize,
     /// Tokens it reads when it opens the returned files whole.
     whole_tokens: usize,
 }
@@ -858,6 +1076,14 @@ struct Score {
 impl Score {
     fn recall(&self) -> f64 {
         self.found as f64 / self.gold as f64
+    }
+
+    /// The wanted pages the list also gave something to read in, over all of
+    /// them: [`Score::recall`] with the part of the page the gold set names
+    /// asked about, and never more than it, because a part cannot be returned
+    /// without its page.
+    fn section_recall(&self) -> f64 {
+        self.parts_found as f64 / self.gold as f64
     }
 
     /// The share of what was returned that was wanted. A run that returned
@@ -1245,34 +1471,24 @@ impl Env<'_> {
             .iter()
             .map(|hit| parse::relative_to_root(self.root, hit))
             .collect();
-        let expected = query.expected();
-        let found = hits.iter().filter(|hit| expected.contains(*hit)).count();
-        let whole_tokens: usize = tokens(hits.iter().map(|page| self.corpus.chars_of(page)).sum());
+        // A grep opens every page it hit, whole: the whole file is the range it
+        // returns, so it is scored by the walk's own rule — what it judged and
+        // what it returned are one list, and the two precisions are the same
+        // number.
+        let returned: Vec<Visit> = hits
+            .iter()
+            .map(|path| Visit {
+                path: path.clone(),
+                relevance: None,
+                scent: None,
+                lines: vec![whole_page(self.corpus, path)],
+            })
+            .collect();
         Run {
             id: query.id.clone(),
-            // A grep reads every page it hit, so what it judged and what it
-            // returned are one list: the two precisions are the same number,
-            // and the row is comparable to s1m's rows on that footing.
-            score: Score {
-                gold: expected.len(),
-                visited: hits.len(),
-                returned: hits.len(),
-                found,
-                reached: found,
-                // An agent that greps reads the files it hit, whole.
-                read_tokens: whole_tokens,
-                whole_tokens,
-            },
+            score: self.score(query, &returned, &[]),
             spent: Spent::default(),
-            returned: hits
-                .into_iter()
-                .map(|path| Visit {
-                    path,
-                    relevance: None,
-                    scent: None,
-                    lines: Vec::new(),
-                })
-                .collect(),
+            returned,
             walked: Vec::new(),
             judged: Vec::new(),
             unreadable: Vec::new(),
@@ -1291,14 +1507,23 @@ impl Env<'_> {
             .iter()
             .filter(|visit| expected.contains(&visit.path))
             .count();
+        let parts_found = query
+            .wanted()
+            .iter()
+            .filter(|part| {
+                returned
+                    .iter()
+                    .any(|visit| visit.path == part.page && covers(&visit.lines, part.lines))
+            })
+            .count();
         let reached = returned
             .iter()
             .chain(walked)
             .filter(|visit| expected.contains(&visit.path))
             .count();
-        let read: usize = returned
+        let read: Reading = returned
             .iter()
-            .map(|visit| self.corpus.chars_in(&visit.path, &visit.lines))
+            .map(|visit| self.corpus.reading(&visit.path, &visit.lines))
             .sum();
         let whole: usize = returned
             .iter()
@@ -1309,11 +1534,23 @@ impl Env<'_> {
             visited: returned.len() + walked.len(),
             returned: returned.len(),
             found,
+            parts_found,
             reached,
-            read_tokens: tokens(read),
+            read_tokens: tokens(read.chars),
+            read_lines: read.lines,
             whole_tokens: tokens(whole),
         }
     }
+}
+
+/// Whether a returned file's `ranges` reach the labelled part: the rule a
+/// wanted part is counted by, and the reason a section's range covers its
+/// subsections' — a range that touches the part is reading it, and one that
+/// misses it is not.
+fn covers(ranges: &[[usize; 2]], part: [usize; 2]) -> bool {
+    ranges
+        .iter()
+        .any(|range| range[0] <= part[1] && part[0] <= range[1])
 }
 
 // ------------------------------------------------------------------ the runs
@@ -1778,6 +2015,21 @@ impl Findings {
         );
         let _ = writeln!(
             out,
+            "- **Section recall**: {} — {} of the {} wanted parts the gold set labels are covered \
+             by the ranges the list returns, against {} of the {} wanted pages in the list at all, \
+             for {} lines returned. A part is the heading or line range an entry names, and an \
+             entry that names none is wanted whole, so its part is its page; where the two numbers \
+             differ, the list returned a page with nothing to read in it, or ranges that miss the \
+             part the label points at.",
+            ratio(mean_section_recall(s1m)),
+            sum(s1m, |run| run.score.parts_found),
+            wanted,
+            ratio(mean_recall(s1m)),
+            sum(s1m, |run| run.score.found),
+            sum(s1m, |run| run.score.read_lines),
+        );
+        let _ = writeln!(
+            out,
             "- **The keyword ranker finds more and reads far more**: recall {} against s1m's {}, at \
              {} tokens against {} — {} the reading for {} more of the wanted pages. On a wiki whose \
              pages share their vocabulary with the queries, grep is the stronger recaller and s1m \
@@ -1920,7 +2172,9 @@ impl Findings {
              would want open. `mode` is the criterion the query is judged by, `entry` the page a \
              caller would start from. Labels are the queries' own — a page that is useful but \
              unlisted costs precision, and no label says a page is useless — so precision is a \
-             lower bound.",
+             lower bound. An entry that names a heading or lines is a page whose answer lives in \
+             part of it ([#58]), and those are the parts **Section recall** below is counted over: \
+             a page named on its own is wanted whole, so its part is its page.",
             self.gold.queries.len()
         );
         let _ = writeln!(out);
@@ -1937,7 +2191,7 @@ impl Findings {
                     query
                         .expected
                         .iter()
-                        .map(|page| format!("`{page}`"))
+                        .map(|entry| entry.to_string())
                         .collect::<Vec<_>>()
                         .join(", "),
                     query.note.clone().unwrap_or_default(),
@@ -1966,10 +2220,15 @@ impl Findings {
              pages, and precision is the wanted pages in it over the files in it; precision \
              (visited) is the same over everything the walk judged, which is the number this \
              harness reported while the list was everything the walk had visited, so the two side \
-             by side are what the cutoff bought and cost. At `--max-files {tight}`: {} files \
+             by side are what the cutoff bought and cost. `Sections` is how many of those wanted \
+             pages the list also gave something to read in — the returned ranges overlapping the \
+             part of the page the gold entry names, its whole page where it names none — over one \
+             part a wanted page, and `Section recall` that count over `Gold`. It is never above \
+             recall: a part cannot be returned without its page. At `--max-files {tight}`: {} files \
              visited and {} returned, mean precision {} against {} over everything visited. `read` \
              is what the agent opens — the returned ranges only — and `whole` is those same files \
-             read entire.",
+             read entire; `Lines` is the same reading in line numbers, counted once where ranges \
+             overlap.",
             self.threshold,
             sum(tight_runs, |run| run.score.visited),
             sum(tight_runs, |run| run.score.returned),
@@ -1989,9 +2248,12 @@ impl Findings {
                     "Returned",
                     "Found",
                     "Recall",
+                    "Sections",
+                    "Section recall",
                     "Precision",
                     "Precision (visited)",
                     "Read (tok)",
+                    "Lines",
                     "Whole (tok)",
                     "Cost",
                     "ms/answer",
@@ -2007,9 +2269,12 @@ impl Findings {
                         run.score.returned.to_string(),
                         run.score.found.to_string(),
                         ratio(run.score.recall()),
+                        format!("{}/{}", run.score.parts_found, run.score.gold),
+                        ratio(run.score.section_recall()),
                         ratio(run.score.precision()),
                         ratio(run.score.precision_over_visited()),
                         run.score.read_tokens.to_string(),
+                        run.score.read_lines.to_string(),
                         run.score.whole_tokens.to_string(),
                         usd(run.spent.cost_usd()),
                         millis(run.spent.mean_latency()),
@@ -2025,9 +2290,12 @@ impl Findings {
                     String::new(),
                     String::new(),
                     format!("**{}**", ratio(mean_recall(runs))),
+                    String::new(),
+                    format!("**{}**", ratio(mean_section_recall(runs))),
                     format!("**{}**", ratio(mean_precision(runs))),
                     format!("**{}**", ratio(mean_precision_over_visited(runs))),
                     format!("**{}**", sum(runs, |run| run.score.read_tokens)),
+                    format!("**{}**", sum(runs, |run| run.score.read_lines)),
                     format!("**{}**", sum(runs, |run| run.score.whole_tokens)),
                     format!("**{}**", usd(sum_cost(runs))),
                     millis(mean_run_latency(runs)),
@@ -2362,13 +2630,25 @@ impl Findings {
             "The same gold set walked at `--max-files {}` with the link and section thresholds \
              moved together, the way the CLI defaults them. These are judgments the runs above \
              already made wherever the threshold never changed which page was worth visiting, so \
-             most of this table costs nothing.",
+             most of this table costs nothing. `Section recall` and `Lines` are the two columns \
+             this is tuned against ([#58]): recall says whether the page is in the list at all, \
+             and the pair says whether what is returned is the part that answers — a threshold \
+             that keeps recall and takes lines without losing parts is reading less of the same \
+             pages, and one that loses parts is cutting the answer.",
             self.budgets[0]
         );
         let _ = writeln!(out);
         head(
             out,
-            &["Threshold", "Recall", "Precision", "Read (tok)", "Cost"],
+            &[
+                "Threshold",
+                "Recall",
+                "Section recall",
+                "Precision",
+                "Read (tok)",
+                "Lines",
+                "Cost",
+            ],
         );
         for (threshold, runs) in &self.sweep {
             row(
@@ -2379,8 +2659,10 @@ impl Findings {
                         false => threshold.to_string(),
                     },
                     ratio(mean_recall(runs)),
+                    ratio(mean_section_recall(runs)),
                     ratio(mean_precision(runs)),
                     sum(runs, |run| run.score.read_tokens).to_string(),
+                    sum(runs, |run| run.score.read_lines).to_string(),
                     usd(sum_cost(runs)),
                 ],
             );
@@ -2851,6 +3133,12 @@ impl Findings {
              the state definition and the other two questions, not the reading frame."
         );
         let _ = writeln!(out);
+        let shipped = &self.wordings[0].1;
+        let legacy = self
+            .wordings
+            .iter()
+            .find(|(label, _)| *label == "section-legacy")
+            .map(|(_, runs)| runs);
         let _ = writeln!(
             out,
             "The default row is the section question [#52] decided on, so the registers below it \
@@ -2860,8 +3148,21 @@ impl Findings {
              private one beside it. `section-legacy` is the one row here that asks the words that \
              shipped before the change: it is the walk the rest of this report was made on until \
              the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files {}`, against the \
-             default's 0.83 / 0.27 for 44,906 — the same wanted pages, four fifths of the reading.",
-            self.budgets[0]
+             default's 0.83 / 0.27 for 44,906 — the same wanted pages, two thirds of the \
+             reading. Whether the reading it cut was the right reading is what the columns added \
+             for [#58] answer: `section-legacy` returns {} of the wanted parts for {} lines, and \
+             the default {} for {}.",
+            self.budgets[0],
+            match legacy {
+                Some(runs) => ratio(mean_section_recall(runs)),
+                None => "—".to_string(),
+            },
+            match legacy {
+                Some(runs) => sum(runs, |run| run.score.read_lines).to_string(),
+                None => "—".to_string(),
+            },
+            ratio(mean_section_recall(shipped)),
+            sum(shipped, |run| run.score.read_lines),
         );
         let _ = writeln!(out);
         head(
@@ -2869,8 +3170,10 @@ impl Findings {
             &[
                 "Wording",
                 "Recall",
+                "Section recall",
                 "Precision",
                 "Read (tok)",
+                "Lines",
                 "Returned",
                 "Input (tok)",
                 "Cost",
@@ -2884,8 +3187,10 @@ impl Findings {
                 &[
                     (*label).to_string(),
                     ratio(mean_recall(runs)),
+                    ratio(mean_section_recall(runs)),
                     ratio(mean_precision(runs)),
                     sum(runs, |run| run.score.read_tokens).to_string(),
+                    sum(runs, |run| run.score.read_lines).to_string(),
                     sum(runs, |run| run.score.returned).to_string(),
                     sum(runs, |run| run.spent.input_tokens).to_string(),
                     usd(sum_cost(runs)),
@@ -2901,19 +3206,22 @@ impl Findings {
              agent reads and the one precision is over: a register that leaves recall where it was \
              and returns fewer files is one whose sections and Scores stopped vouching for pages \
              the walk still reached, and that is a cheaper list with the same wanted pages in it. \
-             `Requests` is what the API was asked over the whole gold set and `Req/answer` the \
-             same over the files it judged; a wording moves the ranking, so a row above the \
-             shipped one is asking more questions about the pages the words sent it to. The \
-             register each name sends is in `src/jev.rs` (`Wording`), sentence for sentence, and \
-             is held there by a test: what is measured here is what a reviewer can read. \
-             `--wording` on the CLI is the one way to ask for one."
+             `Section recall` and `Lines` say what that cheaper list kept: the labelled parts of \
+             those pages the returned ranges cover, and the lines they span, so a row that returns \
+             fewer files and the same parts is reading less of the same pages, and one that loses \
+             parts is reading around the answer ([#58]). `Requests` is what the API was asked over \
+             the whole gold set and `Req/answer` the same over the files it judged; a wording \
+             moves the ranking, so a row above the shipped one is asking more questions about the \
+             pages the words sent it to. The register each name sends is in `src/jev.rs` \
+             (`Wording`), sentence for sentence, and is held there by a test: what is measured \
+             here is what a reviewer can read. `--wording` on the CLI is the one way to ask for \
+             one."
         );
         let _ = writeln!(out);
 
         // Per query, the queries the shipped walk found least first, as the
         // tables above: a mean over twenty queries hides the ones that found
         // nothing, which are the ones a wording has to move to matter.
-        let shipped = &self.wordings[0].1;
         let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
         order.sort_by(|left, right| {
             shipped[*left]
@@ -2957,6 +3265,82 @@ impl Findings {
         );
         row(out, &means);
         let _ = writeln!(out);
+
+        // What the reading was for, per query, for the two rows the columns
+        // were added for ([#58]): the means above say what the section question
+        // did to the parts, and this says which queries it did it to.
+        let _ = writeln!(
+            out,
+            "Section recall and the same lines per query, the walk that ships against \
+             `section-legacy`, the queries the section question lost the most parts on first — a \
+             query the two rows agree on is one whose cut reading was not read for:"
+        );
+        let _ = writeln!(out);
+        let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
+        order.sort_by(|left, right| {
+            let lost = |index: usize| match legacy {
+                Some(runs) => {
+                    shipped[index].score.section_recall() - runs[index].score.section_recall()
+                }
+                None => 0.0,
+            };
+            lost(*left)
+                .partial_cmp(&lost(*right))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.gold.queries[*left]
+                        .id
+                        .cmp(&self.gold.queries[*right].id)
+                })
+        });
+        head(
+            out,
+            &[
+                "Query",
+                "Gold",
+                "Mode",
+                "Section recall: default",
+                "Section recall: section-legacy",
+                "Lines: default",
+                "Lines: section-legacy",
+            ],
+        );
+        for &index in &order {
+            let legacy_run = legacy.map(|runs| &runs[index]);
+            row(
+                out,
+                &[
+                    format!("`{}`", self.gold.queries[index].id),
+                    shipped[index].score.gold.to_string(),
+                    format!("`{}`", self.gold.queries[index].mode),
+                    ratio(shipped[index].score.section_recall()),
+                    legacy_run
+                        .map_or_else(|| "—".to_string(), |run| ratio(run.score.section_recall())),
+                    shipped[index].score.read_lines.to_string(),
+                    legacy_run
+                        .map_or_else(|| "—".to_string(), |run| run.score.read_lines.to_string()),
+                ],
+            );
+        }
+        row(
+            out,
+            &[
+                "**mean**".to_string(),
+                String::new(),
+                String::new(),
+                format!("**{}**", ratio(mean_section_recall(shipped))),
+                legacy.map_or_else(
+                    || "—".to_string(),
+                    |runs| format!("**{}**", ratio(mean_section_recall(runs))),
+                ),
+                format!("**{}**", sum(shipped, |run| run.score.read_lines)),
+                legacy.map_or_else(
+                    || "—".to_string(),
+                    |runs| format!("**{}**", sum(runs, |run| run.score.read_lines)),
+                ),
+            ],
+        );
+        let _ = writeln!(out);
     }
 
     fn limitations(&self, out: &mut String) {
@@ -2984,6 +3368,14 @@ impl Findings {
              earned no place on its own is not in that list, so it counts as missed. `read` counts \
              characters at {}, not what a tokeniser would charge.",
             CHARS_PER_TOKEN
+        );
+        let _ = writeln!(
+            out,
+            "- **A section hit is not coverage.** Section recall counts a labelled part the \
+             returned ranges overlap, so a range that covers one line of a labelled section is \
+             counted like the range that covers all of it, and a part is only as good as the label \
+             a person wrote. It cannot be above recall, and both are one reader's judgement of \
+             what the answer is."
         );
         let _ = writeln!(
             out,
@@ -3234,6 +3626,20 @@ fn mean_recall(runs: &[Run]) -> f64 {
     }
 }
 
+/// The same mean over the parts the gold set labels: what the returned ranges
+/// cover, beside the pages the list returned.
+fn mean_section_recall(runs: &[Run]) -> f64 {
+    match runs.is_empty() {
+        true => 0.0,
+        false => {
+            runs.iter()
+                .map(|run| run.score.section_recall())
+                .sum::<f64>()
+                / runs.len() as f64
+        }
+    }
+}
+
 fn mean_precision(runs: &[Run]) -> f64 {
     match runs.is_empty() {
         true => 0.0,
@@ -3317,19 +3723,47 @@ mod tests {
     }
 
     fn query(id: &str, expected: &[&str]) -> Query {
+        querying(
+            id,
+            &expected
+                .iter()
+                .map(|page| (*page, [1, usize::MAX]))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// A query whose labels name the part of each page that answers: a label a
+    /// gold set reads off the wiki, spelled out here so a test can score one
+    /// without a wiki to resolve it against.
+    fn querying(id: &str, parts: &[(&str, [usize; 2])]) -> Query {
         Query {
             id: id.to_string(),
             query: "a query".to_string(),
             mode: "useful-for".to_string(),
             entry: "index.md".to_string(),
-            expected: expected.iter().map(|page| (*page).to_string()).collect(),
+            expected: parts
+                .iter()
+                .map(|(page, lines)| Expected::Part {
+                    path: (*page).to_string(),
+                    heading: None,
+                    lines: Some(*lines),
+                })
+                .collect(),
             note: None,
+            wanted: parts
+                .iter()
+                .map(|(page, lines)| Wanted {
+                    page: PathBuf::from(page),
+                    lines: *lines,
+                })
+                .collect(),
         }
     }
 
     /// The reading numbers are the text of the returned ranges, and a range the
     /// reader has already read in another range is not read twice: sections
-    /// nest, so a parent's range contains its children's.
+    /// nest, so a parent's range contains its children's. The lines are the
+    /// same reading in the unit a section question is asked in.
     #[test]
     fn read_tokens_count_each_line_once_however_ranges_overlap() {
         // Four lines of four characters each, newline included, so a token is
@@ -3337,23 +3771,45 @@ mod tests {
         let corpus = corpus(&[("a.md", "aaa\nbbb\nccc\nddd\n")]);
         let page = Path::new("a.md");
 
-        assert_eq!(tokens(corpus.chars_in(page, &[[1, 2]])), 2, "two lines");
         assert_eq!(
-            tokens(corpus.chars_in(page, &[[1, 4], [2, 3]])),
+            tokens(corpus.reading(page, &[[1, 2]]).chars),
+            2,
+            "two lines"
+        );
+        assert_eq!(
+            tokens(corpus.reading(page, &[[1, 4], [2, 3]]).chars),
             4,
             "the nested range adds nothing"
         );
         assert_eq!(
-            tokens(corpus.chars_in(page, &[[1, 1], [3, 3]])),
+            tokens(corpus.reading(page, &[[1, 1], [3, 3]]).chars),
             2,
             "disjoint ranges add up"
         );
         assert_eq!(
-            tokens(corpus.chars_in(page, &[[9, 20]])),
+            tokens(corpus.reading(page, &[[9, 20]]).chars),
             0,
             "a range past the end reads nothing"
         );
         assert_eq!(tokens(corpus.chars_of(page)), 4, "the whole file");
+
+        assert_eq!(corpus.reading(page, &[[1, 2]]).lines, 2, "two lines");
+        assert_eq!(
+            corpus.reading(page, &[[1, 4], [2, 3]]).lines,
+            4,
+            "the nested range is one reading of those lines"
+        );
+        assert_eq!(
+            corpus.reading(page, &[[1, 1], [3, 3]]).lines,
+            2,
+            "disjoint ranges add up"
+        );
+        assert_eq!(
+            corpus.reading(page, &[[9, 20]]).lines,
+            0,
+            "a range past the end reads nothing"
+        );
+        assert_eq!(corpus.lines_of(page), 4, "the whole file");
     }
 
     /// The characters counted are the file's, not the bytes': a page of
@@ -3361,7 +3817,7 @@ mod tests {
     #[test]
     fn read_tokens_count_characters_not_bytes() {
         let corpus = corpus(&[("a.md", "héllo wörld\n")]);
-        assert_eq!(corpus.chars_in(Path::new("a.md"), &[[1, 1]]), 12);
+        assert_eq!(corpus.reading(Path::new("a.md"), &[[1, 1]]).chars, 12);
     }
 
     /// Recall is what the list found over what was wanted, precision what it
@@ -3407,6 +3863,168 @@ mod tests {
             score.whole_tokens, 5,
             "wanted.md's 19 characters whole, not the walked file's four as well"
         );
+    }
+
+    /// Section recall is file recall with the part of the page asked about: a
+    /// file returned with ranges that miss the labelled section is found and
+    /// not covered, and one returned with no ranges at all is the whole
+    /// difference between the two numbers.
+    #[test]
+    fn section_recall_counts_only_the_parts_the_ranges_cover() {
+        let corpus = corpus(&[
+            ("index.md", "index\n"),
+            ("wanted.md", "one\ntwo\nthree\nfour\n"),
+            ("whole.md", "five\nsix\n"),
+        ]);
+        let env = Env {
+            root: Path::new("wiki"),
+            corpus: &corpus,
+            cache: &Cache::Off,
+            key: String::new(),
+            ignore: Ignore::none(),
+        };
+        // One labelled part inside a page, and one page whose whole body is
+        // what its label names: an entry naming no part at all resolves to the
+        // second of those, so both are one part a wanted page.
+        let query = querying("q", &[("wanted.md", [2, 3]), ("whole.md", [1, 2])]);
+
+        let score = env.score(
+            &query,
+            &[visit("wanted.md", &[[1, 1]]), visit("whole.md", &[[1, 2]])],
+            &[],
+        );
+        assert_eq!(score.found, 2, "both wanted pages are in the list");
+        assert_eq!(score.parts_found, 1, "and one of them misses its part");
+        assert_eq!(score.recall(), 1.0);
+        assert_eq!(score.section_recall(), 0.5);
+        assert_eq!(score.read_lines, 3, "one line, then the whole of whole.md");
+
+        let score = env.score(
+            &query,
+            &[visit("wanted.md", &[[3, 4]]), visit("whole.md", &[[2, 2]])],
+            &[],
+        );
+        assert_eq!(score.parts_found, 2, "a range that overlaps is reading it");
+        assert_eq!(score.section_recall(), 1.0);
+
+        // The page the list returned with nothing above the section threshold
+        // to read: recall counts it, section recall does not, and that gap is
+        // the one the two numbers exist to show.
+        let score = env.score(
+            &query,
+            &[visit("wanted.md", &[])],
+            &[visit("whole.md", &[[1, 2]])],
+        );
+        assert_eq!(score.found, 1);
+        assert_eq!(score.parts_found, 0);
+        assert_eq!(score.section_recall(), 0.0);
+        assert_eq!(score.read_lines, 0);
+    }
+
+    /// A gold entry may name the part of a page that answers, and the label is
+    /// read against the wiki: a heading is the section the parser gives the
+    /// walk — its subsections included — lines are as written, and a page named
+    /// on its own is wanted whole. A label that names nothing is the set's
+    /// mistake, named as one, because it would otherwise read as a page nothing
+    /// recalled.
+    #[test]
+    fn a_gold_entry_may_name_the_part_of_the_page_that_answers() {
+        let wiki = scratch("parts");
+        fs::write(wiki.join("index.md"), "# Index\n").expect("a page");
+        fs::write(
+            wiki.join("named.md"),
+            "# Named\ntext\n\n## Section A\none\n\n### Nested\ntwo\n\n## Section B\nthree\n",
+        )
+        .expect("a page");
+        fs::write(wiki.join("lines.md"), "one\ntwo\nthree\nfour\nfive\n").expect("a page");
+        fs::write(
+            wiki.join("twice.md"),
+            "# Twice\n\n## Same\none\n\n## Same\ntwo\n",
+        )
+        .expect("a page");
+        let corpus = Corpus::load(&wiki).expect("a wiki");
+
+        let file = wiki.join("gold.json");
+        let gold = |expected: &str| {
+            fs::write(
+                &file,
+                format!(
+                    r#"{{"queries":[{{"id":"q","query":"a query","mode":"answers",
+                        "entry":"index.md","expected":{expected}}}]}}"#
+                ),
+            )
+            .expect("a gold set");
+            Gold::load(&file, &corpus)
+        };
+
+        let loaded = gold(
+            r#"["index.md", {"path":"named.md","heading":"Section A"},
+                {"path":"lines.md","lines":[2,3]}]"#,
+        )
+        .expect("a labelled set");
+        assert_eq!(
+            loaded.queries[0].wanted(),
+            [
+                Wanted {
+                    page: PathBuf::from("index.md"),
+                    lines: [1, 1],
+                },
+                Wanted {
+                    // The section's own heading through its last line, which
+                    // includes the subsection under it.
+                    page: PathBuf::from("named.md"),
+                    lines: [4, 9],
+                },
+                Wanted {
+                    page: PathBuf::from("lines.md"),
+                    lines: [2, 3],
+                },
+            ],
+            "a page named on its own is wanted whole, a heading is the section \
+             the parser gives the walk, and lines are as written"
+        );
+        assert_eq!(
+            loaded.queries[0].expected().len(),
+            3,
+            "every entry is still a page for file-level recall"
+        );
+
+        for (label, names, expected) in [
+            (
+                "a heading the page does not have",
+                "q: named.md has no heading named \"Section Z\"",
+                r#"["index.md", {"path":"named.md","heading":"Section Z"}]"#,
+            ),
+            (
+                "a heading two sections share",
+                "q: twice.md has two headings named \"Same\"; name lines instead",
+                r#"["index.md", {"path":"twice.md","heading":"Same"}]"#,
+            ),
+            (
+                "lines the page does not have",
+                "q: lines.md has 5 lines, so 4–9 is not a range in it",
+                r#"["index.md", {"path":"lines.md","lines":[4,9]}]"#,
+            ),
+            (
+                "lines that run backwards",
+                "q: lines.md has 5 lines, so 3–2 is not a range in it",
+                r#"["index.md", {"path":"lines.md","lines":[3,2]}]"#,
+            ),
+            (
+                "a heading and lines at once",
+                "q: lines.md names a heading and lines; one or the other",
+                r#"["index.md", {"path":"lines.md","heading":"Any","lines":[1,2]}]"#,
+            ),
+            (
+                "a part that names neither",
+                "q: lines.md names neither a heading nor lines",
+                r#"["index.md", {"path":"lines.md"}]"#,
+            ),
+        ] {
+            let error = gold(expected).expect_err(label);
+            assert!(error.contains(names), "{label}: {error}");
+        }
+        let _ = fs::remove_dir_all(&wiki);
     }
 
     /// A gold set the wiki cannot answer is the set's mistake, and is named as

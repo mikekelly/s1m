@@ -943,7 +943,7 @@ fn s1m_condition(
             "cold": cold,
             "threshold": threshold,
             "files": list.files,
-            "wanted": query.wanted,
+            "wanted": query.pages(),
             "read_chars": list.read_chars,
         }),
         // s1m's walk buys judgments from a model, but the model is the
@@ -1192,7 +1192,7 @@ fn agent_run(
             "answer": summary.answer,
             "files_relied": files_relied,
             "files_read": files_read,
-            "wanted": query.wanted,
+            "wanted": query.pages(),
             "relied_parsed": relied_parsed,
             // What the parent and the subagent answered on, which the point of
             // the run is that they can differ. What was asked for is on the row
