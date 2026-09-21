@@ -56,6 +56,13 @@
 //! has been visited stay settled rather than be re-opened. A scent outside 0 to
 //! 1 is not followed: scoring junk is not allowed to break that ordering.
 //!
+//! A config may ask for a trace ([`crate::trace`], the CLI's `--trace FILE`):
+//! the walk then reports every file it pops, every link it queues or passes
+//! over, and every visit, and the scorer's cache reports the requests and
+//! answers beside them. The trace is written as the walk goes and changes
+//! nothing about it — a traced walk visits exactly what an untraced one visits,
+//! and the file is a record of the run and not an input to it.
+//!
 //! Every path in the result — `path`, `via`, link targets — is spelled the way
 //! [`parse`] spells link targets: normalised and relative to the root, so
 //! `config.root.join(path)` is the file to read.
@@ -74,6 +81,7 @@ use serde::Serialize;
 use crate::ignore::Ignore;
 use crate::parse::{ParseError, ParsedFile, parse, relative_to_root};
 use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError};
+use crate::trace::{Reason, Trace};
 
 /// One traversal: the query, where to start, and the budgets that stop it.
 ///
@@ -134,6 +142,16 @@ pub struct Config<'a> {
     /// silent drop ([`crate::cli::Error::Ignored`]); the drop is here so that no
     /// caller of the walk can read a matched path by passing one.
     pub ignore: &'a Ignore,
+    /// The run's trace, or `None` for a walk nobody is watching
+    /// ([`crate::trace`]).
+    ///
+    /// The walk reports what it does — every pop, every link it queues or
+    /// passes over, every visit — and nothing else: what a request cost and
+    /// whether the answer was on disk is the scorer's, and the cache reports
+    /// that to the same trace. A traced walk decides exactly what an untraced
+    /// one decides; the trace is written as the walk goes, so a run that is
+    /// killed leaves everything up to the kill.
+    pub trace: Option<&'a Trace>,
 }
 
 /// How a file's links earn their place on the frontier.
@@ -351,9 +369,21 @@ impl PartialEq for Frontier {
 
 impl Eq for Frontier {}
 
-/// What the walk holds for a file: its parse and its judgment, or why it could
-/// not be had.
-type Answer = Result<(ParsedFile, FileJudgment), Failure>;
+/// One file's answer: what was parsed and judged, and the links the root's
+/// `.s1mignore` took out before the scorer saw them.
+///
+/// The matched targets are carried rather than dropped because the trace
+/// reports them: each was never read, never sent and never judged, which is not
+/// the same thing as a link the scorer passed over, and once they are out of
+/// the file the walk is the only place that still knows of them.
+struct Answered {
+    file: ParsedFile,
+    judgment: FileJudgment,
+    ignored: Vec<PathBuf>,
+}
+
+/// What the walk holds for a file: its answer, or why it could not be had.
+type Answer = Result<Answered, Failure>;
 
 /// One walk's state.
 struct Search<'a> {
@@ -437,6 +467,11 @@ impl<'a> Search<'a> {
             }
         }
 
+        // What the walk queued and the budget then stopped short of is still on
+        // the frontier, and a trace has to say so: a replay would otherwise
+        // leave those paths on screen, waiting for a turn that never came.
+        self.prune_the_rest();
+
         // A round buys its files together, so the walk can end with an answer it
         // never used: a better path took the file's place and the budget then
         // ran out. One that answered is what the walk bought and did not spend;
@@ -495,6 +530,12 @@ impl<'a> Search<'a> {
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         for entry in &entries {
             self.best.insert(entry.path.clone(), entry.clone());
+            // The entry files are the first thing the walk visits, so they are
+            // the first files a replay shows: popped at path score 1, depth 0,
+            // and no link reached them.
+            if let Some(trace) = self.config.trace {
+                trace.popped(&entry.path, entry.score, entry.depth, &entry.via);
+            }
         }
         Ok(entries)
     }
@@ -529,8 +570,20 @@ impl<'a> Search<'a> {
     fn next_pending(&mut self, batch: &[Frontier]) -> Option<Frontier> {
         loop {
             let entry = self.frontier.pop()?;
-            if self.dealt_with(&entry) || self.past_beam(entry.depth, batch) {
+            if self.dealt_with(&entry) {
                 continue;
+            }
+            if self.past_beam(entry.depth, batch) {
+                // The beam has taken as many files at this depth as it allows,
+                // so this path is dropped here and never expanded. It was
+                // admitted when its link queued it, and the trace says it went
+                // no further: a replay that only heard about admissions would
+                // show a frontier that never empties.
+                self.pruned_path(&entry, Reason::Beam);
+                continue;
+            }
+            if let Some(trace) = self.config.trace {
+                trace.popped(&entry.path, entry.score, entry.depth, &entry.via);
             }
             return Some(entry);
         }
@@ -584,6 +637,47 @@ impl<'a> Search<'a> {
         self.frontier.push(entry);
     }
 
+    /// One link the walk passed over, as the trace reports it.
+    fn prune(&self, source: &Path, target: &Path, scent: Option<f64>, reason: Reason) {
+        if let Some(trace) = self.config.trace {
+            trace.pruned(source, target, scent, reason);
+        }
+    }
+
+    /// One path the walk queued and dropped before visiting it, as the trace
+    /// reports it. The source is the file whose link queued the path, which
+    /// every path on the frontier has: the entries were named and are not
+    /// queued, and they are visited before the walk reads the frontier at all.
+    fn pruned_path(&self, entry: &Frontier, reason: Reason) {
+        let Some(source) = entry.via.last() else {
+            return;
+        };
+        self.prune(source, &entry.path, entry.scent, reason);
+    }
+
+    /// The paths the walk queued and never reached because its file budget ran
+    /// out, reported as pruned by it in path order — the heap's order is not an
+    /// order a record can use.
+    ///
+    /// A path a better one has overtaken is not among them: the file is visited
+    /// by the best path found to it, and the link that queued the other one was
+    /// reported when it queued it. Neither is a file already visited or failed,
+    /// which is what [`Search::dealt_with`] says.
+    fn prune_the_rest(&mut self) {
+        if self.config.trace.is_none() {
+            return;
+        }
+        let mut pending: Vec<Frontier> = std::mem::take(&mut self.frontier)
+            .into_vec()
+            .into_iter()
+            .filter(|entry| !self.dealt_with(entry))
+            .collect();
+        pending.sort_by(|a, b| a.path.cmp(&b.path));
+        for entry in &pending {
+            self.pruned_path(entry, Reason::MaxFiles);
+        }
+    }
+
     /// The answers for one round's files, in the order the batch was popped.
     ///
     /// A file a round overtook is already answered, and that answer is taken
@@ -633,7 +727,8 @@ impl<'a> Search<'a> {
     /// file here, before the scorer sees it: the target is not read for a
     /// preview, its path is not in the request, and the judgment has no question
     /// to answer about it. What comes back is the file's own links minus those,
-    /// which is also what the reading list reports.
+    /// which is also what the reading list reports — and the targets themselves,
+    /// which is what the trace reports.
     async fn score(&self, batch: &[Frontier]) -> Vec<Answer> {
         let root = self.config.root;
         let query = self.config.query;
@@ -641,9 +736,20 @@ impl<'a> Search<'a> {
         let scorer = self.scorer;
         join_all(batch.iter().map(|entry| async move {
             let mut file = parse(root.join(&entry.path), root)?;
-            file.links.retain(|link| !ignore.matched(&link.target));
+            let mut ignored = Vec::new();
+            file.links.retain(|link| {
+                let matched = ignore.matched(&link.target);
+                if matched {
+                    ignored.push(link.target.clone());
+                }
+                !matched
+            });
             let judgment = scorer.score(query, &file).await?;
-            Ok((file, judgment))
+            Ok(Answered {
+                file,
+                judgment,
+                ignored,
+            })
         }))
         .await
     }
@@ -661,7 +767,11 @@ impl<'a> Search<'a> {
             scent,
             via,
         } = self.best.remove(&entry.path).unwrap_or(entry);
-        let (file, judgment) = match outcome {
+        let Answered {
+            file,
+            judgment,
+            ignored,
+        } = match outcome {
             Ok(answered) => answered,
             Err(failure) => {
                 // A file the walk popped and could not judge still spends the
@@ -688,18 +798,36 @@ impl<'a> Search<'a> {
             *self.depths.entry(depth).or_default() += 1;
         }
 
+        // The links the root's `.s1mignore` took out of the file are reported
+        // first, in the order the file links to them: they were never read and
+        // never judged, which the rest of this visit's record is about.
+        for target in &ignored {
+            self.prune(&path, target, None, Reason::Ignored);
+        }
+
         let mut links = judged_links(&file, &judgment);
         for link in &mut links {
-            // A link the scorer named no scent for, one it did not keep, a
-            // scent that is not a probability, one below the threshold, one out
-            // of the root or one past the depth budget all queue nothing.
+            // A link outside the root is never followed, whatever the scorer
+            // said about it — and a Choice scorer is not even asked about one —
+            // so it is reported here rather than as an answer with no home.
+            if !link.in_root {
+                self.prune(&path, &link.target, link.scent, Reason::OutOfRoot);
+                continue;
+            }
+            // A link the scorer named no scent for, a scent that is not a
+            // probability, one the admission rule does not admit, or one past
+            // the depth budget all queue nothing: each is reported with the
+            // reason the walk read it by.
             let Some(link_scent) = link.scent else {
+                self.prune(&path, &link.target, None, Reason::Unjudged);
                 continue;
             };
-            if !link.in_root
-                || !self.config.admission.admits(link_scent, link.keep)
-                || depth + 1 > self.config.max_depth
-            {
+            if !self.config.admission.admits(link_scent, link.keep) {
+                self.prune(&path, &link.target, link.scent, self.refusal());
+                continue;
+            }
+            if depth + 1 > self.config.max_depth {
+                self.prune(&path, &link.target, link.scent, Reason::MaxDepth);
                 continue;
             }
             let mut child_via = via.clone();
@@ -711,9 +839,24 @@ impl<'a> Search<'a> {
                 scent: Some(link_scent),
                 via: child_via,
             });
+            if let Some(trace) = self.config.trace {
+                if link.followed {
+                    trace.admitted(&path, &link.target, link_scent);
+                } else {
+                    // The target is visited already, or a path at least as good
+                    // was queued for it: the first path to reach a file at its
+                    // best score is the one the walk keeps.
+                    trace.pruned(
+                        &path,
+                        &link.target,
+                        Some(link_scent),
+                        Reason::AlreadyReached,
+                    );
+                }
+            }
         }
 
-        self.results.push(VisitedFile {
+        let visited = VisitedFile {
             path,
             relevance: judgment.relevance,
             scent,
@@ -722,7 +865,27 @@ impl<'a> Search<'a> {
             via,
             sections: judged_sections(&file, &judgment),
             links,
-        });
+        };
+        if let Some(trace) = self.config.trace {
+            // The reading list's rule, asked of the reading list's cutoff: a
+            // result is a file that earned a place, and the list and the trace
+            // cannot disagree about which files those are.
+            trace.result(
+                &visited.path,
+                visited.relevance,
+                visited.earns_a_place(trace.threshold()),
+            );
+        }
+        self.results.push(visited);
+    }
+
+    /// The reason the admission rule refused a link: the caller's floor did not
+    /// clear, or the scorer's own verdict did not keep it.
+    fn refusal(&self) -> Reason {
+        match self.config.admission {
+            Admission::Threshold(_) => Reason::BelowThreshold,
+            Admission::Scorer => Reason::NotKept,
+        }
     }
 
     /// Queues a file unless it is already dealt with or a path at least as good

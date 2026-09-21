@@ -223,6 +223,7 @@ above describe.
 | `--share-k` | `3` | And the cut's numerator: a link has to hold `k / options` of the page's probability |
 | `--beam` | `8` under `--scorer choice`, none otherwise | Files the walk visits at one depth |
 | `--wording` | the wording that ships | Ask the three questions in another register, leaving the criterion alone: `navigator`, `path`, `sharp-no`, `rules`, `necessity`, `section-legacy`, `reader-action`, `answer-bearing` or `reader`. It composes with `--mode` rather than replacing it — one picks what counts as relevant, the other how the questions about it are put — and the reading list still reports the criterion's name ([#52](https://github.com/mikekelly/s1m/issues/52)) |
+| `--trace` | off | Write the walk to a file as it happens, one JSON object per line, so it can be replayed ([the trace of a run](#the-trace-of-a-run)) |
 
 A Choice over a page keeps a link when its share clears
 `max(--share-floor, min(--share-k / options, 0.5))`, where `options` counts the `none` option
@@ -256,6 +257,49 @@ the table in
 [eval/REPORT.md](eval/REPORT.md#the-wording-the-same-three-questions-in-another-register) and the
 decision in
 [docs/spike-notes.md](docs/spike-notes.md#the-wording-what-the-three-judgments-are-asked-in).
+
+### The trace of a run
+
+`--trace FILE` writes what the walk did to `FILE` as it does it: one JSON object per line, each
+with `t_ms`, the milliseconds since the walk started. Off is off — no record is built at all —
+and on is a record of the run rather than an input to it: the reading list on stdout is the one
+the same command prints without the flag, and it is the same cache key, so a traced run and an
+untraced one ask for the same things and rank the same files.
+
+What it is for is replay. A reading list says what the walk found; a trace says what it did, in
+the order it did it, so a run can be drawn as the crawl it was with the list filling in. Each
+line is written whole and as its event happens, so a run that is killed leaves everything up to
+the kill — a reader that stops at the last line has a trace of the run so far, and never half a
+line.
+
+Paths are relative to the root the walk is bounded by — `notes/ledger.md` for a root of `wiki` —
+which is how `via` and a link's target are spelled within a run.
+
+| `event` | Fields | What it is |
+| --- | --- | --- |
+| `popped` | `path`, `path_score`, `depth`, `via` | The walk took the file off the frontier. The entry files come first, at path score 1, depth 0 and no `via`; every other path carries the score, depth and `via` of the best path found to the file. |
+| `requested` | `path`, `post_index` | One request for the file, once per post: a page whose sections and links do not fit one request is asked about in several, and each is a record of its own, in the order they were sent. |
+| `answered` | `path`, `latency_ms`, `relevance`, `cached`, `sections`, `links` | The scorer's answer: the file's relevance, a score per heading section and a scent per link, each as the scorer gave it. `cached` is `true` when the answer came off the disk, and `latency_ms` is what the call that bought it took — whenever that was, so a warm replay can be told from a cold one. |
+| `admitted` | `source`, `target`, `scent` | A link queued its target, at `scent` of the source's path score. |
+| `pruned` | `source`, `target`, `scent`, `reason` | Either a link that queued nothing — `below_threshold`, `not_kept`, `unjudged`, `out_of_root`, `max_depth`, `already_reached`, `ignored` — or a path the walk queued and then dropped: `beam`, `max_files`. |
+| `result` | `path`, `relevance`, `earned_a_place` | The file was visited, with the reading list's own verdict on it: relevance or a section at or above `--threshold`. |
+
+A path can be admitted and pruned later, by `beam` or by `max_files`: both budgets are read when
+the walk takes a path off the frontier and not when a link queues it, so a replay has both
+records and knows the path never became a visit. A file the walk could not judge keeps what
+happened to it — a `popped`, a `requested`, and no `answered`.
+
+```bash
+s1m --trace run.jsonl "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+jq -c 'select(.event == "admitted" or .event == "result")' run.jsonl | head -3
+```
+
+The trace is not part of the walk's determinism, and does not have to be: `t_ms` and `latency_ms`
+are the run's real timings, and the order a round's answers come back in is the network's. What
+the reading list promises — the files visited and the order they rank in — is the same with the
+flag as without it. The player that draws one is a thing of its own, and not part of this
+([#57](https://github.com/mikekelly/s1m/issues/57)).
 
 ### Output formats
 

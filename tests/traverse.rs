@@ -10,15 +10,20 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde_json::{Value, json};
 use tokio::time::sleep;
 
+use s1m::cache::{Cacheable, CachedScorer};
+use s1m::cli::Uncached;
 use s1m::ignore::Ignore;
 use s1m::parse::{self, ParsedFile, relative_to_root};
 use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
+use s1m::trace::{Reason, Trace};
 use s1m::traverse::{Admission, Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
 
 const QUERY: &str = "settlement timing for instant payouts";
@@ -61,6 +66,9 @@ struct Fake {
     in_flight: AtomicUsize,
     peak: AtomicUsize,
     mixer: AtomicUsize,
+    /// A trace to look at while this fake is answering: what a run that is
+    /// killed mid-answer has already written about it.
+    peek: Option<PathBuf>,
 }
 
 impl Fake {
@@ -78,7 +86,15 @@ impl Fake {
             in_flight: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             mixer: AtomicUsize::new(mix),
+            peek: None,
         }
+    }
+
+    /// Watches `path` while answering: inside every call, the file's request is
+    /// on disk and its answer is not, which is the state a killed run leaves.
+    fn peeking(mut self, path: PathBuf) -> Fake {
+        self.peek = Some(path);
+        self
     }
 
     /// Varies each answer's latency, so answers come back in a different order
@@ -131,8 +147,58 @@ impl Fake {
 impl Scorer for Fake {
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         assert_eq!(query, QUERY, "the traversal's query reaches the scorer");
+        self.answer(file).await
+    }
+}
+
+/// The same fake as a scorer a cache can sit in front of, which is what makes
+/// the requests a run makes visible to a trace: one request per file, built
+/// from the query and the path, and an answer that reports how long it took.
+#[async_trait::async_trait]
+impl Cacheable for Fake {
+    type Request = String;
+    /// What the answer cost: how long the fake's own call took, which is what a
+    /// trace reports as `latency_ms` and what a jittered run varies.
+    type Detail = Duration;
+
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<String, ScorerError> {
+        Ok(format!("{query}\n{}", file.path.display()))
+    }
+
+    fn key(&self, request: &String) -> Result<Vec<u8>, ScorerError> {
+        Ok(request.as_bytes().to_vec())
+    }
+
+    async fn call(
+        &self,
+        _request: &String,
+        file: &ParsedFile,
+    ) -> Result<(FileJudgment, Duration), ScorerError> {
+        let started = Instant::now();
+        let judgment = self.answer(file).await?;
+        Ok((judgment, started.elapsed()))
+    }
+
+    /// One request per file: nothing this fake judges is split across posts,
+    /// which is a real scorer's business ([`s1m::jev::JevScorer`]).
+    fn posts(&self, _request: &String) -> usize {
+        1
+    }
+
+    fn latency(detail: &Duration) -> Duration {
+        *detail
+    }
+}
+
+impl Fake {
+    /// What the table says about `file`: the answer a request for it gets, and
+    /// the delay per answer the walk's determinism tests turn on.
+    async fn answer(&self, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         let path = relative_to_root(&self.root, &file.path);
         let name = path.to_string_lossy().into_owned();
+        if let Some(trace) = &self.peek {
+            self.peek_at(trace, &name);
+        }
         let Some(entry) = self.table.get(name.as_str()) else {
             return Err(ScorerError::MissingAnswer { id: name });
         };
@@ -173,6 +239,40 @@ impl Scorer for Fake {
                 })
                 .collect(),
         })
+    }
+
+    /// Stops the walk under a trace file's own feet: a file's request is on
+    /// disk before the answer to it is bought, which is what a run killed
+    /// mid-answer leaves behind.
+    ///
+    /// Read line by line rather than as a whole, because a trace is JSON Lines
+    /// and not one document: a reader that needs the last line to parse has a
+    /// trace it cannot follow while the run that wrote it is still going.
+    fn peek_at(&self, trace: &Path, file: &str) {
+        let written = fs::read_to_string(trace)
+            .unwrap_or_else(|error| panic!("{}: {error}", trace.display()));
+        let records: Vec<Value> = written
+            .lines()
+            .map(|line| {
+                serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}"))
+            })
+            .collect();
+        let about = |event: &str| {
+            records
+                .iter()
+                .filter(|record| record["event"] == event && record["path"] == file)
+                .count()
+        };
+        assert_eq!(
+            about("requested"),
+            1,
+            "{file}'s request should be on disk before its answer is bought: {written}"
+        );
+        assert_eq!(
+            about("answered"),
+            0,
+            "{file} has no answer yet, so none should be written: {written}"
+        );
     }
 }
 
@@ -475,6 +575,11 @@ impl Settings {
     }
 
     async fn run(&self, scorer: &dyn Scorer) -> Traversal {
+        self.traced(scorer, None).await
+    }
+
+    /// The same walk, reporting to `trace` when the test asked for one.
+    async fn traced(&self, scorer: &dyn Scorer, trace: Option<&Trace>) -> Traversal {
         let config = Config {
             query: QUERY,
             entries: &self.entries,
@@ -485,6 +590,7 @@ impl Settings {
             admission: self.admission,
             beam: self.beam,
             ignore: &self.ignore,
+            trace,
         };
         traverse(&config, scorer)
             .await
@@ -1485,6 +1591,7 @@ async fn entries_must_be_given_against_the_same_base_as_the_root() {
         admission: Admission::Threshold(0.6),
         beam: None,
         ignore: &ignore,
+        trace: None,
     };
 
     assert!(matches!(
@@ -1714,4 +1821,567 @@ async fn a_file_the_walk_cannot_judge_still_spends_its_beam_turn() {
     assert_eq!(paths(&one), paths(&four), "the same at any round size");
     assert_eq!(failures(&one), failures(&four));
     assert_eq!(one.calls, four.calls);
+}
+
+// ----------------------------------------------------------------- the trace
+
+/// The trace file a [`Traced`] writes, named inside its own directory.
+const TRACE: &str = "trace.jsonl";
+
+/// A trace file of one test's own, and what is in it so far.
+///
+/// The file lives in a [`Tree`]'s directory, which is a temp directory the test
+/// holds: a trace is read while the walk that wrote it is still around, and one
+/// test's trace must not be read by another.
+///
+/// One trace and not two: the walk reports its own events to it and the judge
+/// reports the requests and answers to the same file, which is what `main.rs`
+/// wires for `--trace`.
+struct Traced {
+    dir: Tree,
+    trace: Arc<Trace>,
+}
+
+impl Traced {
+    /// A trace for a walk over `root`, cut at the reading list's `threshold`.
+    fn new(label: &str, root: &Path, threshold: f64) -> Traced {
+        let dir = Tree::new(label);
+        let trace = Trace::create(&dir.root().join(TRACE), root, threshold).expect("a trace file");
+        Traced {
+            dir,
+            trace: Arc::new(trace),
+        }
+    }
+
+    /// The file the records go to.
+    fn path(&self) -> PathBuf {
+        self.dir.root().join(TRACE)
+    }
+
+    /// What the walk reports to.
+    fn walk(&self) -> Option<&Trace> {
+        Some(&self.trace)
+    }
+
+    /// What a judge reports to: the same trace the walk writes.
+    fn sink(&self) -> Option<Arc<Trace>> {
+        Some(Arc::clone(&self.trace))
+    }
+
+    /// The scorer as the run's judge, reporting its requests and answers to this
+    /// trace — what `main.rs` builds for a `--no-cache` run with `--trace`.
+    fn judge<S: Cacheable>(&self, scorer: S) -> Uncached<S> {
+        Uncached::new(scorer).with_trace(self.sink())
+    }
+
+    /// The records written so far, each line parsed on its own: a trace is JSON
+    /// Lines, and every line of it stands alone.
+    fn records(&self) -> Vec<Value> {
+        fs::read_to_string(self.path())
+            .expect("the trace file should be readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect()
+    }
+
+    /// Every record as `event path`, or `event source -> target` for one about a
+    /// link, which is the order a test holds the trace to.
+    fn order(&self) -> Vec<String> {
+        self.records()
+            .iter()
+            .map(|record| {
+                let event = record["event"].as_str().expect("an event name");
+                match record["path"].as_str() {
+                    Some(path) => format!("{event} {path}"),
+                    None => format!(
+                        "{event} {} -> {}",
+                        record["source"].as_str().expect("a source"),
+                        record["target"].as_str().expect("a target")
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    /// The one record of `event` about the file `path`.
+    fn record(&self, event: &str, path: &str) -> Value {
+        let records = self.records();
+        records
+            .iter()
+            .find(|record| record["event"] == event && record["path"] == path)
+            .unwrap_or_else(|| panic!("{event} {path} should be in the trace: {records:?}"))
+            .clone()
+    }
+
+    /// The one record of `event` about the link from `source` to `target`.
+    fn link(&self, event: &str, source: &str, target: &str) -> Value {
+        let records = self.records();
+        records
+            .iter()
+            .find(|record| {
+                record["event"] == event && record["source"] == source && record["target"] == target
+            })
+            .unwrap_or_else(|| {
+                panic!("{event} {source} -> {target} should be in the trace: {records:?}")
+            })
+            .clone()
+    }
+
+    /// The targets of the records of `event` whose `reason` is `reason`.
+    fn targets_with(&self, event: &str, reason: &str) -> Vec<String> {
+        self.records()
+            .iter()
+            .filter(|record| record["event"] == event && record["reason"] == reason)
+            .map(|record| {
+                record["target"]
+                    .as_str()
+                    .expect("a link record has a target")
+                    .to_string()
+            })
+            .collect()
+    }
+}
+
+/// The graph the trace tests walk: one entry, one page it links on to, a page
+/// under the threshold, a page outside the root, and a page two hops down.
+///
+/// Small enough that the trace it produces is read line by line in the test
+/// below, and shaped so that a link is passed over for each of the reasons a
+/// walk has: `b.md` is under the threshold, `../outside.md` is out of the root,
+/// and `index.md` — the page the walk started from — is reached again from
+/// `a.md`.
+fn traced_tree(label: &str) -> Tree {
+    let tree = Tree::new(label);
+    tree.page(
+        "index.md",
+        &[
+            "a.md".to_string(),
+            "b.md".to_string(),
+            "../outside.md".to_string(),
+        ],
+    );
+    tree.page("a.md", &["c.md".to_string(), "index.md".to_string()]);
+    tree.page("b.md", &[]);
+    tree.page("c.md", &["b.md".to_string()]);
+    tree
+}
+
+/// What the fake knows about the traced tree: the entry is relevant to nothing,
+/// `a.md` is a result, `c.md` is reached two hops down, and `b.md` is under the
+/// threshold from the entry and over it from `c.md`.
+fn traced_table() -> Vec<(&'static str, Entry)> {
+    vec![
+        (
+            "index.md",
+            Entry::new(
+                0.4,
+                &[("a.md", 0.9), ("b.md", 0.4), ("../outside.md", 0.99)],
+            ),
+        ),
+        ("a.md", Entry::new(0.9, &[("c.md", 0.9), ("index.md", 0.9)])),
+        ("b.md", Entry::new(0.3, &[])),
+        ("c.md", Entry::new(0.7, &[("b.md", 0.9)])),
+    ]
+}
+
+/// The trace is the walk in the order it happened: the file popped, the request
+/// made for it, the answer that came back, every link it judged, and the visit
+/// that closed it — a file at a time, in the order the rounds went.
+///
+/// The numbers are the walk's own, so the two cannot drift: `path_score` is the
+/// product of the scents on the path that reached the file, `depth` and `via`
+/// are that path, and every record's `t_ms` is when it happened.
+#[tokio::test]
+async fn the_trace_is_the_walk_in_the_order_it_happened() {
+    let tree = traced_tree("trace-order");
+    let settings = Settings::over(tree.root(), &["index.md"]);
+    let traced = Traced::new("trace-order-file", &tree.root(), 0.6);
+    let scorer = traced.judge(Fake::new(&traced_table()).over(tree.root()));
+
+    let traversal = settings.traced(&scorer, traced.walk()).await;
+
+    assert_eq!(
+        traced.order(),
+        [
+            "popped index.md",
+            "requested index.md",
+            "answered index.md",
+            "admitted index.md -> a.md",
+            "pruned index.md -> b.md",
+            "pruned index.md -> ../outside.md",
+            "result index.md",
+            "popped a.md",
+            "requested a.md",
+            "answered a.md",
+            "admitted a.md -> c.md",
+            "pruned a.md -> index.md",
+            "result a.md",
+            "popped c.md",
+            "requested c.md",
+            "answered c.md",
+            "admitted c.md -> b.md",
+            "result c.md",
+            "popped b.md",
+            "requested b.md",
+            "answered b.md",
+            "result b.md",
+        ],
+        "one file's pop, request, answer, links and visit at a time"
+    );
+
+    // The entry is popped first and is free: path score 1, depth 0, no link
+    // reached it. What is two hops down carries the path that reached it.
+    let entry = traced.record("popped", "index.md");
+    assert_eq!(entry["path_score"], 1.0);
+    assert_eq!(entry["depth"], 0);
+    assert_eq!(entry["via"], json!([]));
+    let deep = traced.record("popped", "c.md");
+    assert_eq!(deep["depth"], 2);
+    assert_eq!(deep["via"], json!(["index.md", "a.md"]));
+    assert_eq!(
+        deep["path_score"], 0.81,
+        "0.9 from the entry, 0.9 again from a.md"
+    );
+
+    // What the scorer answered, as the walk read it: the file's relevance, its
+    // sections and its links, and — with no cache in the way — no reuse.
+    let answered = traced.record("answered", "a.md");
+    assert_eq!(answered["relevance"], 0.9);
+    assert_eq!(answered["cached"], false);
+    assert_eq!(answered["latency_ms"], 0, "a fake that does not sleep");
+    assert_eq!(answered["sections"][0]["score"], 0.5);
+    assert_eq!(
+        answered["links"],
+        json!([
+            {"target": "c.md", "scent": 0.9, "keep": true},
+            {"target": "index.md", "scent": 0.9, "keep": true},
+        ])
+    );
+    assert_eq!(traced.record("requested", "a.md")["post_index"], 0);
+
+    // Each link is in the trace with the verdict the walk read it by.
+    assert_eq!(traced.link("admitted", "index.md", "a.md")["scent"], 0.9);
+    let under = traced.link("pruned", "index.md", "b.md");
+    assert_eq!(under["reason"], "below_threshold");
+    assert_eq!(under["scent"], 0.4);
+    assert_eq!(
+        traced.link("pruned", "index.md", "../outside.md")["reason"],
+        "out_of_root"
+    );
+    assert_eq!(
+        traced.link("pruned", "a.md", "index.md")["reason"],
+        "already_reached",
+        "the entry has been visited, and nothing reaches a file twice"
+    );
+    assert_eq!(
+        traced.link("admitted", "c.md", "b.md")["scent"],
+        0.9,
+        "the page the entry was too weak to reach is reached from c.md"
+    );
+
+    // And the visits the trace ends with are the reading list's own files, with
+    // the walk's numbers: the trace is in the order the walk visited them, and
+    // the list is the same files ranked.
+    let results: Vec<Value> = traced
+        .records()
+        .into_iter()
+        .filter(|record| record["event"] == "result")
+        .collect();
+    assert_eq!(
+        results.len(),
+        traversal.results.len(),
+        "every visit is a result, and no other file has one"
+    );
+    for file in &traversal.results {
+        let path = file.path.to_string_lossy();
+        let result = traced.record("result", &path);
+        assert_eq!(result["relevance"], file.relevance, "{path}");
+        assert_eq!(
+            result["earned_a_place"],
+            file.earns_a_place(0.6),
+            "{path}: the reading list's own rule, asked of the reading list's cutoff"
+        );
+    }
+}
+
+/// A file the walk could not judge keeps the records it had: it was popped and
+/// a request was made for it, and no answer came back. Nothing is held until
+/// the walk ends, so what a run that is killed leaves is what had happened.
+#[tokio::test]
+async fn a_file_the_walk_could_not_judge_has_a_request_and_no_answer() {
+    let tree = Tree::new("trace-unjudged");
+    tree.page("index.md", &["ghost.md".to_string()]);
+    tree.page("ghost.md", &[]);
+    // The table has no row for `ghost.md`, so the walk reaches a page it cannot
+    // judge — a page that is not there, or an API that refused it.
+    let traced = Traced::new("trace-unjudged-file", &tree.root(), 0.6);
+    let scorer = traced
+        .judge(Fake::new(&[("index.md", Entry::new(0.9, &[("ghost.md", 0.9)]))]).over(tree.root()));
+
+    let traversal = Settings::over(tree.root(), &["index.md"])
+        .traced(&scorer, traced.walk())
+        .await;
+
+    assert_eq!(failures(&traversal).len(), 1, "the one page that failed");
+    assert_eq!(traced.record("popped", "ghost.md")["depth"], 1);
+    assert_eq!(traced.record("requested", "ghost.md")["post_index"], 0);
+    assert_eq!(
+        traced
+            .records()
+            .iter()
+            .filter(|record| record["path"] == "ghost.md")
+            .map(|record| record["event"].as_str().expect("an event name"))
+            .collect::<Vec<_>>(),
+        ["popped", "requested"],
+        "and nothing else: no answer, no visit, no link of a file that was never judged"
+    );
+}
+
+/// A trace is written as the walk goes and not at the end of it: while an
+/// answer is being bought, the request it is being bought for is already on
+/// disk. The fake reads the file under the walk's own feet to hold it to that.
+#[tokio::test]
+async fn a_request_is_on_disk_before_its_answer_is_bought() {
+    let traced = Traced::new("trace-mid-flight", &root(), 0.6);
+    let scorer = traced.judge(mixed_graph().peeking(traced.path()));
+    let settings = Settings::new(&["index.md", "payments/README.md", "notes/scratch.md"]).fanout(3);
+
+    let traversal = settings.traced(&scorer, traced.walk()).await;
+
+    assert!(
+        traversal.results.len() >= 4,
+        "the walk should span several rounds: {:?}",
+        paths(&traversal)
+    );
+    assert_eq!(
+        traced
+            .records()
+            .iter()
+            .filter(|record| record["event"] == "requested")
+            .count(),
+        traversal.calls,
+        "one request per file that was asked about"
+    );
+}
+
+/// A warm run and a cold one have the same trace: every answer a cache served
+/// says `cached`, and the request that would have been made is in it either way,
+/// so a player reads a replay the same way whichever it is.
+#[tokio::test]
+async fn the_answers_a_cache_served_are_reported_as_cached() {
+    let tree = Tree::new("trace-cached-pages");
+    tree.page("index.md", &["a.md".to_string()]);
+    tree.page("a.md", &[]);
+    let table = [
+        ("index.md", Entry::new(0.9, &[("a.md", 0.9)])),
+        ("a.md", Entry::new(0.7, &[])),
+    ];
+    let settings = Settings::over(tree.root(), &["index.md"]);
+    let store = Tree::new("trace-cached-store");
+
+    let cold = Traced::new("trace-cold", &tree.root(), 0.6);
+    let bought = Fake::new(&table).over(tree.root());
+    let cache = CachedScorer::new(bought, store.root())
+        .expect("a cache")
+        .with_trace(cold.sink());
+    settings.traced(&cache, cold.walk()).await;
+
+    let warm = Traced::new("trace-warm", &tree.root(), 0.6);
+    let served = Fake::new(&table).over(tree.root());
+    let cache = CachedScorer::new(served, store.root())
+        .expect("a cache")
+        .with_trace(warm.sink());
+    settings.traced(&cache, warm.walk()).await;
+
+    assert_eq!(cache.calls(), 0, "a warm cache asks for nothing");
+    assert_eq!(cache.hits(), 2, "and serves both answers from disk");
+    assert_eq!(
+        cold.record("answered", "a.md")["cached"],
+        false,
+        "the first run bought its answer"
+    );
+    let served = warm.record("answered", "a.md");
+    assert_eq!(served["cached"], true);
+    assert_eq!(served["relevance"], 0.7, "the stored answer, not a new one");
+    assert_eq!(warm.record("requested", "a.md")["post_index"], 0);
+    assert_eq!(
+        warm.order(),
+        cold.order(),
+        "the same walk, the same records in the same order"
+    );
+}
+
+/// A link that queued nothing is in the trace with the reason the walk read it
+/// by: the depth budget for a hop past it, and no judgment at all for a target
+/// the scorer named no scent for.
+#[tokio::test]
+async fn a_link_the_walk_passed_over_is_reported_with_its_reason() {
+    let tree = traced_tree("trace-reasons");
+    // The table names the entry's link to `a.md` and nothing about `b.md`, so
+    // the walk has no scent to follow for it: a link the model answered nothing
+    // about is not a link the model called weak.
+    let traced = Traced::new("trace-reasons-file", &tree.root(), 0.6);
+    let scorer = traced.judge(
+        Fake::new(&[
+            ("index.md", Entry::new(0.4, &[("a.md", 0.9)])),
+            ("a.md", Entry::new(0.9, &[("c.md", 0.9), ("index.md", 0.9)])),
+        ])
+        .over(tree.root()),
+    );
+
+    Settings::over(tree.root(), &["index.md"])
+        .max_depth(1)
+        .traced(&scorer, traced.walk())
+        .await;
+
+    let unjudged = traced.link("pruned", "index.md", "b.md");
+    assert_eq!(unjudged["reason"], json!(Reason::Unjudged));
+    assert_eq!(
+        unjudged["scent"],
+        Value::Null,
+        "no scent was given, so none is reported"
+    );
+    assert_eq!(
+        traced.link("pruned", "a.md", "c.md")["reason"],
+        json!(Reason::MaxDepth),
+        "a hop past the depth budget is never followed"
+    );
+    assert_eq!(
+        traced.link("pruned", "a.md", "c.md")["scent"],
+        0.9,
+        "though the scorer called it strong"
+    );
+}
+
+/// A walk that follows the scorer's own verdict reports the links it kept back
+/// as the scorer's doing and not the threshold's: a Choice share means
+/// something only beside the options it was weighed against
+/// ([#47](https://github.com/mikekelly/s1m/issues/47)).
+#[tokio::test]
+async fn a_link_the_scorer_did_not_keep_is_reported_as_kept_back() {
+    let tree = two_ways("trace-kept");
+    let scorer = ByRule::new(0.5, 0.9).link("b.md", 0.1).unkept("a.md");
+    let traced = Traced::new("trace-kept-file", &tree.root(), 0.6);
+
+    Settings::over(tree.root(), &["index.md"])
+        .kept()
+        .traced(&scorer, traced.walk())
+        .await;
+
+    let kept_back = traced.link("pruned", "index.md", "a.md");
+    assert_eq!(kept_back["reason"], "not_kept");
+    assert_eq!(
+        kept_back["scent"], 0.9,
+        "the number is reported as it was answered, whatever decided the link"
+    );
+    assert_eq!(
+        traced.link("admitted", "index.md", "b.md")["scent"],
+        0.1,
+        "and a share the scorer kept is followed at its own number"
+    );
+}
+
+/// A link the root's `.s1mignore` matches is reported as ignored, with no
+/// scent: it was never read, never sent and never judged, which is the one
+/// thing the trace can say about it that the reading list cannot.
+#[tokio::test]
+async fn an_ignored_link_is_reported_but_never_sent() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/ignore");
+    let traced = Traced::new("trace-ignored", &root, 0.6);
+    let scorer = traced.judge(
+        Fake::new(&[
+            (
+                "entry.md",
+                Entry::new(0.9, &[("public.md", 0.9), ("private/vault.md", 0.95)]),
+            ),
+            ("public.md", Entry::new(0.5, &[])),
+            ("private/vault.md", Entry::new(1.0, &[])),
+        ])
+        .over(root.clone()),
+    );
+
+    Settings::over(root, &["entry.md"])
+        .traced(&scorer, traced.walk())
+        .await;
+
+    let ignored = traced.link("pruned", "entry.md", "private/vault.md");
+    assert_eq!(ignored["reason"], "ignored");
+    assert_eq!(ignored["scent"], Value::Null);
+    assert!(
+        traced
+            .records()
+            .iter()
+            .all(|record| record["path"] != "private/vault.md"),
+        "the matched page is never popped, requested, answered or visited: {:?}",
+        traced.order()
+    );
+    let asked: Vec<String> = traced
+        .records()
+        .iter()
+        .filter(|record| record["event"] == "requested")
+        .map(|record| record["path"].as_str().expect("a path").to_string())
+        .collect();
+    assert_eq!(
+        asked,
+        ["entry.md", "public.md"],
+        "the matched page is never read, never sent, never asked about"
+    );
+}
+
+/// The two budgets a queued path can run into are reported where the walk reads
+/// them: a beam has no turn left for a path at its depth, and the file budget
+/// runs out before a path's turn comes. A path can be admitted and pruned later
+/// — a beam and a budget are read when the walk takes a path off the frontier,
+/// not when a link queues it — and a replay needs both records to empty its
+/// frontier.
+#[tokio::test]
+async fn the_paths_a_budget_dropped_are_reported() {
+    let beamed = fan("trace-beam");
+    let traced = Traced::new("trace-beam-file", &beamed.root(), 0.6);
+    Settings::over(beamed.root(), &["index.md"])
+        .beam(2)
+        .traced(&fan_scorer(), traced.walk())
+        .await;
+
+    assert_eq!(
+        traced.targets_with("pruned", "beam"),
+        ["leaf-3.md", "leaf-4.md", "leaf-5.md"],
+        "the paths the depth had no turn for, weakest first"
+    );
+    assert_eq!(
+        traced.link("admitted", "index.md", "leaf-5.md")["scent"],
+        0.61,
+        "and the link that queued it was admitted all the same"
+    );
+    for leaf in ["leaf-1.md", "leaf-2.md"] {
+        assert_eq!(traced.record("popped", leaf)["depth"], 1);
+    }
+
+    let budgeted = fan("trace-budget");
+    let traced = Traced::new("trace-budget-file", &budgeted.root(), 0.6);
+    Settings::over(budgeted.root(), &["index.md"])
+        .max_files(0)
+        .traced(&fan_scorer(), traced.walk())
+        .await;
+
+    assert_eq!(
+        traced.targets_with("pruned", "max_files"),
+        [
+            "leaf-1.md",
+            "leaf-2.md",
+            "leaf-3.md",
+            "leaf-4.md",
+            "leaf-5.md"
+        ],
+        "everything the walk queued, in path order and not the heap's"
+    );
+    assert_eq!(
+        traced
+            .records()
+            .iter()
+            .filter(|record| record["event"] == "result")
+            .count(),
+        1,
+        "the entry file was visited and nothing else was"
+    );
 }

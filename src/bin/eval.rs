@@ -1081,6 +1081,8 @@ impl Env<'_> {
             admission: policy.admission(threshold),
             beam: policy.beam(),
             ignore: &self.ignore,
+            // The eval measures the walk, not a recording of it.
+            trace: None,
         };
         let traversal = traverse(&config, &meter)
             .await

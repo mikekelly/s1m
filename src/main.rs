@@ -14,6 +14,7 @@
 use std::fmt::{Display, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use s1m::cache::{Cacheable, CachedScorer, Scored};
@@ -23,6 +24,7 @@ use s1m::ignore::{self, Ignore};
 use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevScorer, KeepRule, Mode, Wording};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
+use s1m::trace::Trace;
 use s1m::traverse::Admission;
 
 /// The plan's defaults for the budgets. They live on the flags that carry them
@@ -193,6 +195,22 @@ struct Cli {
     /// Call Jev for every file, ignoring the answers already on disk.
     #[arg(long)]
     no_cache: bool,
+
+    /// Write a trace of the walk to FILE: one JSON object per line, each
+    /// stamped with the milliseconds since the walk started, so a run can be
+    /// replayed as a timed animation of the crawl and the reading list filling
+    /// in.
+    ///
+    /// Every event of the walk is in it — the files popped off the frontier,
+    /// the link targets admitted or passed over, each file's answer and each
+    /// request it took, and every visit — and the file is written as the walk
+    /// goes, so a run that is killed leaves what happened up to the kill.
+    ///
+    /// Hidden: the format is the interface, not the flag, and it is
+    /// documented in the README rather than here
+    /// (https://github.com/mikekelly/s1m/issues/57).
+    #[arg(long, value_name = "FILE", hide = true)]
+    trace: Option<PathBuf>,
 
     /// Leave each link target's own H2/H3 headings out of its preview, the way
     /// the preview was before [#46]. Hidden: the ablation the evaluation
@@ -530,12 +548,16 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
         Some(wording) => wording.wording().word(mode),
         None => mode,
     };
+    // The trace is created before anything is bought: a file that cannot be
+    // written is the caller's mistake, and it costs nothing to say so before a
+    // round of judgments rather than after one.
+    let trace = trace(cli.trace.as_deref(), &root, cli.threshold);
     let context = cli.context();
     let judge: Box<dyn Judge> = match cli.scorer {
         ScorerArg::Noul => {
             let jev = context.apply(scorer(&root)?).with_mode(mode);
             options.mode = jev.mode().name.to_string();
-            cached(jev, cli.no_cache)?
+            cached(jev, cli.no_cache, trace)?
         }
         ScorerArg::Choice => {
             // The file's own judgment is made with the state that ships; only
@@ -547,7 +569,7 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
                     ..context
                 });
             options.mode = choice.mode().name.to_string();
-            cached(choice, cli.no_cache)?
+            cached(choice, cli.no_cache, trace)?
         }
     };
 
@@ -561,15 +583,37 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
 ///
 /// Both scorers go through here, so `--no-cache` and the cache directory mean
 /// the same thing whichever link judgment the run asked for, and the reading
-/// list's `calls` counts the same thing either way.
+/// list's `calls` counts the same thing either way. So does the run's trace,
+/// when there is one: both sides report the requests they make and the answers
+/// they get to it, so a cold run's trace and a warm one's have the same shape
+/// and differ in `cached` ([`s1m::trace`]).
 fn cached<S: Cacheable + 'static>(
     scorer: S,
     no_cache: bool,
+    trace: Option<Arc<Trace>>,
 ) -> Result<Box<dyn Judge>, ScorerError> {
-    Ok(match no_cache {
-        true => Box::new(Uncached::new(scorer)),
-        false => Box::new(CachedScorer::from_env(scorer)?),
+    Ok(if no_cache {
+        Box::new(Uncached::new(scorer).with_trace(trace))
+    } else {
+        Box::new(CachedScorer::from_env(scorer)?.with_trace(trace))
     })
+}
+
+/// The run's trace, when `--trace` named a file, or `None` for a run nobody is
+/// watching.
+///
+/// A file that cannot be written is the caller's mistake and the run's error,
+/// reported before anything is read or bought: a run whose trace is not the
+/// trace the caller asked for has no business starting.
+fn trace(file: Option<&Path>, root: &Path, threshold: f64) -> Option<Arc<Trace>> {
+    let file = file?;
+    match Trace::create(file, root, threshold) {
+        Ok(trace) => Some(Arc::new(trace)),
+        Err(source) => fail(format!(
+            "could not write the trace to {}: {source}",
+            file.display()
+        )),
+    }
 }
 
 /// The criterion this run judges by: the `--criteria` file's when there is one,

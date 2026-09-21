@@ -2599,6 +2599,19 @@ impl Cacheable for ChoiceScorer {
         ChoiceScorer::request(self, query, file)
     }
 
+    /// One post per request, and a page split across posts is that many
+    /// requests: what a trace reports as one `requested` event per post. The
+    /// Choice questions ride in posts of their own, so a page whose links are
+    /// asked in chunks is several.
+    fn posts(&self, request: &Request) -> usize {
+        request.posts.len()
+    }
+
+    /// What the calls took, as the API's own accounting has it.
+    fn latency(detail: &JevDetail) -> Duration {
+        detail.latency
+    }
+
     /// The endpoint, the request, and the keep rule the answer is read by.
     ///
     /// The same key the absolute judge builds, over a request that carries the
@@ -2635,6 +2648,17 @@ impl Cacheable for JevScorer {
 
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
         JevScorer::request(self, query, file)
+    }
+
+    /// One request per file unless the sections and links did not fit one
+    /// post's budget: what a trace reports as one `requested` event per post.
+    fn posts(&self, request: &Request) -> usize {
+        request.posts.len()
+    }
+
+    /// What the call took, as the API's own accounting has it.
+    fn latency(detail: &JevDetail) -> Duration {
+        detail.latency
     }
 
     /// The endpoint as well as the body: a proxy and the API can answer one body
@@ -2782,6 +2806,7 @@ mod tests {
     use super::*;
     use crate::cache::{Cacheable, CachedScorer, Scored};
     use crate::testkit::TempDir;
+    use crate::trace::Trace;
 
     // --------------------------------------------------------- the fixture
 
@@ -5550,6 +5575,77 @@ mod tests {
             requests.len(),
             "the accounting says how many requests the judgment took"
         );
+    }
+
+    /// A page the API's state budget splits across posts is that many requests,
+    /// and a trace reports one `requested` record per post, in the order they
+    /// were sent, closed by the one answer they all merged into.
+    ///
+    /// How many posts a file takes is not visible from the outside — it depends
+    /// on what the file's state costs — so what a trace calls a request has to
+    /// be what the scorer actually sent.
+    #[tokio::test]
+    async fn a_split_page_is_one_requested_record_per_post() {
+        let dir = TempDir::new("trace-posts");
+        let file = generated(&dir, 0, 300);
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+        let store = TempDir::new("trace-posts-store");
+        let path = store.path().join("trace.jsonl");
+        let trace = Trace::create(&path, dir.path(), 0.6).expect("a trace");
+        let cached = CachedScorer::new(api.scorer_in(dir.path()), store.path())
+            .expect("a cache")
+            .with_trace(Some(Arc::new(trace)));
+
+        cached
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let posts = api.requests().len();
+        assert!(
+            posts > 1,
+            "the fixture has to be split for this to be about the split: {posts} requests"
+        );
+        let records = records(&path);
+        let requested: Vec<u64> = records
+            .iter()
+            .filter(|record| record["event"] == "requested")
+            .map(|record| record["post_index"].as_u64().expect("a post index"))
+            .collect();
+        assert_eq!(
+            requested,
+            (0..posts as u64).collect::<Vec<_>>(),
+            "one record per post, in the order they were sent"
+        );
+
+        let answered = records
+            .iter()
+            .find(|record| record["event"] == "answered")
+            .unwrap_or_else(|| panic!("the answer should be in the trace: {records:?}"));
+        assert_eq!(answered["path"], "hub.md");
+        assert_eq!(answered["cached"], false);
+        assert!(
+            answered["latency_ms"].as_u64().is_some(),
+            "the call's own latency: {answered}"
+        );
+        assert_eq!(
+            answered["sections"].as_array().expect("sections").len(),
+            file.sections.len(),
+            "the answers of every post merged into the file's judgment"
+        );
+        assert_eq!(
+            answered["links"].as_array().expect("links").len(),
+            file.links.len()
+        );
+    }
+
+    /// The records of a trace file, each line parsed on its own.
+    fn records(path: &Path) -> Vec<Value> {
+        fs::read_to_string(path)
+            .expect("the trace file should be readable")
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+            .collect()
     }
 
     /// Sections split the same way, in the file's own order: a page with more

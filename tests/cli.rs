@@ -4,7 +4,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -925,6 +925,36 @@ fn result<'a>(list: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{path} should be in the reading list"))
 }
 
+/// The records of a trace file, each line parsed on its own: a trace is JSON
+/// Lines, and every line of it stands alone.
+fn records(path: &Path) -> Vec<Value> {
+    fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap_or_else(|error| panic!("{line}: {error}")))
+        .collect()
+}
+
+/// Those records as `(event, what it is about)`: the path for a record about a
+/// file, and `source -> target` for one about a link.
+fn events(records: &[Value]) -> Vec<(String, String)> {
+    records
+        .iter()
+        .map(|record| {
+            let event = record["event"].as_str().expect("an event name").to_string();
+            let what = match record["path"].as_str() {
+                Some(path) => path.to_string(),
+                None => format!(
+                    "{} -> {}",
+                    record["source"].as_str().expect("a source"),
+                    record["target"].as_str().expect("a target")
+                ),
+            };
+            (event, what)
+        })
+        .collect()
+}
+
 // ------------------------------------------------------------- the tests
 
 /// The whole point of the command: one query and an entry file come back as the
@@ -999,6 +1029,117 @@ fn a_second_run_with_a_warm_cache_reports_no_calls() {
     assert_eq!(warm["calls"], 0, "a warm cache buys none of them");
     assert_eq!(paths(&warm), [DEEP, ENTRY, NEXT], "and ranks the same list");
     assert_eq!(api.answered(), 3, "the second run asked the API nothing");
+}
+
+/// `--trace` writes what the walk did as it did it, and changes nothing else:
+/// the file is one JSON object per line, and stdout is the reading list the
+/// same run prints without the flag.
+///
+/// The traces come off one cache, so the cold run and the warm one are the same
+/// walk: a replay has to be able to tell them apart, which is what `cached` is
+/// for. The traces are written under this test's cache directory, which is a
+/// temp directory the test removes.
+#[test]
+fn a_trace_is_written_as_the_walk_goes() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let cold_path = cache.dir.join("cold.jsonl");
+    let warm_path = cache.dir.join("warm.jsonl");
+
+    let cold = run_with(
+        &[QUERY, ENTRY, "--trace", cold_path.to_str().expect("a path")],
+        &api,
+        &cache,
+    );
+    // The same run from the now warm cache, and the same run with no flag at
+    // all: what `--trace` may not change.
+    let warm = run_with(
+        &[QUERY, ENTRY, "--trace", warm_path.to_str().expect("a path")],
+        &api,
+        &cache,
+    );
+    let plain = run_with(&[QUERY, ENTRY], &api, &cache);
+
+    assert_eq!(cold.status.code(), Some(0), "{}", stderr(&cold));
+    assert_eq!(warm.status.code(), Some(0), "{}", stderr(&warm));
+    assert_eq!(cold.stderr, b"", "{}", stderr(&cold));
+    assert_eq!(
+        stdout(&plain),
+        stdout(&warm),
+        "the list is the same with and without --trace"
+    );
+
+    let cold = records(&cold_path);
+    assert_eq!(
+        events(&cold),
+        [
+            ("popped", "entry.md"),
+            ("requested", "entry.md"),
+            ("answered", "entry.md"),
+            ("admitted", "entry.md -> next.md"),
+            ("result", "entry.md"),
+            ("popped", "next.md"),
+            ("requested", "next.md"),
+            ("answered", "next.md"),
+            ("admitted", "next.md -> deep.md"),
+            ("result", "next.md"),
+            ("popped", "deep.md"),
+            ("requested", "deep.md"),
+            ("answered", "deep.md"),
+            ("result", "deep.md"),
+        ]
+        .map(|(event, what)| (event.to_string(), what.to_string())),
+        "the walk's own order: one visit at a time, entries first"
+    );
+
+    let answered: Vec<&Value> = cold
+        .iter()
+        .filter(|record| record["event"] == "answered")
+        .collect();
+    assert_eq!(answered.len(), 3, "one answer per file judged");
+    for record in &answered {
+        assert_eq!(record["cached"], false, "a cold run bought this: {record}");
+        assert!(
+            record["latency_ms"].as_u64().is_some(),
+            "and reports what the call took: {record}"
+        );
+    }
+
+    let warm = records(&warm_path);
+    assert_eq!(
+        events(&warm),
+        events(&cold),
+        "a warm run walks the same walk, and `cached` is what tells them apart"
+    );
+    for record in warm.iter().filter(|record| record["event"] == "answered") {
+        assert_eq!(record["cached"], true, "a warm run: {record}");
+    }
+    assert_eq!(
+        api.answered(),
+        3,
+        "only the cold run asked the API anything"
+    );
+}
+
+/// A trace that cannot be written is the caller's mistake and the run's error,
+/// and it is caught before anything is read or bought: nothing is asked of the
+/// API for a run whose trace is not the trace the caller asked for.
+#[test]
+fn a_trace_that_cannot_be_written_exits_2_without_a_call() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(
+        &[QUERY, ENTRY, "--trace", "tests/fixtures/cli"],
+        &api,
+        &cache,
+    );
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(error.contains("trace"), "{error}");
+    assert_eq!(api.answered(), 0, "the run stopped before its first call");
 }
 
 /// A section the model scored below `--threshold` is dropped from the file's

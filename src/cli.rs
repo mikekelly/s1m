@@ -51,6 +51,7 @@
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -60,6 +61,7 @@ use crate::cache::{Cacheable, CachedScorer};
 use crate::ignore::{Ignore, IgnoreError};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
+use crate::trace::Trace;
 use crate::traverse::{
     Admission, Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
 };
@@ -161,6 +163,16 @@ pub trait Judge: Send + Sync {
     /// Answers bought from the API so far: what the reading list reports as
     /// `calls`.
     fn calls(&self) -> u64;
+
+    /// The trace this run writes, when `--trace` named a file, or `None`.
+    ///
+    /// `main.rs` builds one trace and hands it to the judge, which reports the
+    /// requests and answers to it; the walk reports its own events to the same
+    /// one, which is why it asks the judge for it rather than being passed one
+    /// of its own ([`crate::trace`]).
+    fn trace(&self) -> Option<&Trace> {
+        None
+    }
 }
 
 /// A [`CachedScorer`] as the CLI's judge.
@@ -175,6 +187,10 @@ impl<S: Cacheable> Judge for CachedScorer<S> {
     fn calls(&self) -> u64 {
         CachedScorer::calls(self)
     }
+
+    fn trace(&self) -> Option<&Trace> {
+        CachedScorer::trace(self)
+    }
 }
 
 /// A scorer with no cache in front of it, which is what `--no-cache` runs.
@@ -182,37 +198,66 @@ impl<S: Cacheable> Judge for CachedScorer<S> {
 /// Every judgment is bought, so counting the answers that come back is the same
 /// count [`CachedScorer`] keeps: what the API was asked, not what the walk
 /// visited.
+///
+/// It wraps a [`Cacheable`] rather than a bare [`Scorer`] because a run with no
+/// cache is the same run with nothing kept: it builds the request the cache
+/// would key — so the two mean the same thing whatever the scorer did with it —
+/// and it is what lets a trace report one `requested` event per post whether
+/// the answers were bought or served ([`crate::trace`]).
 pub struct Uncached<S> {
     inner: S,
     calls: AtomicU64,
+    /// The run's trace, when one was asked for: the same trace the walk writes
+    /// to, and where this reports the requests and answers the cache would
+    /// otherwise report ([`crate::cache::CachedScorer::with_trace`]).
+    trace: Option<Arc<Trace>>,
 }
 
-impl<S: Scorer> Uncached<S> {
+impl<S: Cacheable> Uncached<S> {
     /// Wraps `inner`, counting the answers it returns.
     pub fn new(inner: S) -> Self {
         Uncached {
             inner,
             calls: AtomicU64::new(0),
+            trace: None,
         }
+    }
+
+    /// Reports this run's requests and answers to `trace`, when there is one.
+    pub fn with_trace(mut self, trace: Option<Arc<Trace>>) -> Self {
+        self.trace = trace;
+        self
     }
 }
 
 #[async_trait]
-impl<S: Scorer> Scorer for Uncached<S> {
+impl<S: Cacheable> Scorer for Uncached<S> {
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        let judgment = self.inner.score(query, file).await?;
+        let request = self.inner.request(query, file)?;
+        if let Some(trace) = &self.trace {
+            trace.requested(&file.path, self.inner.posts(&request));
+        }
+        let (judgment, detail) = self.inner.call(&request, file).await?;
         self.calls.fetch_add(1, Ordering::Relaxed);
+        if let Some(trace) = &self.trace {
+            // No cache was asked, so no answer can have come off the disk.
+            trace.answered(&file.path, S::latency(&detail), false, &judgment);
+        }
         Ok(judgment)
     }
 }
 
-impl<S: Scorer> Judge for Uncached<S> {
+impl<S: Cacheable> Judge for Uncached<S> {
     fn scorer(&self) -> &dyn Scorer {
         self
     }
 
     fn calls(&self) -> u64 {
         self.calls.load(Ordering::Relaxed)
+    }
+
+    fn trace(&self) -> Option<&Trace> {
+        self.trace.as_deref()
     }
 }
 
@@ -453,6 +498,10 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         admission: options.admission,
         beam: options.beam,
         ignore: &ignore,
+        // The trace the judge writes its requests and answers to, when
+        // `--trace` asked for one: the walk reports its own events to the same
+        // file, so a reader sees one run rather than two ([`crate::trace`]).
+        trace: judge.trace(),
     };
     let traversal = traverse(&config, judge.scorer()).await?;
 

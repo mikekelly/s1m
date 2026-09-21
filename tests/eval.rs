@@ -176,6 +176,7 @@ async fn the_walk_with_no_budget_leaves_nothing_queued_or_admitted() {
             admission: s1m::traverse::Admission::Threshold(THRESHOLD),
             beam: None,
             ignore: &ignore,
+            trace: None,
         };
         let traversal = s1m::traverse::traverse(&config, &scorer)
             .await
