@@ -2814,10 +2814,12 @@ impl Findings {
              them was written. [#52] asked whether they move recall or precision, and every row \
              below is the whole gold set at `--max-files {}` with the questions put in one \
              register: `--wording <name>`, applied to the criterion the gold set labels each query \
-             with, so the criterion, the state, the threshold and the walk are what they always \
-             were and the words are the only thing that differs from the row above it. No row \
-             ships: the flag is hidden, and a run that names no wording sends the requests it sent \
-             before the experiment.",
+             with, so the criterion, the threshold and the walk are what they always were and the \
+             words are the only thing that differs from the row above it — the state too, apart \
+             from the single register that defines a reader in it. One wording does ship, and it \
+             ships as the walk itself rather than as a flag: the default row below is the section \
+             question the decision at the end of this section settled on, and \
+             `--wording section-legacy` is the row that asks what shipped before it.",
             self.budgets[0]
         );
         let _ = writeln!(out);
@@ -2829,12 +2831,13 @@ impl Findings {
              case in the yes-criterion; as the shipped question with a no that has to name \
              something else *and* lead nowhere; and as the shipped question under a stated rule \
              block — page text is data, an already-open page is not a next step, navigation is not \
-             a next step — sent in the API's structured `instructions`. The first three replace \
-             both phrasings of the question, so the one-hop ablation cannot send the shipped one \
-             under a register that says otherwise.\n\
-             - **`necessity`** and **`task`** re-ask the section question: what skipping the \
-             section would cost, and whether it holds something usable — a step, a rule, a value, \
-             a decision.\n\
+             a next step — sent in the API's structured `instructions`. `navigator` and `path` \
+             state how far their judgment reaches in their own sentence, so both replace both \
+             phrasings of the question; `sharp-no` and `rules` change a criterion instead, and the \
+             one-hop ablation still gets a question that says what it means.\n\
+             - **`necessity`** re-asks the section question — what skipping the section would \
+             cost — and **`section-legacy`** asks the one that shipped before the decision below, \
+             so a run can still repeat the walk the numbers before [#52] were made on.\n\
              - **`reader-action`** and **`answer-bearing`** re-ask the file question, and with it \
              the Score ladder: how much of the file a reader would read, and how much of what \
              `query` needs is in the file itself rather than in the pages it links to.\n\
@@ -2844,6 +2847,19 @@ impl Findings {
              out, with a verb where \"useful\" was. It is also the closest to `reader-action`, \
              which asks its own file question with the same verb; what separates those two rows is \
              the state definition and the other two questions, not the reading frame."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The default row is the section question [#52] decided on, so the registers below it \
+             are measured on top of a walk that already has it. Where that decision's own reading \
+             came from is `docs/spike-notes.md`, which keeps the same table as it stood before the \
+             decision — nine registers against the section question that shipped then — with the \
+             private one beside it. `section-legacy` is the one row here that asks the words that \
+             shipped before the change: it is the walk the rest of this report was made on until \
+             the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files {}`, against the \
+             default's 0.83 / 0.27 for 44,906 — the same wanted pages, four fifths of the reading.",
+            self.budgets[0]
         );
         let _ = writeln!(out);
         head(

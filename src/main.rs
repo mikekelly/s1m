@@ -160,12 +160,15 @@ struct Cli {
     /// alone: each name is a wording [`s1m::jev`] states, and the default is
     /// the wording that ships.
     ///
+    /// Global, so it reads the same before or after a subcommand — `score-file`
+    /// takes it too, and by the same name rather than one of its own.
+    ///
     /// Hidden: the experiment in https://github.com/mikekelly/s1m/issues/52,
     /// not the CLI's interface. This flag and `--mode` compose rather than
     /// conflict — one picks what counts as relevant, the other how the
     /// questions about it are put — and the reading list reports the criterion's
     /// name, not the wording's.
-    #[arg(long, value_name = "NAME", value_enum, hide = true)]
+    #[arg(long, value_name = "NAME", value_enum, hide = true, global = true)]
     wording: Option<WordingArg>,
 
     /// The directory that bounds the walk; a link resolving outside it is not
@@ -283,7 +286,7 @@ enum WordingArg {
     SharpNo,
     Rules,
     Necessity,
-    Task,
+    SectionLegacy,
     ReaderAction,
     AnswerBearing,
     Reader,
@@ -298,7 +301,7 @@ impl WordingArg {
             WordingArg::SharpNo => Wording::SharpNo,
             WordingArg::Rules => Wording::Rules,
             WordingArg::Necessity => Wording::Necessity,
-            WordingArg::Task => Wording::Task,
+            WordingArg::SectionLegacy => Wording::SectionLegacy,
             WordingArg::ReaderAction => Wording::ReaderAction,
             WordingArg::AnswerBearing => Wording::AnswerBearing,
             WordingArg::Reader => Wording::Reader,
@@ -395,10 +398,6 @@ enum Command {
         /// same ablation.
         #[arg(long, hide = true)]
         one_hop_links: bool,
-        /// Ask the three questions in another register, the way the hidden
-        /// `--wording` of a query does.
-        #[arg(long, value_name = "NAME", value_enum, hide = true)]
-        wording: Option<WordingArg>,
     },
 }
 
@@ -483,7 +482,6 @@ async fn main() {
             no_preview_headings,
             no_preview_leads,
             one_hop_links,
-            wording,
         }) => {
             let context = Context {
                 previews: !no_previews,
@@ -492,7 +490,9 @@ async fn main() {
                 two_hop: !one_hop_links,
                 ..Context::default()
             };
-            if let Err(error) = score_file(&query, &file, root, context, no_cache, wording).await {
+            if let Err(error) =
+                score_file(&query, &file, root, context, no_cache, cli.wording).await
+            {
                 fail(format!("{error:#}"));
             }
         }

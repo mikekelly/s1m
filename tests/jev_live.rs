@@ -166,14 +166,24 @@ async fn the_release_page_is_judged_useful_for_a_release_query() {
     );
 
     // #9 as a caller meets it: the page's own section is the range to read, and
-    // the "See also" list under it is navigation. The threshold the plan
-    // proposes (0.6) separates them, which is what lets a caller read the
-    // returned range and skip the rest of the page.
+    // the "See also" list under it is navigation, and the two are far apart
+    // whatever wording asks about them.
+    //
+    // What the plan's 0.6 no longer does is separate them: [#52]'s section
+    // question reads this page's own text at about 0.4 where the question it
+    // replaced read it above 0.6, so this range is one of the ones the walk
+    // stopped returning — the eval's recall is level without it, for a third
+    // less reading, which is the trade that decision made on both gold sets.
+    // The question it replaced is still reachable, as `--wording
+    // section-legacy`, when the absolute height of a section score is what a
+    // call is asking about.
+    //
+    // [#52]: https://github.com/mikekelly/s1m/issues/52
     let body = section(&outcome.judgment, "Release");
     let see_also = section(&outcome.judgment, "See also");
     assert!(
-        body > 0.6,
-        "the page's own text is what to read, got {body}"
+        body > see_also + 0.2,
+        "the page's own text is what to read: {body} against {see_also} for the link list"
     );
     assert!(
         see_also < body,

@@ -214,7 +214,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Only the name and the questions are [`Cow`]s, because a criteria file
 /// supplies those in the caller's own words: its path names the mode and its
 /// criterion goes into all of them. The ladder and the yes/no wording are this
-/// module's and are static, which is why the criteria file borrows them.
+/// module's and are static, which is why the criteria file borrows them — and so
+/// are the [`targets`](Mode::targets) the mode is looking for, the
+/// [`reader`](Mode::reader) its questions may name and the
+/// [`link_rules`](Mode::link_rules) it may ask under.
 #[derive(Debug, Clone, Serialize)]
 pub struct Mode {
     /// The mode's name, as `--mode` spells it; a criteria file's path, as
@@ -241,14 +244,37 @@ pub struct Mode {
     /// answer is the probability-weighted position over these levels, numbered
     /// from zero, so the last level is the top of the scale.
     pub file_levels: &'static [&'static str],
-    /// The question about one heading section. `{index}` is replaced with that
-    /// section's position in `state.sections`, which is how the instructions
-    /// point at it.
+    /// The question about one heading section, as it ships. `{index}` is
+    /// replaced with that section's position in `state.sections`, which is how
+    /// the instructions point at it.
+    ///
+    /// Since [#52] the worded mode ships the section question that experiment
+    /// settled on — a section earns its place by holding something usable —
+    /// and a mode that carries its own criterion carries it into that question.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
     pub section_question: Cow<'static, str>,
     /// What a yes means for that section.
     pub section_true: &'static str,
     /// What a no means for that section.
     pub section_false: &'static str,
+    /// The section question this mode asked before [#52] decided how the
+    /// shipped one reads, and what a yes meant then: `--wording section-legacy`
+    /// puts them back, so the walk that shipped before the decision is still a
+    /// walk a run can ask for, request for request — and so the answers the
+    /// cache already holds for it are the answers it gets.
+    ///
+    /// The shipped and the legacy wording share [`Mode::section_false`]: under
+    /// either question, the no is what a section that holds nothing for `query`
+    /// is.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    pub section_question_legacy: Cow<'static, str>,
+    /// What a yes meant for that section before [#52], and means again under
+    /// `--wording section-legacy`.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    pub section_true_legacy: &'static str,
     /// The question about one link. `{index}` is replaced with that link's
     /// position in `state.links`, which is how the instructions point at it.
     pub link_question: Cow<'static, str>,
@@ -316,16 +342,28 @@ impl Mode {
     /// below, and `name` is what the reading list reports as `mode` —
     /// `--criteria` passes the path it was given.
     ///
+    /// The section question is this module's shipped one ([#52]) with the
+    /// criterion on the end of it: the register that question is in — does the
+    /// section hold something the reader would use — says nothing about what
+    /// relevance means, and a caller's criterion is what does. The section
+    /// question of every built-in mode is the same sentence without it, because
+    /// each mode's own words already say what it is looking for.
+    ///
     /// `criterion` is expected trimmed and non-empty; the CLI is where a file
     /// that holds nothing is the caller's mistake.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
     pub fn custom(name: impl Into<Cow<'static, str>>, criterion: &str) -> Mode {
         let mut file_question =
             String::from("How relevant is `file` for `query`, judged by this criterion: ");
         file_question.push_str(criterion);
-        let mut section_question = String::from(
+        let mut section_question = String::from(TASK_QUESTION);
+        section_question.push_str(" Judged by this criterion: ");
+        section_question.push_str(criterion);
+        let mut section_question_legacy = String::from(
             "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — worth reading, judged by this criterion: ",
         );
-        section_question.push_str(criterion);
+        section_question_legacy.push_str(criterion);
         let mut link_question = String::from(
             "Is following `links[{index}]` likely to lead to content that meets this criterion: ",
         );
@@ -348,8 +386,10 @@ impl Mode {
             file_question: Cow::Owned(file_question),
             file_levels: CRITERION_LEVELS,
             section_question: Cow::Owned(section_question),
-            section_true: CRITERION_SECTION_TRUE,
+            section_true: TASK_TRUE,
             section_false: CRITERION_SECTION_FALSE,
+            section_question_legacy: Cow::Owned(section_question_legacy),
+            section_true_legacy: CRITERION_SECTION_TRUE,
             link_question: Cow::Owned(link_question),
             link_true: CRITERION_LINK_TRUE,
             link_false: CRITERION_LINK_FALSE,
@@ -376,11 +416,13 @@ pub const ABOUT: Mode = Mode {
         "related — `file` is on a subject next to `query`, and covers part of it.",
         "on the subject — `file` is about the subject of `query`: the page to collect.",
     ],
-    section_question: Cow::Borrowed(
+    section_question: Cow::Borrowed(TASK_QUESTION),
+    section_true: TASK_TRUE,
+    section_false: OFF_SUBJECT_SECTION,
+    section_question_legacy: Cow::Borrowed(
         "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — on the subject of `query`?",
     ),
-    section_true: "The text under that heading covers the subject, so reading those lines is worth the reader's next step.",
-    section_false: OFF_SUBJECT_SECTION,
+    section_true_legacy: "The text under that heading covers the subject, so reading those lines is worth the reader's next step.",
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content on the subject of `query`?",
     ),
@@ -412,11 +454,13 @@ pub const USEFUL_FOR: Mode = Mode {
         "supporting — `file` holds context or part of what `query` needs, but is not where that person should start.",
         "central — `file` is about what `query` describes, or is the page to start from.",
     ],
-    section_question: Cow::Borrowed(
+    section_question: Cow::Borrowed(TASK_QUESTION),
+    section_true: TASK_TRUE,
+    section_false: OFF_SUBJECT_SECTION,
+    section_question_legacy: Cow::Borrowed(
         "Is `sections[{index}]` — the part of `file` under that heading, at the lines given — useful for someone doing what `query` describes?",
     ),
-    section_true: "The text under that heading is on the subject, or is where that person should look, so reading those lines is worth their next step.",
-    section_false: OFF_SUBJECT_SECTION,
+    section_true_legacy: "The text under that heading is on the subject, or is where that person should look, so reading those lines is worth their next step.",
     link_question: Cow::Borrowed(
         "Is following `links[{index}]` likely to lead to content useful for someone doing what `query` describes?",
     ),
@@ -449,11 +493,13 @@ pub const ANSWERS: Mode = Mode {
         "part of the answer — `file` answers part of `query`, or names where the answer is.",
         "the answer — `file` contains the answer to `query`.",
     ],
-    section_question: Cow::Borrowed(
+    section_question: Cow::Borrowed(TASK_QUESTION),
+    section_true: TASK_TRUE,
+    section_false: "The text under that heading does not answer `query`, or holds nothing to read: navigation, a bare list of links, boilerplate, or an empty stub.",
+    section_question_legacy: Cow::Borrowed(
         "Does `sections[{index}]` — the part of `file` under that heading, at the lines given — contain the answer to `query`, or part of it?",
     ),
-    section_true: "The text under that heading contains the answer or part of it, or names where the answer is.",
-    section_false: "The text under that heading does not answer `query`, or holds nothing to read: navigation, a bare list of links, boilerplate, or an empty stub.",
+    section_true_legacy: "The text under that heading contains the answer or part of it, or names where the answer is.",
     link_question: Cow::Borrowed(
         "Does following `links[{index}]` lead to content containing the answer to `query`?",
     ),
@@ -481,6 +527,27 @@ const OFF_SUBJECT: &str = "The target is off the subject, or following it reache
 /// nothing: `about` and `useful-for` ask the same thing of a section here, so
 /// they say the same thing about one that leads nowhere.
 const OFF_SUBJECT_SECTION: &str = "The text under that heading is off the subject, or holds nothing to read: navigation, a bare list of links, boilerplate, an empty stub, or a heading whose section is somewhere else.";
+
+/// The section question every mode ships with since [#52], and what a yes means
+/// for it: a section earns its place by holding something the reader would use —
+/// a step, a rule, a value, a decision — rather than by being on the subject.
+///
+/// The experiment preferred it to every other register of that question on both
+/// gold sets: recall level with the question it replaced query for query, and a
+/// third less reading for it. Every mode carries it, so the built-in ones differ
+/// in their file and link questions and not in this one; a mode whose criterion
+/// is the caller's own carries that criterion into it ([`Mode::custom`]), and
+/// the question each mode asked before the decision is its
+/// [`Mode::section_question_legacy`], reachable as `--wording section-legacy`.
+///
+/// [#52]: https://github.com/mikekelly/s1m/issues/52
+const TASK_QUESTION: &str = "Does `sections[{index}]` — the part of `file` under that heading, \
+                             at the lines given — hold something someone doing `query` would use: \
+                             a step, a rule, a value, a decision?";
+
+/// And what a yes means for it.
+const TASK_TRUE: &str =
+    "It does: a step, a rule, a value or a decision under that heading is what `query` needs.";
 
 /// The ladder a criterion of the caller's own is scored on: the same four
 /// degrees for every criterion, because the criterion itself is in the
@@ -553,9 +620,13 @@ pub enum Wording {
     Rules,
     /// A section earns its place by what skipping it would cost.
     Necessity,
-    /// A section earns its place by holding something usable: a step, a rule, a
-    /// value, a decision.
-    Task,
+    /// The section question as it read before [#52] decided the shipped one,
+    /// with the yes-criterion of the time: the walk that shipped before the
+    /// change, request for request, so a run can still repeat it — and so the
+    /// answers the cache holds for those requests are the answers it gets.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    SectionLegacy,
     /// The file question as the reader's own action: how much of the file they
     /// would read.
     ReaderAction,
@@ -614,13 +685,6 @@ const NECESSITY_QUESTION: &str = "Would someone doing `query` be worse off for s
 
 const NECESSITY_TRUE: &str =
     "They would: those lines answer part of `query`, or say where to go next.";
-
-const TASK_QUESTION: &str = "Does `sections[{index}]` — the part of `file` under that heading, \
-                             at the lines given — hold something someone doing `query` would use: \
-                             a step, a rule, a value, a decision?";
-
-const TASK_TRUE: &str =
-    "It does: a step, a rule, a value or a decision under that heading is what `query` needs.";
 
 const READER_ACTION_QUESTION: &str =
     "If someone doing `query` opened `file`, how much would they read?";
@@ -695,13 +759,16 @@ impl Wording {
     /// Every wording, in the order the report's table lists them: the link
     /// question first, because that is where the numbers moved, then the
     /// section's, then the file's, then the one that crosses all three.
-    pub const ALL: [Wording; 9] = [
+    ///
+    /// The section question the experiment preferred is the one that ships, so
+    /// it has no row of its own here: the row that asks for it is the shipped
+    /// walk, and the register is the one that goes back.
+    pub const ALL: [Wording; 8] = [
         Wording::Navigator,
         Wording::Path,
         Wording::SharpNo,
         Wording::Rules,
-        Wording::Necessity,
-        Wording::Task,
+        Wording::SectionLegacy,
         Wording::ReaderAction,
         Wording::AnswerBearing,
         Wording::Reader,
@@ -715,7 +782,7 @@ impl Wording {
             Wording::SharpNo => "sharp-no",
             Wording::Rules => "rules",
             Wording::Necessity => "necessity",
-            Wording::Task => "task",
+            Wording::SectionLegacy => "section-legacy",
             Wording::ReaderAction => "reader-action",
             Wording::AnswerBearing => "answer-bearing",
             Wording::Reader => "reader",
@@ -760,9 +827,9 @@ impl Wording {
                 section_true: NECESSITY_TRUE,
                 ..mode
             },
-            Wording::Task => Mode {
-                section_question: Cow::Borrowed(TASK_QUESTION),
-                section_true: TASK_TRUE,
+            Wording::SectionLegacy => Mode {
+                section_question: mode.section_question_legacy.clone(),
+                section_true: mode.section_true_legacy,
                 ..mode
             },
             Wording::ReaderAction => Mode {
@@ -2718,10 +2785,14 @@ mod tests {
 
     // --------------------------------------------------------- the fixture
 
-    /// The committed bytes of the shipped request, and the variable that
-    /// rewrites them, the way `tests/formats.rs` keeps the views' snapshots.
-    const SNAPSHOT: &str = "tests/snapshots/request-default.json";
+    /// The committed bytes of the requests this module pins, and the variable
+    /// that rewrites them, the way `tests/formats.rs` keeps the views'
+    /// snapshots: what the walk sends now, and what `--wording section-legacy`
+    /// puts back ([`SNAPSHOT_BEFORE_52`]).
+    const SNAPSHOTS: &str = "tests/snapshots";
     const UPDATE_SNAPSHOTS: &str = "S1M_UPDATE_SNAPSHOTS";
+    const SNAPSHOT: &str = "request-default.json";
+    const SNAPSHOT_BEFORE_52: &str = "request-before-52.json";
 
     /// The wiki from #4: eight links on the index page, covering a target
     /// inside the root, one that escapes it, one that does not exist, and two
@@ -3849,9 +3920,13 @@ mod tests {
             );
         }
 
+        // A mode is a criterion, and two criteria are two requests. The section
+        // question is not what tells them apart since [#52] decided it: every
+        // mode asks the same one of a section, and what is the mode's own is the
+        // file's question and the link's.
         for (index, (mode, request)) in sent.iter().enumerate() {
             for (other, other_request) in &sent[index + 1..] {
-                for question in [FILE_QUESTION, "section_0", "link_0"] {
+                for question in [FILE_QUESTION, "link_0"] {
                     assert_ne!(
                         request["questions"][question]["instructions"],
                         other_request["questions"][question]["instructions"],
@@ -3867,15 +3942,20 @@ mod tests {
                     mode.name,
                     other.name
                 );
-                for question in ["section_0", "link_0"] {
-                    assert_ne!(
-                        request["questions"][question]["criteria"],
-                        other_request["questions"][question]["criteria"],
-                        "{} and {} call the same thing a yes",
-                        mode.name,
-                        other.name
-                    );
-                }
+                assert_ne!(
+                    request["questions"]["link_0"]["criteria"],
+                    other_request["questions"]["link_0"]["criteria"],
+                    "{} and {} call the same thing a yes",
+                    mode.name,
+                    other.name
+                );
+                assert_eq!(
+                    request["questions"]["section_0"]["instructions"],
+                    other_request["questions"]["section_0"]["instructions"],
+                    "{} and {} ask the shipped section question differently",
+                    mode.name,
+                    other.name
+                );
             }
         }
     }
@@ -3935,42 +4015,74 @@ mod tests {
         );
     }
 
-    /// The default request, byte for byte, against the one a run sent before
-    /// [#52] added a wording to the module: the same state, the same questions
-    /// and the same strings.
+    /// The default request, byte for byte: what the walk sends now that [#52]
+    /// has decided the section question, and the bytes captured again when it
+    /// did.
     ///
     /// A wording is a mode, and a mode is a request's bytes, so the risk this
-    /// guards is a wording leaking into a request nobody asked one for — a
+    /// guards is a register leaking into a request nobody asked one for — a
     /// `reader` key in the state, an `instructions` object where a sentence
-    /// belongs, a question the register touched. The bytes are committed under
+    /// belongs, a question no register touched. The bytes are committed under
     /// `tests/snapshots/` and compared byte for byte, so a leak shows up as a
     /// diff of a file a reviewer can read; the temporary root the page is
     /// written under is elided, because where a page is is not what this is
     /// about. `S1M_UPDATE_SNAPSHOTS=1 cargo test --lib the_default_request`
     /// rewrites it, the way the views' snapshots are rewritten.
-    ///
-    /// [#52]: https://github.com/mikekelly/s1m/issues/52
     #[test]
-    fn the_default_request_is_byte_identical_to_the_wording_that_shipped() {
+    fn the_default_request_is_pinned_byte_for_byte() {
+        pinned(SNAPSHOT, &pinned_request(None));
+    }
+
+    /// `--wording section-legacy` puts back the request the walk sent before
+    /// [#52] decided the section question, to the byte.
+    ///
+    /// That is what the register is for: the old walk is still a walk a run can
+    /// repeat, and the answers the cache holds under those requests are still
+    /// the answers it gets. A drift here — a sentence, a criterion, the order of
+    /// a field — would not fail anything else, and would leave the old numbers
+    /// unreachable while every test stayed green.
+    #[test]
+    fn the_legacy_section_wording_sends_the_request_that_shipped_before_52() {
+        pinned(
+            SNAPSHOT_BEFORE_52,
+            &pinned_request(Some(Wording::SectionLegacy)),
+        );
+    }
+
+    /// One request of the fixture page with `wording` applied to the shipped
+    /// mode — none for the walk that ships — as the bytes a run would send.
+    fn pinned_request(wording: Option<Wording>) -> String {
         let api = FakeApi::new(|_, _| (200, full_reply(1, 1, 2.0)));
-        let dir = TempDir::new("default-request");
+        let dir = TempDir::new("pinned-request");
         let page = linked_page(&dir, 1, 0);
+        let mode = match wording {
+            Some(wording) => wording.word(USEFUL_FOR.clone()),
+            None => USEFUL_FOR.clone(),
+        };
         let request = api
             .scorer_in(dir.path())
+            .with_mode(mode)
             .request("how are payments settled", &page)
             .expect("a request");
-        let sent = serde_json::to_string(&request)
+        serde_json::to_string(&request)
             .expect("a request is strings and numbers")
-            .replace(&dir.path().display().to_string(), "<root>");
+            .replace(&dir.path().display().to_string(), "<root>")
+    }
 
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(SNAPSHOT);
+    /// One request against the bytes committed for it, or rewriting them when
+    /// `S1M_UPDATE_SNAPSHOTS` says so: the helper `tests/formats.rs` keeps its
+    /// snapshots with, for the one request this module pins.
+    fn pinned(name: &str, sent: &str) {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(SNAPSHOTS)
+            .join(name);
         if std::env::var_os(UPDATE_SNAPSHOTS).is_some() {
-            fs::write(&path, &sent).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+            fs::write(&path, sent).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
             return;
         }
         let expected =
             fs::read_to_string(&path).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-        assert_eq!(sent, expected, "the default request is not what shipped");
+        assert_eq!(sent, expected, "{} is not what shipped", path.display());
     }
 
     /// Every wording sends exactly its own wording and criteria, whatever mode
@@ -4008,7 +4120,8 @@ mod tests {
                 assert_eq!(file["criteria"], json!(mode.file_levels));
                 assert_eq!(
                     file["criteria"].as_array().expect("levels").len(),
-                    mode.levels()
+                    4,
+                    "every Score in this module is on a four-rung ladder"
                 );
 
                 let section = &questions["section_0"];
@@ -4127,7 +4240,9 @@ mod tests {
                 ],
                 Wording::SharpNo => vec!["link_false"],
                 Wording::Rules => vec!["link_rules"],
-                Wording::Necessity | Wording::Task => vec!["section_question", "section_true"],
+                Wording::Necessity | Wording::SectionLegacy => {
+                    vec!["section_question", "section_true"]
+                }
                 Wording::ReaderAction | Wording::AnswerBearing => {
                     vec!["file_question", "file_levels"]
                 }
@@ -4201,6 +4316,20 @@ mod tests {
     fn every_wording_sends_the_sentences_the_issue_spelled() {
         let worded = |wording: Wording| wording.word(USEFUL_FOR.clone());
 
+        // What ships, and where the decision [#52] landed: every mode asks this
+        // of a section now, whatever criterion it carries.
+        assert_eq!(
+            USEFUL_FOR.section_question.as_ref(),
+            "Does `sections[{index}]` — the part of `file` under that heading, at the lines \
+             given — hold something someone doing `query` would use: a step, a rule, a value, a \
+             decision?"
+        );
+        assert_eq!(
+            USEFUL_FOR.section_true,
+            "It does: a step, a rule, a value or a decision under that heading is what `query` \
+             needs."
+        );
+
         // The link registers, both phrasings: a register that states its own
         // reach asks the same sentence either way.
         let navigator = worded(Wording::Navigator);
@@ -4234,6 +4363,11 @@ mod tests {
             path.link_true_two_hop,
             "It is: the target is one of them, or it is a page of links on the way to one."
         );
+        assert_eq!(
+            path.link_false,
+            "It is not: the target is somewhere else, or following it reaches nothing to read: \
+             navigation, boilerplate, an empty stub, or an unrelated page."
+        );
 
         // The sharper no is the shipped question with one thing changed.
         let sharp = worded(Wording::SharpNo);
@@ -4263,7 +4397,8 @@ mod tests {
             ]
         );
 
-        // The section registers.
+        // The section registers: the one that ships is pinned above, and this
+        // is the question it replaced, which stays reachable.
         let necessity = worded(Wording::Necessity);
         assert_eq!(
             necessity.section_question.as_ref(),
@@ -4271,17 +4406,24 @@ mod tests {
              part of `file` under that heading, at the lines given?"
         );
         assert_eq!(
+            necessity.section_true,
+            "They would: those lines answer part of `query`, or say where to go next."
+        );
+        assert_eq!(
             necessity.section_false, USEFUL_FOR.section_false,
             "the no side is the mode's own: the same nothing there for `query`"
         );
-        let task = worded(Wording::Task);
+        let legacy = worded(Wording::SectionLegacy);
         assert_eq!(
-            task.section_question.as_ref(),
-            "Does `sections[{index}]` — the part of `file` under that heading, at the lines \
-             given — hold something someone doing `query` would use: a step, a rule, a value, a \
-             decision?"
+            legacy.section_question.as_ref(),
+            "Is `sections[{index}]` — the part of `file` under that heading, at the lines given \
+             — useful for someone doing what `query` describes?"
         );
-        assert_eq!(task.section_false, USEFUL_FOR.section_false);
+        assert_eq!(
+            legacy.section_true,
+            "The text under that heading is on the subject, or is where that person should look, \
+             so reading those lines is worth their next step."
+        );
 
         // The file registers, which are ladders rather than one sentence.
         let action = worded(Wording::ReaderAction);
@@ -4325,9 +4467,28 @@ mod tests {
             "How much of `file` would `reader` read?"
         );
         assert_eq!(
+            reader.file_levels,
+            [
+                "unrelated — `reader` would not read `file`.",
+                "tangential — `file` is on a nearby subject, and `reader` would not read it.",
+                "supporting — `file` holds context or part of what `query` needs, but `reader` \
+                 would not start there.",
+                "central — `file` is about what `query` describes, or is where `reader` starts.",
+            ]
+        );
+        assert_eq!(
             reader.section_question.as_ref(),
             "Would `reader` read `sections[{index}]` — the part of `file` under that heading, at \
              the lines given?"
+        );
+        assert_eq!(
+            reader.section_true,
+            "`reader` would: those lines answer `query`, or say where it is answered."
+        );
+        assert_eq!(
+            reader.section_false,
+            "`reader` would skip them: navigation, a bare list of links, boilerplate, an empty \
+             stub, or a heading whose section is somewhere else."
         );
         assert_eq!(
             reader.link_question.as_ref(),
@@ -4336,6 +4497,26 @@ mod tests {
         assert_eq!(
             reader.link_question_two_hop.as_ref(),
             "Would `reader` follow `links[{index}]`, directly or through the pages it links to?"
+        );
+        assert_eq!(
+            reader.link_true_two_hop,
+            "`reader` would: the target, or what it links to, is where `query` is answered."
+        );
+        assert_eq!(
+            reader.link_false,
+            "`reader` would not: the target, and what it links to, are somewhere else."
+        );
+        // The relative judge's questions are the mode's here too: a run that
+        // asks one Choice over a page's links under this register names the
+        // reader in it.
+        assert_eq!(
+            reader.choice_question.as_ref(),
+            "Which link is the best next step for `reader`?"
+        );
+        assert_eq!(
+            reader.choice_question_two_hop.as_ref(),
+            "Which link is the best next step, directly or through the pages it links to, for \
+             `reader`?"
         );
     }
 
