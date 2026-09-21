@@ -403,6 +403,7 @@ mod tests {
         ReadingList {
             query: "settlement timing".to_string(),
             mode: "useful-for".to_string(),
+            scorer: "noul".to_string(),
             visited,
             calls: visited as u64,
             results,

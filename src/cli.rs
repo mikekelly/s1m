@@ -61,7 +61,7 @@ use crate::ignore::{Ignore, IgnoreError};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
 use crate::traverse::{
-    Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
+    Admission, Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
 };
 
 /// One run's inputs: the flags the CLI carries, with their defaults applied.
@@ -86,8 +86,25 @@ pub struct Options {
     pub max_files: usize,
     /// Most link hops from an entry file.
     pub max_depth: usize,
-    /// Least link scent that queues a target.
+    /// Least link scent that queues a target, under
+    /// [`Admission::Threshold`]: the plan's `--threshold`, and the same number
+    /// the reading list cuts at.
+    ///
+    /// The walk's frontier and the reading list are two cutoffs, and the CLI
+    /// gives them one number: the same `--threshold` decides what is followed
+    /// and what is worth reading. A scorer whose numbers are not on that scale
+    /// — a Choice share — is admitted by
+    /// [`Admission::Scorer`](crate::traverse::Admission::Scorer) instead, and
+    /// this stays the reading list's cutoff on the file's own relevance.
     pub threshold: f64,
+    /// How the walk's links are admitted to the frontier, which follows from
+    /// the scorer: a Noul against `threshold`, a Choice share against the
+    /// scorer's own rule. `main.rs` is where the pair is decided.
+    pub admission: Admission,
+    /// Most paths the walk holds at one depth, or `None` for no ceiling: the
+    /// beam the relative-scent spike walks with, and off for the walk that
+    /// ships.
+    pub beam: Option<usize>,
     /// Frontier files expanded per round. The CLI has no flag for it; `main.rs`
     /// sets it from the plan's constant.
     pub fanout: usize,
@@ -97,6 +114,11 @@ pub struct Options {
     /// carries the criterion, because it is built with the questions, so the
     /// CLI takes the name from there.
     pub mode: String,
+    /// How the links were judged, as the reading list reports it: `noul` for a
+    /// yes/no question per link, `choice` for one Choice over a page's links.
+    /// The two numbers on a link's `scent` are not the same kind of number, so
+    /// the reading list says which one it is ([`ReadingList::scorer`]).
+    pub scorer: String,
 }
 
 impl Options {
@@ -207,6 +229,14 @@ pub struct ReadingList {
     pub query: String,
     /// The relevance criterion the answers were judged against.
     pub mode: String,
+    /// How the links were judged: `noul`, one yes/no question per link, or
+    /// `choice`, one Choice over a page's links.
+    ///
+    /// A link's `scent` is a probability of leading somewhere useful under
+    /// `noul`, and one option's share of a page's Choice under `choice` — a
+    /// number that means something only beside the other links of that page.
+    /// The field is here so a reader knows which number it is looking at.
+    pub scorer: String,
     /// Files judged: the ones in [`Self::results`] and the ones in
     /// [`Self::walked`], which are what `--max-files` budgets.
     pub visited: usize,
@@ -420,7 +450,8 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         max_files: options.max_files,
         max_depth: options.max_depth,
         fanout: options.fanout,
-        threshold: options.threshold,
+        admission: options.admission,
+        beam: options.beam,
         ignore: &ignore,
     };
     let traversal = traverse(&config, judge.scorer()).await?;
@@ -511,6 +542,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
     Ok(ReadingList {
         query: options.query.clone(),
         mode: options.mode.clone(),
+        scorer: options.scorer.clone(),
         visited,
         calls: judge.calls(),
         results,
@@ -600,6 +632,9 @@ mod tests {
         scent: f64,
         /// A file name to refuse, as the API refusing one page's question does.
         refuse: Option<&'static str>,
+        /// Whether the scorer keeps the links it judges: what a walk following
+        /// the scorer's verdict reads instead of the scent.
+        keep: bool,
         buys: bool,
         calls: AtomicU64,
     }
@@ -637,12 +672,20 @@ mod tests {
             self
         }
 
+        /// The same answers, with the scorer's verdict on every link: `false`
+        /// is a scorer that keeps none of them.
+        fn keeping(mut self, keep: bool) -> Fake {
+            self.keep = keep;
+            self
+        }
+
         fn answering(relevance: fn(&ParsedFile) -> f64, scent: f64, buys: bool) -> Fake {
             Fake {
                 relevance,
                 section: flat,
                 scent,
                 refuse: None,
+                keep: true,
                 buys,
                 calls: AtomicU64::new(0),
             }
@@ -688,6 +731,7 @@ mod tests {
                     .map(|link| LinkJudgment {
                         target: link.target.clone(),
                         scent: self.scent,
+                        keep: self.keep,
                     })
                     .collect(),
             })
@@ -723,13 +767,47 @@ mod tests {
             max_files: 25,
             max_depth: 6,
             threshold: 0.6,
+            admission: Admission::Threshold(0.6),
+            beam: None,
             fanout: 8,
             mode: "useful-for".to_string(),
+            scorer: "noul".to_string(),
         }
     }
 
     async fn run_with(entry: &str, judge: &dyn Judge) -> Result<ReadingList, Error> {
         run(&options(entry), judge).await
+    }
+
+    /// A run whose walk follows the scorer's verdict rather than a threshold is
+    /// the relative judge's ([#47](https://github.com/mikekelly/s1m/issues/47)):
+    /// the reading list says which one it was, and the files it reaches are the
+    /// ones whose links the scorer kept.
+    #[tokio::test]
+    async fn a_run_following_the_scorers_verdict_says_which_judge_it_was() {
+        let judge = Fake::uncached(by_relevance, 0.9).keeping(false);
+        let mut options = options(ENTRY);
+        options.admission = Admission::Scorer;
+        options.beam = Some(8);
+        options.scorer = "choice".to_string();
+
+        let list = run(&options, &judge).await.expect("the fixture walks");
+        let json: Value = serde_json::from_str(&list.to_json()).expect("the reading list is JSON");
+
+        assert_eq!(json["scorer"], "choice");
+        assert_eq!(
+            json["visited"], 1,
+            "the entry alone: the only link out of it was judged and not kept"
+        );
+        assert_eq!(
+            json["results"][0]["links"][0]["followed"], false,
+            "a link at 0.9 is not followed when the scorer did not keep it"
+        );
+        assert_eq!(
+            list.exit_code(),
+            1,
+            "and it is a list the caller could write"
+        );
     }
 
     /// The plan's output shape, asserted whole: the field names, the ranking,
@@ -745,6 +823,7 @@ mod tests {
             json!({
                 "query": "how do I cut a release",
                 "mode": "useful-for",
+                "scorer": "noul",
                 "visited": 3,
                 "calls": 3,
                 "results": [

@@ -431,3 +431,99 @@ gold set; [`eval/REPORT.md`](../eval/REPORT.md) has the numbers and the method.
   answer at full fidelity, and costs a second round trip for the same file. → still open.
 - Whether the Score's four levels beat a different number of levels, or beat a Noul plus a
   second "is it even on topic" question. One run per page is not enough to tell. → still open.
+
+## The relative judge: one Choice over a page's links
+
+Measured 2026-09-21 for [#47](https://github.com/mikekelly/s1m/issues/47), on the same gold set
+and the same page the rest of these notes were measured on. Everything above judges a link on
+its own: one Noul per link, "is following this likely to lead somewhere useful", followed where
+it clears `--threshold`. The alternative measured here judges the page instead — one Choice over
+its links, "which of these is the best next step" — and follows the answer by share.
+
+The code is in [`src/jev.rs`](../src/jev.rs) (`ChoiceScorer`, `KeepRule`) behind hidden flags
+(`--scorer choice`, `--previews`, `--share-floor`, `--share-k`, `--beam`), and the walk that
+follows it is a beam search: [`Config::beam`](../src/traverse.rs) caps the files visited at one
+depth, of the same kind as `--max-files` one depth at a time. The default walk is unchanged.
+
+### What the request is
+
+One more request per file, beside the one that judges the file itself. The file's own Score and
+its section Nouls are asked exactly as they always were — the same state, links and previews
+included, minus the question per link — so the two judges' file relevance and section scores are
+answered from the same bytes and a table of the two compares one thing.
+
+The Choice question's state is the page (path, title, content) and its options are the page's
+in-root links, keyed by their position and described by the anchor, the sentence the link sits
+in and the heading it sits under. `--previews` adds the target's preview to each option's
+description — the same parts the link state carries, so the headings and the target's own link
+anchors [#46](https://github.com/mikekelly/s1m/issues/46) ships are in it — and the question is
+the two-hop one for the same reason the Noul question is. A page with more links than the API's
+255 options takes — 254 links and a `none` beside them — is asked in chunks of that size, and a
+chunk the state budget cannot take is smaller still. The answer is a share per link and the
+confidence of the distribution.
+
+A link is kept when its share clears `max(0.02, min(3 / options, 0.5))`, where `options` counts
+the chunk's `none`; a page whose best option is `none` keeps nothing, and a page whose best
+option is a link always keeps that one link. The `0.5` ceiling is not decoration: without it
+`3 / options` is one or more on a page of three options or fewer, and no answer could ever clear
+it.
+
+### What it found
+
+The 20-query gold set at `--max-files 10`, every row a cold walk, measured against what ships
+since [#46] — the same file judgment and the same state for every row, so the link question and
+the rule that follows it are the only difference:
+
+| Links judged | Recall | Precision | Read (tok) | Requests | Req/answer | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| noul: what ships | 0.83 | 0.26 | 68,663 | 181 | 1.00 | $0.044431 |
+| choice | 0.57 | 0.38 | 24,649 | 115 | 1.95 | $0.016604 |
+| choice + previews | 0.62 | 0.41 | 29,123 | 113 | 1.95 | $0.020314 |
+| choice + previews, `k=1` | 0.72 | 0.43 | 40,504 | 141 | 1.93 | $0.024802 |
+
+`Requests` is what the API was asked over the whole gold set and `Req/answer` the same over the
+files judged, so 1.00 is a link table that fits one post and 1.95 is the second request a page's
+Choice costs. The per-query table is in [`eval/REPORT.md`](../eval/REPORT.md#the-relative-judge-one-choice-over-a-pages-links).
+
+Reading them:
+
+- **The relative judge does not beat the walk that ships.** Recall is 0.26 below it at the
+  shipped cut and 0.11 below it even at `k=1`, for 0.12 and 0.17 more precision and 64% and 41%
+  less reading. [#46] raised the bar from 0.64 to 0.83 by carrying the target's headings and its
+  own link anchors and asking the link question about two hops, and a judge with one question per
+  page does not clear it on a wiki of 19 pages.
+- **The cut is still the lever.** `k=3` to `k=1` is 0.57 → 0.72 recall without touching the
+  primitive or the state: on pages of five or six links, `3 / options` is a cut of half the
+  page's mass, and the model's second and third choices are pruned with it. Whether a looser cut
+  closes the last 0.11 is the measurement worth buying next.
+- **Precision is what the shares buy.** Every choice row returns 50 to 64 files where the walk
+  that ships returns 129, over 24.6k to 40.5k tokens against 68.7k, and reads 39% cheaper: an
+  agent that pays for context rather than for calls is the one this is for.
+- **The second request per page costs requests, not money.** ~1.95 requests per answer, and the
+  choice rows are still cheaper than the row above them: the two requests share the page's text,
+  and the option descriptions are shorter than the link table they replace.
+- **A private wiki reads the same way.** The same rows, 20 queries at `--max-files 25`: 0.54 / 0.67
+  / 0.70 recall against 0.87 for the walk that ships, no precision difference (0.21 against 0.22),
+  and the five queries the walk misses are two at the loosest cut — with two to three times the Jev
+  tokens. Aggregates only, measured and posted by the session that holds that wiki
+  ([#47](https://github.com/mikekelly/s1m/issues/47)); the numbers say keep the primitive behind its
+  flag.
+- **It is the same shape as before [#46].** Measured against the pre-[#46] walk (0.64 recall,
+  0.30 precision, 35,771 tokens), the same rows read 0.57 / 0.39, 0.61 / 0.43 and, at `k=1`,
+  **0.69 / 0.40** — the one configuration on this wiki that beat the walk it was measured
+  against. The relative judge did not get worse; the bar moved.
+
+### Not settled
+
+- Which cut the relative judge wants. `k=1` is the loosest row bought, and it is still below the
+  bar on recall: the flag takes any value, so the sweep below it is the next measurement, and the
+  private gold set is where it should be run.
+- Whether the shipped default should move. That is the decision
+  [#47](https://github.com/mikekelly/s1m/issues/47) asks for, and it is [#2]'s to make from the
+  table above and the private one.
+- What a beam costs. The beam was on for every choice row and off for the shipping one, so
+  nothing here separates the relative judge from the beam. On a wiki this size neither binds —
+  the walk runs out of links above the cut first — and a corpus with more than eight paths at a
+  depth per query is where it would show.
+
+[#2]: https://github.com/mikekelly/s1m/issues/2

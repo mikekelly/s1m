@@ -27,7 +27,32 @@ pub struct LinkJudgment {
     /// The model's answer, 0 to 1: near 1 means following the link is likely to
     /// reach useful content, near 0.5 means the model is unsure rather than
     /// that the link is middling, which is why callers threshold above 0.5.
+    ///
+    /// A Choice share is on this field too, and is not the same kind of number:
+    /// it is one option's probability among the options it was weighed against,
+    /// so it is small on a page with many links and means nothing without them.
+    /// That is what [`LinkJudgment::keep`] is for.
     pub scent: f64,
+    /// Whether the walk should queue the target, when the scorer's number is
+    /// not on a scale the walk can threshold.
+    ///
+    /// A Noul is: the walk's [`crate::traverse::Admission::Threshold`] compares
+    /// it to the caller's floor, so the scorers that give one answer `true`
+    /// here and leave the decision to the walk. A Choice share is not — the
+    /// same 0.05 is a strong answer on a page of three links and noise on a
+    /// page of two hundred — so the scorer that gives one decides, per link,
+    /// from the options beside it ([`crate::jev::KeepRule`]), and
+    /// [`crate::traverse::Admission::Scorer`] follows that answer.
+    ///
+    /// `true` for an entry written before this field existed: those were
+    /// judged by a scorer with no verdict of its own.
+    #[serde(default = "kept")]
+    pub keep: bool,
+}
+
+/// What [`LinkJudgment::keep`] is for a judgment that came without one.
+fn kept() -> bool {
+    true
 }
 
 /// What one heading section is worth: whether its lines are worth reading for
@@ -142,10 +167,13 @@ pub trait Scorer: Send + Sync {
     /// Judges `file` as a source of material about `query`.
     ///
     /// Implementations must return one [`SectionJudgment`] per
-    /// [`ParsedFile::sections`] entry and one [`LinkJudgment`] per
-    /// [`ParsedFile::links`] entry, each in that order, so the caller can pair
-    /// them by index. `file.links` that point outside the root are still
-    /// judged: the caller decides whether to follow them.
-    ///
+    /// [`ParsedFile::sections`] entry, in that order, so the caller can pair
+    /// them by index. [`LinkJudgment`]s are paired by target instead, so a
+    /// scorer returns one per link it judged and nothing for a link it did not:
+    /// that link keeps no scent in the reading list, and the walk does not
+    /// follow it. `file.links` that point outside the root are still judged by
+    /// a scorer that asks about links one at a time, and need not be by one
+    /// that weighs them against each other: the caller decides whether to
+    /// follow them, and never follows one outside the root.
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError>;
 }

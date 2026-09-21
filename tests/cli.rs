@@ -479,17 +479,27 @@ impl FakeApi {
     ///
     /// [#37]: https://github.com/mikekelly/s1m/issues/37
     fn refusing(page: &str, score: f64, noul: f64, section: f64) -> FakeApi {
-        FakeApi::answering(score, noul, section, Some(page))
+        FakeApi::answering(score, noul, section, Some((page.to_string(), false)))
     }
 
-    fn answering(score: f64, noul: f64, section: f64, refuse: Option<&str>) -> FakeApi {
+    /// The same server, refusing `page`'s Choice question alone: the file's own
+    /// Score and its sections are answered, and the post that asks about the
+    /// page's links is the one the API rejects — the 422 an empty question map
+    /// earns ([#47]).
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    fn refusing_choice(page: &str, score: f64, noul: f64, section: f64) -> FakeApi {
+        FakeApi::answering(score, noul, section, Some((page.to_string(), true)))
+    }
+
+    fn answering(score: f64, noul: f64, section: f64, refuse: Option<(String, bool)>) -> FakeApi {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("the bound address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let recorded = Arc::clone(&requests);
         let flag = Arc::clone(&stop);
-        let refused = refuse.map(str::to_string);
+        let refused = refuse;
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
                 if flag.load(Ordering::SeqCst) {
@@ -499,10 +509,12 @@ impl FakeApi {
                 let Some(request) = read_request(&mut stream) else {
                     continue;
                 };
-                let refused = refused.as_ref().is_some_and(|page| {
-                    request["state"]["file"]["path"]
+                let refused = refused.as_ref().is_some_and(|(page, choice_only)| {
+                    let on_page = request["state"]["file"]["path"]
                         .as_str()
-                        .is_some_and(|path| path.ends_with(page))
+                        .is_some_and(|path| path.ends_with(page.as_str()));
+                    let choice = request["questions"].get(CHOICE_QUESTION).is_some();
+                    on_page && (!*choice_only || choice)
                 });
                 recorded
                     .lock()
@@ -599,8 +611,14 @@ fn content_length(head: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// The API's answer to one request: `score` for the file question and `noul`
-/// for every link question.
+/// The id the relative judge asks its one question under, and the option that
+/// says none of the page's links is worth following.
+const CHOICE_QUESTION: &str = "link_choice";
+const NONE_OPTION: &str = "none";
+
+/// The API's answer to one request: `score` for the file question, `noul` for
+/// every link question, and a Choice over the options a Choice question
+/// defines.
 ///
 /// The ids are the request's own keys, so a file with any number of sections
 /// and links is answered whole — the scorer treats one unanswered question as a
@@ -614,6 +632,8 @@ fn reply(request: &Value, score: f64, noul: f64, section: f64) -> String {
         .map(|id| {
             let answer = if id == FILE_QUESTION {
                 json!({"type": "score", "score": score, "confidence": 0.9})
+            } else if id == CHOICE_QUESTION {
+                choice_answer(&questions[id])
             } else if id.starts_with("section_") {
                 json!({"type": "noul", "noul": section})
             } else {
@@ -628,6 +648,34 @@ fn reply(request: &Value, score: f64, noul: f64, section: f64) -> String {
         "usage": {"input_tokens": 100, "output_tokens": 10},
     })
     .to_string()
+}
+
+/// The answer to one Choice question: one option holding almost all of the
+/// mass, the way the model answers a hub's links, and `none` under it.
+///
+/// The keys are the question's own options, so the answer is read back onto the
+/// links the question defined whichever ones they are.
+fn choice_answer(question: &Value) -> Value {
+    let options = question["criteria"]
+        .as_object()
+        .expect("a Choice question defines its options");
+    let links: Vec<&String> = options.keys().filter(|key| *key != NONE_OPTION).collect();
+    let mut probabilities = Map::new();
+    for (position, key) in links.iter().enumerate() {
+        // Most of the mass on the first option, a sliver on the rest: the shape
+        // the walk has to keep one link of.
+        probabilities.insert(
+            (*key).clone(),
+            json!(if position == 0 { 0.9 } else { 0.002 }),
+        );
+    }
+    probabilities.insert(NONE_OPTION.to_string(), json!(0.01));
+    json!({
+        "type": "choice",
+        "choice": links.first().map(|key| (*key).clone()).unwrap_or_else(|| NONE_OPTION.to_string()),
+        "probabilities": Value::Object(probabilities),
+        "confidence": 0.8,
+    })
 }
 
 /// A response as a one-shot HTTP/1.1 reply: the length is the body's, and the
@@ -854,6 +902,50 @@ fn a_page_that_cannot_be_judged_is_skipped_and_the_walk_carries_on() {
          and the judgment whose reason carries newlines of its own — and nothing \
          else: {error}"
     );
+}
+
+/// A Choice the API refuses is a page that cannot be judged, not a page with no
+/// links: the link that reached it is still reported as followed, the page is
+/// named on stderr, and the walk keeps the pages it judged.
+///
+/// The refusal is aimed at the Choice request alone — the 422 the API answers a
+/// post whose questions are empty with ([#47]) — so what is under test is that a
+/// link judgment that fails is a hole in the walk, and never a page silently
+/// judged as one with nothing to follow.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+#[test]
+fn a_refused_choice_is_skipped_and_not_a_page_without_links() {
+    let api = FakeApi::refusing_choice(NEXT, 3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY, "--scorer", "choice"], &api, &cache);
+
+    let list = json(&output);
+    assert_eq!(list["scorer"], "choice");
+    assert_eq!(
+        paths(&list),
+        [ENTRY],
+        "the page whose links could not be judged is not in the list"
+    );
+    assert_eq!(
+        list["results"][0]["links"][0]["followed"], true,
+        "the link queued its target all the same: what failed is the page, not the link"
+    );
+    assert_eq!(list["visited"], 1);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "and the list is the entry alone: {}",
+        stderr(&output)
+    );
+
+    let error = stderr(&output);
+    assert!(
+        error.contains(NEXT) && error.contains("max_tokens_exceeded"),
+        "the page and the reason are on stderr: {error}"
+    );
+    assert_eq!(error.lines().count(), 2, "{error}");
 }
 
 /// A page whose judgment fails is not retried and not revisited: the walk asks

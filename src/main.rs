@@ -16,13 +16,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use s1m::cache::{CachedScorer, Scored};
+use s1m::cache::{Cacheable, CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::format::Format;
 use s1m::ignore::{self, Ignore};
-use s1m::jev::{self, Context, JevDetail, JevScorer, Mode};
+use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevScorer, KeepRule, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
+use s1m::traverse::Admission;
 
 /// The plan's defaults for the budgets. They live on the flags that carry them
 /// rather than in the library: nothing below the CLI has a default of its own.
@@ -32,6 +33,19 @@ const MAX_FILES: usize = 25;
 const MAX_DEPTH: usize = 6;
 const THRESHOLD: f64 = 0.6;
 const FANOUT: usize = 8;
+
+/// The relative-link spike's defaults ([#47]): the share a Choice answer has to
+/// hold to keep its link ([`KeepRule`]), and how many paths the frontier holds
+/// at one depth when the walk follows shares.
+///
+/// They belong to the hidden flags that carry them and to no other caller: a
+/// walk under the shipping scorer is not a beam search, and its links are not
+/// weighed against each other.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+const SHARE_FLOOR: f64 = 0.02;
+const SHARE_K: usize = 3;
+const BEAM: usize = 8;
 
 /// The one paragraph that says what s1m is, for `--help`: the same wording the
 /// README opens with and `SKILL.md` carries, so a person or an agent that meets
@@ -186,6 +200,35 @@ struct Cli {
     #[arg(long, value_name = "FORMAT", value_enum, default_value_t = FormatArg::Json)]
     format: FormatArg,
 
+    /// Judge each page's links against each other — one Choice over them, by
+    /// share — instead of asking a yes/no question about each one.
+    ///
+    /// Hidden: the spike in https://github.com/mikekelly/s1m/issues/47, not the
+    /// CLI's interface, and the default is the walk that ships.
+    #[arg(long, value_name = "SCORER", value_enum, default_value_t = ScorerArg::Noul, hide = true)]
+    scorer: ScorerArg,
+
+    /// Send each option's target preview with its description, so a link is
+    /// judged with a look at where it goes and not only at what the page says
+    /// about it.
+    #[arg(long, hide = true)]
+    previews: bool,
+
+    /// Least share of a page's Choice that keeps a link, when the k-scaled cut
+    /// is lower.
+    #[arg(long, value_name = "SHARE", default_value_t = SHARE_FLOOR, hide = true)]
+    share_floor: f64,
+
+    /// The cut's numerator: a link has to hold `k / options` of the page's
+    /// probability, capped at 0.5.
+    #[arg(long, value_name = "N", default_value_t = SHARE_K, hide = true)]
+    share_k: usize,
+
+    /// Most paths the frontier holds at one depth. Defaults to [`BEAM`] under
+    /// `--scorer choice`, and to no ceiling at all otherwise.
+    #[arg(long, value_name = "N", hide = true)]
+    beam: Option<usize>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -208,6 +251,33 @@ impl ModeArg {
             ModeArg::About => jev::ABOUT.clone(),
             ModeArg::UsefulFor => jev::USEFUL_FOR.clone(),
             ModeArg::Answers => jev::ANSWERS.clone(),
+        }
+    }
+}
+
+/// How a run's links are judged: the plan's one question per link, or the
+/// spike's one Choice over a page's links ([#47]).
+///
+/// The default is what ships. The other is what the hidden flag is for, and what
+/// the walk's [`Admission::Scorer`] rule and the scorer's keep rule are for: a
+/// share means something only beside the options it was weighed against, so the
+/// walk cannot threshold it the way it thresholds a Noul.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ScorerArg {
+    /// One Noul per link: how likely following it is to lead somewhere useful.
+    Noul,
+    /// One Choice over the page's links: which of them is the best next step.
+    Choice,
+}
+
+impl ScorerArg {
+    /// The name the reading list reports it under.
+    fn name(self) -> &'static str {
+        match self {
+            ScorerArg::Noul => "noul",
+            ScorerArg::Choice => "choice",
         }
     }
 }
@@ -302,9 +372,45 @@ impl Cli {
             max_files: self.max_files,
             max_depth: self.max_depth,
             threshold: self.threshold,
+            admission: self.admission(),
+            beam: self.beam(),
             fanout: FANOUT,
             mode: String::new(),
+            scorer: self.scorer.name().to_string(),
         }
+    }
+
+    /// How the walk admits a link, which follows from the scorer: a Noul is
+    /// compared to the threshold the caller gave, and a Choice share is kept by
+    /// the scorer's own rule because it means something only beside the options
+    /// it was weighed against.
+    fn admission(&self) -> Admission {
+        match self.scorer {
+            ScorerArg::Noul => Admission::Threshold(self.threshold),
+            ScorerArg::Choice => Admission::Scorer,
+        }
+    }
+
+    /// What the keep rule keeps: the two numbers the hidden flags carry.
+    fn keep(&self) -> KeepRule {
+        KeepRule {
+            floor: self.share_floor,
+            k: self.share_k,
+        }
+    }
+
+    /// The beam: `--beam` when the caller gave one, [`BEAM`] when the walk is
+    /// following shares, and no ceiling at all for the walk that ships.
+    ///
+    /// A beam is part of how the relative judge is followed and not a change to
+    /// the walk underneath it, so turning it on with `--scorer noul` is the
+    /// caller's business and leaving it off with `--scorer choice` is a
+    /// deliberate comparison of one change rather than two.
+    fn beam(&self) -> Option<usize> {
+        self.beam.or(match self.scorer {
+            ScorerArg::Choice => Some(BEAM),
+            ScorerArg::Noul => None,
+        })
     }
 }
 
@@ -364,18 +470,46 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     };
 
     let mode = criterion(cli.mode, cli.criteria.as_deref()).unwrap_or_else(|message| fail(message));
-    let jev = cli.context().apply(scorer(&root)?).with_mode(mode);
-    options.mode = jev.mode().name.to_string();
-
-    let judge: Box<dyn Judge> = if cli.no_cache {
-        Box::new(Uncached::new(jev))
-    } else {
-        Box::new(CachedScorer::from_env(jev)?)
+    let context = cli.context();
+    let judge: Box<dyn Judge> = match cli.scorer {
+        ScorerArg::Noul => {
+            let jev = context.apply(scorer(&root)?).with_mode(mode);
+            options.mode = jev.mode().name.to_string();
+            cached(jev, cli.no_cache)?
+        }
+        ScorerArg::Choice => {
+            // The file's own judgment is made with the state that ships; only
+            // the options' descriptions are the `--previews` flag's business.
+            let choice = ChoiceScorer::new(context.apply(scorer(&root)?).with_mode(mode))
+                .with_keep(cli.keep())
+                .with_context(Context {
+                    previews: cli.previews,
+                    ..context
+                });
+            options.mode = choice.mode().name.to_string();
+            cached(choice, cli.no_cache)?
+        }
     };
 
     let list = cli::run(&options, judge.as_ref()).await?;
     print!("{}", cli.format.format().render(&list));
     Ok(list.exit_code())
+}
+
+/// One scorer as the run's judge: the cache in front of it, or nothing at all
+/// when `--no-cache` said to buy every judgment.
+///
+/// Both scorers go through here, so `--no-cache` and the cache directory mean
+/// the same thing whichever link judgment the run asked for, and the reading
+/// list's `calls` counts the same thing either way.
+fn cached<S: Cacheable + 'static>(
+    scorer: S,
+    no_cache: bool,
+) -> Result<Box<dyn Judge>, ScorerError> {
+    Ok(match no_cache {
+        true => Box::new(Uncached::new(scorer)),
+        false => Box::new(CachedScorer::from_env(scorer)?),
+    })
 }
 
 /// The criterion this run judges by: the `--criteria` file's when there is one,

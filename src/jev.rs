@@ -22,8 +22,9 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -56,6 +57,43 @@ pub const PRICE_PER_MTOK: f64 = 0.042;
 /// The id the file relevance Score comes back under. Question ids are for this
 /// code: the model sees only `instructions` and `criteria`.
 const FILE_QUESTION: &str = "file_relevance";
+
+/// The id the Choice question comes back under: one per post, over the links
+/// that post's options stand for ([#47]).
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+const CHOICE_QUESTION: &str = "link_choice";
+
+/// The option a Choice over a page's links always carries: the way out for a
+/// page none of whose links is worth the reader's next step.
+///
+/// A key rather than an index, so it can never be mistaken for one, and one
+/// whose probability is what the keep rule reads to decide whether the model
+/// would leave the page at all ([`KeepRule::keeps`]).
+const NONE_OPTION: &str = "none";
+
+/// Most links one Choice question carries, with [`NONE_OPTION`] beside them:
+/// the API allows 255 options, and the question's own `none` is one of them.
+///
+/// A chunk is this size at most, and smaller when the state budget says so: the
+/// cap is the API's, and the budget is what a page of previews runs into first.
+const LINKS_PER_CHOICE: usize = 254;
+
+/// The ceiling on the share a link has to hold to be kept, whatever the k of
+/// [`KeepRule`]: half the mass. Without it a page of three options would have to
+/// answer better than certainty to be followed at all.
+///
+/// Public because it is half of what a reader needs to read a share: the other
+/// half is the rule's floor and k, and the three of them are the cut.
+pub const KEEP_CEILING: f64 = 0.5;
+
+/// How far a Choice answer's probabilities may be from summing to one before
+/// they are scaled to it ([`shares`]).
+///
+/// The API promises a distribution that sums to 1, and floating point does not:
+/// this is the room for the difference between the sum of the answers and one,
+/// before a set of shares is treated as something other than a distribution.
+const SHARE_EPSILON: f64 = 1e-6;
 
 /// How much of the file's text is sent. The API allows 32k tokens for the state
 /// plus the longest question and 64k for the whole request; at the two
@@ -213,6 +251,23 @@ pub struct Mode {
     pub link_question_two_hop: Cow<'static, str>,
     /// What a yes means for that link, when the question is the two-hop one.
     pub link_true_two_hop: &'static str,
+    /// The question the relative judge asks instead of one [`Mode::link_question`]
+    /// per link: which of the links this page offers is the best next step,
+    /// under this mode's criterion.
+    ///
+    /// The options are the page's own links, so the wording is the mode's and
+    /// the choice is the same one every other question asks — what is worth the
+    /// reader's next step ([#47]). `link_false` is what the option that says
+    /// none of them is described by, so a page's `none` and a link's no mean the
+    /// same thing.
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    pub choice_question: Cow<'static, str>,
+    /// The same choice asked about two hops instead of one, the way
+    /// [`Mode::link_question_two_hop`] is the link question asked that way:
+    /// what the links lead to through the pages they link to, and not only
+    /// what they point at.
+    pub choice_question_two_hop: Cow<'static, str>,
 }
 
 impl Mode {
@@ -254,6 +309,13 @@ impl Mode {
             "Is following `links[{index}]` likely to lead, directly or through the pages it links to, to content that meets this criterion: ",
         );
         link_question_two_hop.push_str(criterion);
+        let mut choice_question =
+            String::from("Which link is the best next step, judged by this criterion: ");
+        choice_question.push_str(criterion);
+        let mut choice_question_two_hop = String::from(
+            "Which link is the best next step, directly or through the pages it links to, judged by this criterion: ",
+        );
+        choice_question_two_hop.push_str(criterion);
         Mode {
             name: name.into(),
             file_question: Cow::Owned(file_question),
@@ -266,6 +328,8 @@ impl Mode {
             link_false: CRITERION_LINK_FALSE,
             link_question_two_hop: Cow::Owned(link_question_two_hop),
             link_true_two_hop: CRITERION_LINK_TRUE_TWO_HOP,
+            choice_question: Cow::Owned(choice_question),
+            choice_question_two_hop: Cow::Owned(choice_question_two_hop),
         }
     }
 }
@@ -296,6 +360,12 @@ pub const ABOUT: Mode = Mode {
         "Does following `links[{index}]` lead, directly or through the pages it links to, to content on the subject of `query`?",
     ),
     link_true_two_hop: "The target is about the subject, or the pages it links to are.",
+    choice_question: Cow::Borrowed(
+        "Which link is the best next step for someone collecting what `query` is about?",
+    ),
+    choice_question_two_hop: Cow::Borrowed(
+        "Which link is the best next step, directly or through the pages it links to, for someone collecting what `query` is about?",
+    ),
 };
 
 /// The default, and the criterion the spike measured: would this help someone
@@ -323,6 +393,12 @@ pub const USEFUL_FOR: Mode = Mode {
         "Is following `links[{index}]` likely to lead, directly or through the pages it links to, to content useful for someone doing what `query` describes?",
     ),
     link_true_two_hop: "The target is on the subject, or the pages it links to are, so following this link is worth a reader's next step.",
+    choice_question: Cow::Borrowed(
+        "Which link is the best next step for someone doing what `query` describes?",
+    ),
+    choice_question_two_hop: Cow::Borrowed(
+        "Which link is the best next step, directly or through the pages it links to, for someone doing what `query` describes?",
+    ),
 };
 
 /// Question lookup: the page that answers the query, and the pages on the way
@@ -351,6 +427,12 @@ pub const ANSWERS: Mode = Mode {
         "Does following `links[{index}]` lead, directly or through the pages it links to, to content containing the answer to `query`?",
     ),
     link_true_two_hop: "The target contains the answer or part of it, or leads to a page that does.",
+    choice_question: Cow::Borrowed(
+        "Which link is the best next step for someone looking for the answer to `query`?",
+    ),
+    choice_question_two_hop: Cow::Borrowed(
+        "Which link is the best next step, directly or through the pages it links to, for someone looking for the answer to `query`?",
+    ),
 };
 
 /// What a link's no is when the target is not about the subject: `about` and
@@ -384,6 +466,86 @@ const CRITERION_LINK_FALSE: &str = "The target does not meet the criterion, or f
 const CRITERION_SECTION_TRUE: &str = "The text under that heading meets the criterion, so reading those lines is worth the reader's next step.";
 
 const CRITERION_SECTION_FALSE: &str = "The text under that heading does not meet the criterion, or holds nothing to read: navigation, a bare list of links, boilerplate, or an empty stub.";
+
+// ------------------------------------------------------- the relative judge
+
+/// What a Choice share has to be for its link to be kept ([#47]).
+///
+/// A share is one option's probability among the options beside it, so a rule
+/// that reads it needs them: the same 0.05 is a strong answer on a page of three
+/// links and noise on a page of two hundred. The cut moves with the question's
+/// size — `max(floor, min(k / options, 0.5))`, where `options` counts the
+/// [`NONE_OPTION`] the question always carries — and the walk follows it where a
+/// Noul is followed by the caller's threshold
+/// ([`crate::traverse::Admission::Scorer`]).
+///
+/// Two of those bounds are what keep a page from being closed by arithmetic
+/// rather than by the model:
+///
+/// - The ceiling of [`KEEP_CEILING`]: without it `k / options` is 1 or more on a
+///   page of three options or fewer, and no answer could clear it.
+/// - The model's own preference: a page whose highest option is `none` keeps
+///   nothing, whatever the cut, and a page whose highest option is a link keeps
+///   that one link even when it falls below the cut. So a page the model would
+///   leave is left, and a page it would enter is entered by at least one way.
+///
+/// The floor is what all of that leaves for a big page: on one of two hundred
+/// links, `k / options` is under the floor and every link whose share is above
+/// noise is kept.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct KeepRule {
+    /// Least share a link is kept at, whatever the question's size.
+    pub floor: f64,
+    /// How many options the cut is scaled by: a link has to hold `k / options`
+    /// of the mass unless the floor is higher.
+    pub k: usize,
+}
+
+impl Default for KeepRule {
+    fn default() -> Self {
+        KeepRule { floor: 0.02, k: 3 }
+    }
+}
+
+impl KeepRule {
+    /// The share a link has to hold to be kept, in a question with `options`
+    /// options: `max(floor, min(k / options, 0.5))`.
+    pub fn cut(&self, options: usize) -> f64 {
+        (self.k as f64 / options as f64)
+            .min(KEEP_CEILING)
+            .max(self.floor)
+    }
+
+    /// Which of one question's links are kept, in the order they were asked
+    /// about, given each link's share and the share of the `none` option beside
+    /// them.
+    ///
+    /// A link is kept when it holds the cut, or when it is the one link the
+    /// model put above `none`: the highest share, ties broken by the file's own
+    /// order so that one link and not a set of them is the model's preference.
+    /// A question whose highest option is `none` keeps nothing at all.
+    pub fn keeps(&self, shares: &[f64], none: f64) -> Vec<bool> {
+        let cut = self.cut(shares.len() + 1);
+        let mut top: Option<usize> = None;
+        for (position, share) in shares.iter().enumerate() {
+            if top.is_none_or(|top| *share > shares[top]) {
+                top = Some(position);
+            }
+        }
+        // The model would leave the page: the one option it liked best is the
+        // way out.
+        let Some(top) = top.filter(|top| shares[*top] > none) else {
+            return vec![false; shares.len()];
+        };
+        shares
+            .iter()
+            .enumerate()
+            .map(|(position, share)| *share >= cut || position == top)
+            .collect()
+    }
+}
 
 // ------------------------------------------------------------- the request
 
@@ -505,8 +667,16 @@ struct Post {
     /// has no use for it, and a request is not a place to explain itself.
     #[serde(skip_serializing)]
     sections: Vec<usize>,
-    /// The position in the file's links of each entry of [`State::links`], the
-    /// same way.
+    /// The file's link each answer of this post is about, in the order the API
+    /// numbers them: the position in the file's links of each entry of
+    /// [`State::links`] for a post that asks one question per link, and of each
+    /// option for a post whose one question is a Choice over them, which the
+    /// state does not list. Empty when the post carries no links at all.
+    ///
+    /// A post whose links are carried without a question each
+    /// ([`LinkQuestions::Omitted`]) fills this the same way and asks nothing:
+    /// what the answers of a post are is what [`Body::questions`] holds, and
+    /// this only says where an answer that comes back belongs.
     #[serde(skip_serializing)]
     links: Vec<usize>,
 }
@@ -517,6 +687,32 @@ struct Body {
     state: State,
     model: &'static str,
     questions: BTreeMap<String, Question>,
+}
+
+/// What one post of a file asks, beside the file and the share of it the post
+/// carries.
+#[derive(Debug, Clone, Copy)]
+struct Asking {
+    /// Whether this post asks the file's own Score, which is the first post's to
+    /// ask: three posts would otherwise buy three answers to one question.
+    score: bool,
+    /// What it asks about the links it carries.
+    links: LinkQuestions,
+}
+
+/// What the posts of a file ask about the links their state carries.
+///
+/// The two answers are the two scorers: one question per link, which is what
+/// ships, and nothing at all, which is what a file whose links are judged by one
+/// Choice over them needs — the link table still travels, because the file's own
+/// Score and its sections are judged with it in front of them, the way they
+/// always have been.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LinkQuestions {
+    /// One Noul per link, keyed by its position in the post's state.
+    Asked,
+    /// Nothing: the links are a [`ChoiceScorer`]'s question, not this one's.
+    Omitted,
 }
 
 /// One question waiting for a post to go in.
@@ -607,6 +803,16 @@ fn json_len<T: Serialize + ?Sized>(part: &T) -> usize {
         .len()
 }
 
+/// What one option of a Choice costs in a post's question, in characters: its
+/// text with the key, the quotes and the colon that hold it in the criteria map.
+///
+/// Measured as the JSON of the pair, which is the entry plus the brackets that
+/// stand where a reader would find the colon and the comma: never short of what
+/// is sent, which is the direction a budget estimate has to err in.
+fn option_cost(key: &str, text: &str) -> usize {
+    json_len(&(key, text))
+}
+
 /// One typed question. `type` is the API's discriminator, so the fields that do
 /// not belong to this shape are simply absent.
 #[derive(Debug, Serialize)]
@@ -619,6 +825,14 @@ enum Question {
     Score {
         instructions: String,
         criteria: &'static [&'static str],
+    },
+    /// One question over a set of options, each keyed by its position among
+    /// them: the relative judge ([#47]).
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    Choice {
+        instructions: String,
+        criteria: BTreeMap<String, String>,
     },
 }
 
@@ -659,7 +873,7 @@ struct Usage {
 
 /// One typed answer, tagged on the same `type` the question carried. A shape
 /// this code does not know is a decode error, which is the honest outcome: the
-/// two shapes below are the two it asks for.
+/// three shapes below are the three it asks for.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 enum Answer {
@@ -671,28 +885,62 @@ enum Answer {
         /// How peaked the level distribution behind the score was.
         confidence: f64,
     },
+    /// One option picked out of a set, and the whole distribution over them.
+    ///
+    /// The API's own `choice` — the highest-probability option — is not read:
+    /// what the walk follows is the distribution, [`Answer::choice`] checks it
+    /// against the options the question defined, and the maximum it names is one
+    /// this code takes off `probabilities` rather than trusting a second field
+    /// to agree with the first.
+    Choice {
+        probabilities: BTreeMap<String, f64>,
+        /// How peaked that distribution was, 0 to 1.
+        confidence: f64,
+    },
 }
 
 impl Answer {
+    /// The type the answer came back as, for the error a caller sees when it is
+    /// not the shape the question asked for.
+    fn kind(&self) -> &'static str {
+        match self {
+            Answer::Noul { .. } => "noul",
+            Answer::Score { .. } => "score",
+            Answer::Choice { .. } => "choice",
+        }
+    }
+
     fn noul(self, id: &str) -> Result<f64, ScorerError> {
         match self {
             Answer::Noul { noul } => Ok(noul),
-            Answer::Score { .. } => Err(ScorerError::WrongAnswerType {
-                id: id.to_string(),
-                expected: "noul",
-                found: "score",
-            }),
+            other => Err(other.wrong(id, "noul")),
         }
     }
 
     fn score(self, id: &str) -> Result<(f64, f64), ScorerError> {
         match self {
             Answer::Score { score, confidence } => Ok((score, confidence)),
-            Answer::Noul { .. } => Err(ScorerError::WrongAnswerType {
-                id: id.to_string(),
-                expected: "score",
-                found: "noul",
-            }),
+            other => Err(other.wrong(id, "score")),
+        }
+    }
+
+    /// The distribution over the options and how peaked it was.
+    fn choice(self, id: &str) -> Result<(BTreeMap<String, f64>, f64), ScorerError> {
+        match self {
+            Answer::Choice {
+                probabilities,
+                confidence,
+            } => Ok((probabilities, confidence)),
+            other => Err(other.wrong(id, "choice")),
+        }
+    }
+
+    /// This answer, refused: the question asked for `expected`.
+    fn wrong(self, id: &str, expected: &'static str) -> ScorerError {
+        ScorerError::WrongAnswerType {
+            id: id.to_string(),
+            expected,
+            found: self.kind(),
         }
     }
 }
@@ -719,6 +967,16 @@ pub struct JevDetail {
     /// The raw Score answer, 0 to the top level, before it became a relevance.
     pub relevance_level: f64,
     pub relevance_confidence: f64,
+    /// How peaked each Choice answer was, in the order the posts were made;
+    /// empty for a file judged one question per link.
+    ///
+    /// Not part of any decision: the keep rule reads the shares and nothing
+    /// else. It is recorded because it is the one number the API gives about
+    /// how sure it was of a page's ranking rather than of one link, which is
+    /// what a relative judge is worth reading beside its shares
+    /// ([#47](https://github.com/mikekelly/s1m/issues/47)).
+    #[serde(default)]
+    pub choice_confidence: Vec<f64>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub latency: Duration,
@@ -950,7 +1208,7 @@ impl JevScorer {
     /// Judges one file, keeping the accounting [`Scorer::score`] drops.
     pub async fn judge(&self, query: &str, file: &ParsedFile) -> Result<JevOutcome, ScorerError> {
         let request = self.request(query, file)?;
-        self.judge_request(&request, file).await
+        self.judge_request(&request, file, self.judging()).await
     }
 
     /// Sends one already-built request for `file`, keeping the accounting.
@@ -962,6 +1220,7 @@ impl JevScorer {
         &self,
         request: &Request,
         file: &ParsedFile,
+        judging: Judging,
     ) -> Result<JevOutcome, ScorerError> {
         let started = Instant::now();
         let responses = join_all(request.posts.iter().map(|post| self.send(&post.body))).await;
@@ -969,12 +1228,34 @@ impl JevScorer {
         // A post that failed fails the file: one judgment needs all its
         // answers, and the caller has no file to rank on half of them.
         let responses = responses.into_iter().collect::<Result<Vec<_>, _>>()?;
-        self.outcome(file, request, responses, latency)
+        outcome(file, request, responses, latency, judging)
+    }
+
+    /// How this scorer's answers become a judgment: the mode's own ladder, and
+    /// no keep rule — a yes/no answer per link is compared to the caller's
+    /// threshold by the walk itself
+    /// ([`crate::traverse::Admission::Threshold`]).
+    fn judging(&self) -> Judging {
+        Judging {
+            top_level: self.mode.top_level(),
+            keep: None,
+        }
     }
 
     /// One request for one file: its content, its sections, and a question per
     /// section and per link.
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
+        let (file, sections, links) = self.parts(file)?;
+        Ok(self.pack(query, file, sections, links, LinkQuestions::Asked))
+    }
+
+    /// What one file's request is made of: the file as the model sees it, its
+    /// sections, and its links. Both scorers ask with these, and they differ in
+    /// what they ask about the links ([`LinkQuestions`]).
+    fn parts(
+        &self,
+        file: &ParsedFile,
+    ) -> Result<(FileState, Vec<SectionState>, Vec<LinkState>), ScorerError> {
         let content = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
             path: file.path.clone(),
             source,
@@ -1006,7 +1287,7 @@ impl JevScorer {
             })
             .collect();
 
-        Ok(self.pack(query, state, sections, links))
+        Ok((state, sections, links))
     }
 
     /// The file's questions, split across as many posts as the API's state
@@ -1037,6 +1318,7 @@ impl JevScorer {
         file: FileState,
         sections: Vec<SectionState>,
         mut links: Vec<LinkState>,
+        asked: LinkQuestions,
     ) -> Request {
         let fixed = Fixed {
             // The file's own state: what every post carries whatever its share.
@@ -1067,7 +1349,7 @@ impl JevScorer {
             }
         }
 
-        let shares = self.shares(&sections, &links, &fixed);
+        let shares = self.shares(&sections, &links, &fixed, asked);
         let head = Head {
             query: query.to_string(),
             file,
@@ -1079,9 +1361,17 @@ impl JevScorer {
                 .enumerate()
                 .map(|(index, share)| {
                     // The file's Score is about the whole file, so the first
-                    // post asks it and later ones do not: three posts would
-                    // otherwise buy three answers to one question.
-                    self.post(&head, &sections, &links, share, index == 0)
+                    // post asks it and later ones do not.
+                    self.post(
+                        &head,
+                        &sections,
+                        &links,
+                        share,
+                        Asking {
+                            score: index == 0,
+                            links: asked,
+                        },
+                    )
                 })
                 .collect(),
         }
@@ -1111,7 +1401,13 @@ impl JevScorer {
     ///
     /// Always at least one share, even for a file with no sections and no
     /// links: the file still has a Score to ask.
-    fn shares(&self, sections: &[SectionState], links: &[LinkState], fixed: &Fixed) -> Vec<Share> {
+    fn shares(
+        &self,
+        sections: &[SectionState],
+        links: &[LinkState],
+        fixed: &Fixed,
+        asked: LinkQuestions,
+    ) -> Vec<Share> {
         // An item's cost is its state entry, the question, and the characters
         // that hold them in the body: the comma between entries, and the quotes
         // and colon around the id each question is filed under. The question is
@@ -1134,60 +1430,96 @@ impl JevScorer {
             .chain(links.iter().enumerate().map(|(index, link)| {
                 (
                     Item::Link(index),
-                    Cost::of(link, &self.link_question(index), &link_question(index)),
+                    match asked {
+                        LinkQuestions::Asked => {
+                            Cost::of(link, &self.link_question(index), &link_question(index))
+                        }
+                        // The state carries the link, the file's own judgment
+                        // is made beside it, and nothing is asked about it: the
+                        // links of a file judged this way are the Choice
+                        // question's, which is a post of its own.
+                        LinkQuestions::Omitted => Cost {
+                            state: json_len(link) + 1,
+                            question: 0,
+                        },
+                    },
                 )
             }));
 
         let mut shares = vec![Share::default()];
-        // What this share holds so far: its own state entries and its own
+        // What each share holds so far: its own state entries and its own
         // questions. The file's Score is the first share's to ask, and no later
         // one pays for it.
-        let mut used = Cost {
+        let mut used = vec![Cost {
             question: fixed.score,
             ..Cost::default()
-        };
+        }];
         for (item, cost) in costs {
-            let open = shares.last().expect("a share is always open");
-            // A share with something in it gives way to an item that would not
-            // fit; an empty one takes the item whatever it costs, so dealing
-            // always makes progress.
-            if !open.is_empty() && !fixed.fits(used, cost) {
-                shares.push(Share::default());
-                used = Cost::default();
-            }
+            let position = match item {
+                // A section is the file's own question and is never left out: a
+                // share with something in it gives way to a section that would
+                // not fit, and an empty one takes it whatever it costs, so
+                // dealing sections always makes progress.
+                Item::Section(_) => self.open_share(&mut shares, &mut used, cost, fixed),
+                Item::Link(_) => match asked {
+                    LinkQuestions::Asked => self.open_share(&mut shares, &mut used, cost, fixed),
+                    // Every post has to ask something — the API refuses one
+                    // whose questions are empty — so a link the walk has
+                    // nothing to ask about rides in a post that asks something
+                    // else, and one that fits nowhere is left out of the state.
+                    // The Choice question describes it to the model anyway, and
+                    // the file's own Score is what the base request is for.
+                    LinkQuestions::Omitted => {
+                        match used.iter().position(|used| fixed.fits(*used, cost)) {
+                            Some(position) => position,
+                            None => continue,
+                        }
+                    }
+                },
+            };
             match item {
-                Item::Section(index) => shares
-                    .last_mut()
-                    .expect("a share is always open")
-                    .sections
-                    .push(index),
-                Item::Link(index) => {
-                    shares
-                        .last_mut()
-                        .expect("a share is always open")
-                        .links
-                        .push(index);
-                }
+                Item::Section(index) => shares[position].sections.push(index),
+                Item::Link(index) => shares[position].links.push(index),
             }
-            used.state += cost.state;
-            used.question += cost.question;
+            used[position].state += cost.state;
+            used[position].question += cost.question;
         }
         shares
     }
 
-    /// One post: the file, its share of the sections and links, and where each
-    /// answer goes. `score` is whether this post asks the file's own question,
-    /// which is the first post's to ask.
+    /// Where one item goes when a question per item is asked: the share it fits
+    /// in, or a new one beside it.
+    ///
+    /// A share with something in it gives way to an item that would not fit;
+    /// an empty one takes the item whatever it costs, so dealing always makes
+    /// progress.
+    fn open_share(
+        &self,
+        shares: &mut Vec<Share>,
+        used: &mut Vec<Cost>,
+        cost: Cost,
+        fixed: &Fixed,
+    ) -> usize {
+        let last = shares.len() - 1;
+        if !shares[last].is_empty() && !fixed.fits(used[last], cost) {
+            shares.push(Share::default());
+            used.push(Cost::default());
+        }
+        shares.len() - 1
+    }
+
+    /// One post: the file, its share of the sections and links, what it asks
+    /// about them, and where each answer goes.
     fn post(
         &self,
         head: &Head,
         sections: &[SectionState],
         links: &[LinkState],
         share: &Share,
-        score: bool,
+        asking: Asking,
     ) -> Post {
         let mut questions = BTreeMap::new();
-        if score {
+        if asking.score {
             questions.insert(FILE_QUESTION.to_string(), self.score_question());
         }
 
@@ -1203,7 +1535,9 @@ impl JevScorer {
         }
         for (position, &index) in share.links.iter().enumerate() {
             state.links.push(links[index].clone());
-            questions.insert(link_question(position), self.link_question(position));
+            if asking.links == LinkQuestions::Asked {
+                questions.insert(link_question(position), self.link_question(position));
+            }
         }
 
         Post {
@@ -1311,97 +1645,6 @@ impl JevScorer {
         }
     }
 
-    /// Reads every post's answers back onto the file.
-    ///
-    /// `responses` are the answers to `request.posts`, in that order, which is
-    /// the order the questions were dealt out in: the file's sections in
-    /// document order, then its links in the order they appear. So the answers
-    /// of the posts in order are the file's sections and links in order.
-    fn outcome(
-        &self,
-        file: &ParsedFile,
-        request: &Request,
-        responses: Vec<Response>,
-        latency: Duration,
-    ) -> Result<JevOutcome, ScorerError> {
-        // Every post is answered by the same model alias; the first is the one
-        // to report, and a request always has at least one post.
-        let model = responses
-            .first()
-            .map(|response| response.model.clone())
-            .unwrap_or_default();
-
-        let mut level = None;
-        let mut questions = 0;
-        let mut input_tokens = 0;
-        let mut output_tokens = 0;
-        let mut sections = Vec::with_capacity(file.sections.len());
-        let mut links = Vec::with_capacity(file.links.len());
-
-        for (post, response) in request.posts.iter().zip(responses) {
-            let mut answers = response.answers;
-            questions += post.body.questions.len();
-            input_tokens += response.usage.input_tokens;
-            output_tokens += response.usage.output_tokens;
-
-            // Only the first post carries the file's Score; a later post's
-            // answers are all sections and links.
-            if let Some(answer) = answers.remove(FILE_QUESTION) {
-                level = Some(answer.score(FILE_QUESTION)?);
-            }
-
-            for (position, &index) in post.sections.iter().enumerate() {
-                let id = section_question(position);
-                let score = answers
-                    .remove(&id)
-                    .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
-                    .noul(&id)?;
-                let section = &file.sections[index];
-                sections.push(SectionJudgment {
-                    heading: section.heading.clone(),
-                    // The parser's own range, never a derived one: what the
-                    // caller reads is the section that was judged.
-                    lines: section.lines,
-                    score,
-                });
-            }
-
-            for (position, &index) in post.links.iter().enumerate() {
-                let id = link_question(position);
-                let scent = answers
-                    .remove(&id)
-                    .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
-                    .noul(&id)?;
-                links.push(LinkJudgment {
-                    target: file.links[index].target.clone(),
-                    scent,
-                });
-            }
-        }
-
-        let (level, confidence) = level.ok_or_else(|| ScorerError::MissingAnswer {
-            id: FILE_QUESTION.to_string(),
-        })?;
-
-        Ok(JevOutcome {
-            judgment: FileJudgment {
-                relevance: (level / self.mode.top_level()).clamp(0.0, 1.0),
-                sections,
-                links,
-            },
-            detail: JevDetail {
-                model,
-                questions,
-                requests: request.posts.len(),
-                relevance_level: level,
-                relevance_confidence: confidence,
-                input_tokens,
-                output_tokens,
-                latency,
-            },
-        })
-    }
-
     /// The target's title, frontmatter and first paragraph, each bounded.
     ///
     /// Nothing when previews are off, when the link leaves the root — that
@@ -1410,36 +1653,528 @@ impl JevScorer {
     /// links are still judged, from their anchor, sentence and heading. The
     /// frontmatter is the one part that can be dropped on its own
     /// ([`JevScorer::with_preview_frontmatter`]).
-    ///
-    /// Every part is bounded, because a preview is a hint about a target and
-    /// the target is a file this walk did not choose: a title is one line, the
-    /// first paragraph is cut at [`PREVIEW_LIMIT`], and the frontmatter at
-    /// [`FRONTMATTER_LIMIT`]. Without those bounds one page's frontmatter is
-    /// added to the state of every page that links to it.
     fn preview(&self, link: &Link) -> Option<PreviewState> {
-        if !self.previews || !link.in_root {
-            return None;
-        }
-        let preview = parse::preview(self.root.join(&link.target), &self.root).ok()?;
-        Some(PreviewState {
-            title: clamp(&preview.title, PREVIEW_LIMIT),
-            frontmatter: self
-                .preview_frontmatter
-                .then(|| frontmatter(preview.frontmatter))
-                .filter(|frontmatter| !frontmatter.is_empty()),
-            first_paragraph: preview
-                .first_paragraph
-                .map(|paragraph| clamp(&paragraph, PREVIEW_LIMIT)),
-            headings: self.preview_headings.then(|| headings(preview.headings)),
-            leads_to: self.preview_leads.then(|| leads_to(preview.leads)),
-        })
+        preview(&self.root, link, self.context())
     }
+
+    /// The link state this scorer sends: the preview parts it carries and the
+    /// phrasing of the link question it asks.
+    pub fn context(&self) -> Context {
+        Context {
+            previews: self.previews,
+            frontmatter: self.preview_frontmatter,
+            headings: self.preview_headings,
+            leads: self.preview_leads,
+            two_hop: self.two_hop,
+        }
+    }
+}
+
+/// How a file's answers become a judgment: what turns the file's raw Score into
+/// a relevance, and what keeps a Choice post's links.
+///
+/// The two scorers differ in this and nothing else: both build the file's own
+/// questions the same way and merge the same answers, and only how a link's
+/// answer is read depends on which question was asked about it.
+#[derive(Debug, Clone, Copy)]
+struct Judging {
+    /// The top of the mode's Score ladder, which a raw level is divided by.
+    top_level: f64,
+    /// The rule a Choice post's shares are kept by, or `None` for a request
+    /// that asked one question per link: a Noul is thresholded by the walk
+    /// ([`crate::traverse::Admission::Threshold`]), not by this module.
+    keep: Option<KeepRule>,
+}
+
+/// Reads every post's answers back onto the file.
+///
+/// `responses` are the answers to `request.posts`, in that order, which is the
+/// order the questions were dealt out in: the file's sections in document
+/// order, then its links in the order they appear. So the answers of the posts
+/// in order are the file's sections and links in order.
+fn outcome(
+    file: &ParsedFile,
+    request: &Request,
+    responses: Vec<Response>,
+    latency: Duration,
+    judging: Judging,
+) -> Result<JevOutcome, ScorerError> {
+    // Every post is answered by the same model alias; the first is the one
+    // to report, and a request always has at least one post.
+    let model = responses
+        .first()
+        .map(|response| response.model.clone())
+        .unwrap_or_default();
+
+    let mut level = None;
+    let mut questions = 0;
+    let mut input_tokens = 0;
+    let mut output_tokens = 0;
+    let mut sections = Vec::with_capacity(file.sections.len());
+    let mut links = Vec::with_capacity(file.links.len());
+    let mut choices = Vec::new();
+
+    for (post, response) in request.posts.iter().zip(responses) {
+        let mut answers = response.answers;
+        questions += post.body.questions.len();
+        input_tokens += response.usage.input_tokens;
+        output_tokens += response.usage.output_tokens;
+
+        // Only the first post of the file's own questions carries the Score; a
+        // later post's answers are all sections and links.
+        if let Some(answer) = answers.remove(FILE_QUESTION) {
+            level = Some(answer.score(FILE_QUESTION)?);
+        }
+
+        for (position, &index) in post.sections.iter().enumerate() {
+            let id = section_question(position);
+            let score = answers
+                .remove(&id)
+                .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
+                .noul(&id)?;
+            let section = &file.sections[index];
+            sections.push(SectionJudgment {
+                heading: section.heading.clone(),
+                // The parser's own range, never a derived one: what the
+                // caller reads is the section that was judged.
+                lines: section.lines,
+                score,
+            });
+        }
+
+        // One Choice over this post's links, or a Noul each: which one it is, is
+        // what the post asked.
+        if post.body.questions.contains_key(CHOICE_QUESTION) {
+            let (probabilities, confidence) = answers
+                .remove(CHOICE_QUESTION)
+                .ok_or_else(|| ScorerError::MissingAnswer {
+                    id: CHOICE_QUESTION.to_string(),
+                })?
+                .choice(CHOICE_QUESTION)?;
+            let (shares, none) = distribution(&probabilities, post.links.len())?;
+            let keep = judging
+                .keep
+                .expect("a Choice question is only asked by a scorer with a keep rule")
+                .keeps(&shares, none);
+            choices.push(confidence);
+            for (position, &index) in post.links.iter().enumerate() {
+                links.push(LinkJudgment {
+                    target: file.links[index].target.clone(),
+                    scent: shares[position],
+                    keep: keep[position],
+                });
+            }
+            continue;
+        }
+
+        for (position, &index) in post.links.iter().enumerate() {
+            let id = link_question(position);
+            // A post can carry links without asking about them: the file's own
+            // Score is judged with the link table in front of it, the way it
+            // always has been, and the links themselves are the Choice
+            // scorer's question ([`LinkQuestions::Omitted`]).
+            if !post.body.questions.contains_key(&id) {
+                continue;
+            }
+            let scent = answers
+                .remove(&id)
+                .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
+                .noul(&id)?;
+            links.push(LinkJudgment {
+                target: file.links[index].target.clone(),
+                scent,
+                keep: true,
+            });
+        }
+    }
+
+    let (level, confidence) = level.ok_or_else(|| ScorerError::MissingAnswer {
+        id: FILE_QUESTION.to_string(),
+    })?;
+
+    Ok(JevOutcome {
+        judgment: FileJudgment {
+            relevance: (level / judging.top_level).clamp(0.0, 1.0),
+            sections,
+            links,
+        },
+        detail: JevDetail {
+            model,
+            questions,
+            requests: request.posts.len(),
+            relevance_level: level,
+            relevance_confidence: confidence,
+            choice_confidence: choices,
+            input_tokens,
+            output_tokens,
+            latency,
+        },
+    })
+}
+
+/// One Choice answer, read as a distribution: the shares of the options the
+/// question asked about, in the order it asked them, and the share of the
+/// [`NONE_OPTION`] beside them, scaled together when the answer does not add up
+/// to one.
+///
+/// The two come back as one value because the keep rule weighs them against
+/// each other: `none` decides whether the page is entered at all, and a share
+/// scaled against an unscaled `none` would answer that question with arithmetic
+/// the model never did.
+///
+/// The docs promise probabilities that sum to 1, and a distribution that does is
+/// kept as it stands: the keep rule compares its shares to the options beside
+/// them, and the walk multiplies path scores by them. One that does not — a
+/// proxy, a rounded or hand-edited answer — is scaled so its options still add
+/// up, which is what keeps a set of shares from being read as a probability that
+/// is not one.
+///
+/// An answer that omits an option is an error rather than a zero: the question
+/// defined the option, and a share nobody weighed is a hole in the page's
+/// ranking rather than a link the model passed over.
+fn distribution(
+    probabilities: &BTreeMap<String, f64>,
+    options: usize,
+) -> Result<(Vec<f64>, f64), ScorerError> {
+    let sum: f64 = probabilities.values().sum();
+    let scale = match (sum - 1.0).abs() > SHARE_EPSILON && sum > 0.0 {
+        true => 1.0 / sum,
+        false => 1.0,
+    };
+    let none =
+        probabilities
+            .get(NONE_OPTION)
+            .copied()
+            .ok_or_else(|| ScorerError::MissingAnswer {
+                id: NONE_OPTION.to_string(),
+            })?
+            * scale;
+    let shares = (0..options)
+        .map(|position| {
+            let key = position.to_string();
+            probabilities
+                .get(&key)
+                .map(|share| share * scale)
+                .ok_or_else(|| ScorerError::MissingAnswer {
+                    id: format!("{CHOICE_QUESTION}[{key}]"),
+                })
+        })
+        .collect::<Result<Vec<f64>, ScorerError>>()?;
+    Ok((shares, none))
 }
 
 #[async_trait]
 impl Scorer for JevScorer {
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         Ok(self.judge(query, file).await?.judgment)
+    }
+}
+
+/// Judges a page's links against each other instead of one at a time: one Choice
+/// over the page's in-root links, whose answer is a share per link ([#47]).
+///
+/// The file's own Score and its section Nouls are asked exactly as
+/// [`JevScorer`] asks them — the same state, the same wording, minus the
+/// question per link — so the two scorers' relevance and section scores are the
+/// same questions over the same file, and only the link judgment differs. That
+/// is what makes them comparable: a walk under this scorer follows shares by
+/// [`KeepRule`], and a walk under [`JevScorer`] follows scents by the caller's
+/// threshold, and nothing else about what they were told changed.
+///
+/// The links are asked about in a post of their own, because one Choice is one
+/// question with up to 255 options and a page's links are what defines them. A
+/// page with more links than that, or with more than the state budget takes
+/// beside the file, is asked in as many posts as it needs; the answers merge
+/// into one file's links, in the page's own order.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+pub struct ChoiceScorer {
+    /// The absolute judge whose plumbing this shares: one client, one endpoint,
+    /// one key, one file's own Score and its sections.
+    base: JevScorer,
+    /// What a share has to be to keep its link.
+    keep: KeepRule,
+    /// What an option's description carries of its target, and how the Choice
+    /// question is phrased.
+    ///
+    /// Separate from the base's state, which is the state that ships: the file's
+    /// own Score and its sections are always judged with it, and only the
+    /// options vary here. What ships for this scorer is no preview at all — an
+    /// option is the page's own words about the link — so that a run that asks
+    /// for one is asking for the comparison the spike measures.
+    context: Context,
+}
+
+impl ChoiceScorer {
+    /// The relative judge over the absolute one's plumbing. It judges by
+    /// [`KeepRule::default`], describes its options from the page alone, and
+    /// takes the base scorer's mode, key, endpoint and root as they are.
+    pub fn new(base: JevScorer) -> Self {
+        ChoiceScorer {
+            base,
+            keep: KeepRule::default(),
+            context: Context {
+                previews: false,
+                ..Context::DEFAULT
+            },
+        }
+    }
+
+    /// Keeps links by `keep` instead of [`KeepRule::default`].
+    pub fn with_keep(mut self, keep: KeepRule) -> Self {
+        self.keep = keep;
+        self
+    }
+
+    /// Describes each option from `context` instead of the page's own words: the
+    /// preview parts it carries, and whether the Choice question is the two-hop
+    /// one.
+    pub fn with_context(mut self, context: Context) -> Self {
+        self.context = context;
+        self
+    }
+
+    /// Judges by `mode`'s criterion instead of the base's.
+    pub fn with_mode(mut self, mode: Mode) -> Self {
+        self.base = self.base.with_mode(mode);
+        self
+    }
+
+    /// Points both requests at another endpoint.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.base = self.base.with_endpoint(endpoint);
+        self
+    }
+
+    pub fn mode(&self) -> &Mode {
+        self.base.mode()
+    }
+
+    /// Judges one file, keeping the accounting [`Scorer::score`] drops.
+    pub async fn judge(&self, query: &str, file: &ParsedFile) -> Result<JevOutcome, ScorerError> {
+        let request = self.request(query, file)?;
+        self.base
+            .judge_request(&request, file, self.judging())
+            .await
+    }
+
+    /// How this scorer's answers become a judgment: the base's ladder, and the
+    /// keep rule for the links.
+    fn judging(&self) -> Judging {
+        Judging {
+            top_level: self.base.mode.top_level(),
+            keep: Some(self.keep),
+        }
+    }
+
+    /// One request for one file: the file's own Score and its section Nouls, in
+    /// the state the absolute judge asks them in, and one Choice per chunk of
+    /// its in-root links.
+    ///
+    /// The base posts come first, so the file's Score is asked in the first post
+    /// of the request the way it is asked today; all of them go out together,
+    /// so the file costs one round trip and not two.
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
+        let (state, sections, links) = self.base.parts(file)?;
+        let mut posts = self
+            .base
+            .pack(
+                query,
+                state.clone(),
+                sections,
+                links,
+                LinkQuestions::Omitted,
+            )
+            .posts;
+        posts.extend(self.choice_posts(query, &state, &file.links));
+        Ok(Request { posts })
+    }
+
+    /// One file's Choice posts: its in-root links dealt out into questions the
+    /// API takes.
+    ///
+    /// Two ceilings decide a chunk, and either can bind first: the API's 255
+    /// options, [`NONE_OPTION`] being one of them, and the state budget — the
+    /// query, the file, and the question itself, which grows by an option at a
+    /// time. A link the state budget cannot take even alone is still asked
+    /// about, in a post of its own: a page whose own text fills the budget must
+    /// not lose its links to arithmetic.
+    ///
+    /// A page with no in-root link asks nothing: there is no option to choose
+    /// between, and the page is judged by its own Score and sections as it
+    /// always is.
+    ///
+    /// The options are built from the page's own links rather than from the
+    /// state entries the file's judgment carries: an option's preview is this
+    /// scorer's own switch ([`ChoiceScorer::with_previews`]), and the file's own
+    /// judgment is made with the previews that always ship.
+    fn choice_posts(&self, query: &str, file: &FileState, links: &[Link]) -> Vec<Post> {
+        let options: Vec<(usize, String)> = links
+            .iter()
+            .enumerate()
+            .filter(|(_, link)| link.in_root)
+            .map(|(index, link)| (index, self.option(link)))
+            .collect();
+        if options.is_empty() {
+            return Vec::new();
+        }
+
+        // What every post pays whatever its chunk: the file in the state, and
+        // the question's own words with the option that says none of the links.
+        let state = json_len(&query) + json_len(file);
+        let fixed = json_len(&self.choice_question(&[]))
+            + option_cost(NONE_OPTION, self.base.mode.link_false);
+
+        let mut posts = Vec::new();
+        let mut chunk: Vec<(usize, String)> = Vec::new();
+        let mut used = fixed;
+        for (index, text) in options {
+            let cost = option_cost(&chunk.len().to_string(), &text);
+            // A chunk with something in it gives way to an option that would
+            // not fit on either count; an empty one takes it whatever it costs,
+            // so dealing always makes progress and no link is dropped silently.
+            if !chunk.is_empty()
+                && (chunk.len() >= LINKS_PER_CHOICE
+                    || state + used + cost + POST_MARGIN > STATE_CHARS)
+            {
+                posts.push(self.choice_post(query, file, &chunk));
+                chunk = Vec::new();
+                used = fixed;
+            }
+            used += cost;
+            chunk.push((index, text));
+        }
+        posts.push(self.choice_post(query, file, &chunk));
+        posts
+    }
+
+    /// One Choice post: the page, its share of the links as the options of one
+    /// question, and where each answer goes.
+    fn choice_post(&self, query: &str, file: &FileState, chunk: &[(usize, String)]) -> Post {
+        let mut questions = BTreeMap::new();
+        questions.insert(CHOICE_QUESTION.to_string(), self.choice_question(chunk));
+        Post {
+            body: Body {
+                state: State {
+                    query: query.to_string(),
+                    file: file.clone(),
+                    sections: Vec::new(),
+                    links: Vec::new(),
+                },
+                model: MODEL,
+                questions,
+            },
+            sections: Vec::new(),
+            links: chunk.iter().map(|(index, _)| *index).collect(),
+        }
+    }
+
+    /// The one question a Choice post asks: this mode's wording, and one option
+    /// per link the post carries, keyed by its position among them, with the
+    /// option that says none of them beside it ([`NONE_OPTION`]).
+    ///
+    /// The keys are positions and not targets, so an answer is read back by
+    /// where it was asked about rather than by what it said; the `none` option
+    /// is the mode's own "what a no means for a link", so the option that leaves
+    /// the page means what the Noul beside it means.
+    fn choice_question(&self, options: &[(usize, String)]) -> Question {
+        let mut criteria: BTreeMap<String, String> = BTreeMap::new();
+        for (position, (_, text)) in options.iter().enumerate() {
+            criteria.insert(position.to_string(), text.clone());
+        }
+        criteria.insert(
+            NONE_OPTION.to_string(),
+            self.base.mode.link_false.to_string(),
+        );
+        let instructions = match self.context.two_hop {
+            true => self.base.mode.choice_question_two_hop.to_string(),
+            false => self.base.mode.choice_question.to_string(),
+        };
+        Question::Choice {
+            instructions,
+            criteria,
+        }
+    }
+
+    /// What one option says about its link: the page's own words about where it
+    /// goes — the anchor, the sentence it sits in, and the heading it sits under
+    /// — and, when the run asks for one, the preview its own [`Context`] carries.
+    ///
+    /// The page is what the question is asked about, so the option is written
+    /// the page's way rather than as a path: what the model is choosing between
+    /// is what the links say, and what the caller reads back is the position the
+    /// key gave it.
+    fn option(&self, link: &Link) -> String {
+        let mut text = format!("\"{}\" — {}", link.anchor, link.sentence);
+        if let Some(heading) = &link.heading {
+            let _ = write!(text, " (under \"{heading}\")");
+        }
+        if let Some(preview) = preview(&self.base.root, link, self.context) {
+            let _ = write!(text, ". The target is \"{}\"", preview.title);
+            if let Some(frontmatter) = &preview.frontmatter {
+                let fields: Vec<String> = frontmatter
+                    .iter()
+                    .map(|field| format!("{}: {}", field.key, field.value))
+                    .collect();
+                let _ = write!(text, "; its frontmatter reads {}", fields.join("; "));
+            }
+            if let Some(paragraph) = &preview.first_paragraph {
+                let _ = write!(text, "; it opens \"{paragraph}\"");
+            }
+            if let Some(headings) = &preview.headings {
+                let _ = write!(text, "; its headings are {}", headings.join("; "));
+            }
+            if let Some(leads) = &preview.leads_to {
+                let _ = write!(text, "; it links to {}", leads.join("; "));
+            }
+        }
+        text
+    }
+}
+
+#[async_trait]
+impl Scorer for ChoiceScorer {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
+        Ok(self.judge(query, file).await?.judgment)
+    }
+}
+
+/// One file's links are one request, Choice questions and all, and the answer to
+/// it can be kept.
+#[async_trait]
+impl Cacheable for ChoiceScorer {
+    type Request = Request;
+    type Detail = JevDetail;
+
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
+        ChoiceScorer::request(self, query, file)
+    }
+
+    /// The endpoint, the request, and the keep rule the answer is read by.
+    ///
+    /// The same key the absolute judge builds, over a request that carries the
+    /// Choice questions: the endpoint, the model, the mode's wording, the file
+    /// and its sections, and the options — which is everything the answers
+    /// depend on, except the one thing that is not in the request: the rule that
+    /// turns the shares into a verdict. That rule is part of the judgment this
+    /// scorer returns, so it is part of what the answer is keyed on, and a run
+    /// at a different floor or k buys its shares rather than reading another
+    /// rule's verdicts off them.
+    fn key(&self, request: &Request) -> Result<Vec<u8>, ScorerError> {
+        serde_json::to_vec(&(&self.base.endpoint, request, self.keep))
+            .map_err(|source| ScorerError::Encode { source })
+    }
+
+    async fn call(
+        &self,
+        request: &Request,
+        file: &ParsedFile,
+    ) -> Result<(FileJudgment, JevDetail), ScorerError> {
+        let outcome = self
+            .base
+            .judge_request(request, file, self.judging())
+            .await?;
+        Ok((outcome.judgment, outcome.detail))
     }
 }
 
@@ -1469,7 +2204,7 @@ impl Cacheable for JevScorer {
         request: &Request,
         file: &ParsedFile,
     ) -> Result<(FileJudgment, JevDetail), ScorerError> {
-        let outcome = self.judge_request(request, file).await?;
+        let outcome = self.judge_request(request, file, self.judging()).await?;
         Ok((outcome.judgment, outcome.detail))
     }
 }
@@ -1480,6 +2215,42 @@ fn required_key(value: Option<String>) -> Result<String, ScorerError> {
         Some(key) if !key.trim().is_empty() => Ok(key),
         _ => Err(ScorerError::MissingApiKey),
     }
+}
+
+/// The target's title, frontmatter and first paragraph, each bounded: what one
+/// link's option or state entry says about where it goes.
+///
+/// Nothing when previews are off, when the link leaves the root — that content
+/// is outside what the caller asked s1m to look at — or when the target cannot
+/// be read, which is the normal state of a broken link.
+///
+/// Every part is bounded, because a preview is a hint about a target and the
+/// target is a file this walk did not choose: a title is one line, the first
+/// paragraph is cut at [`PREVIEW_LIMIT`], and the frontmatter at
+/// [`FRONTMATTER_LIMIT`]. Without those bounds one page's frontmatter is added
+/// to the state of every page that links to it.
+///
+/// The state is a value rather than the scorer's own fields because the
+/// relative judge decides it for its own questions: the file's own judgment is
+/// made with the state that ships, and an option's description carries a
+/// preview only when the run asked for one ([`ChoiceScorer::with_context`]).
+fn preview(root: &Path, link: &Link, state: Context) -> Option<PreviewState> {
+    if !state.previews || !link.in_root {
+        return None;
+    }
+    let preview = parse::preview(root.join(&link.target), root).ok()?;
+    Some(PreviewState {
+        title: clamp(&preview.title, PREVIEW_LIMIT),
+        frontmatter: state
+            .frontmatter
+            .then(|| frontmatter(preview.frontmatter))
+            .filter(|frontmatter| !frontmatter.is_empty()),
+        first_paragraph: preview
+            .first_paragraph
+            .map(|paragraph| clamp(&paragraph, PREVIEW_LIMIT)),
+        headings: state.headings.then(|| headings(preview.headings)),
+        leads_to: state.leads.then(|| leads_to(preview.leads)),
+    })
 }
 
 /// The headings a preview carries: the target's own, in order, at most
@@ -1560,7 +2331,7 @@ mod tests {
     use serde_json::{Map, Value, json};
 
     use super::*;
-    use crate::cache::{Cacheable, CachedScorer};
+    use crate::cache::{Cacheable, CachedScorer, Scored};
     use crate::testkit::TempDir;
 
     // --------------------------------------------------------- the fixture
@@ -1663,6 +2434,12 @@ mod tests {
         /// wiki as the root link previews are read from.
         fn scorer(&self) -> JevScorer {
             self.scorer_in(&root())
+        }
+
+        /// The relative judge over this server and another root: one Choice
+        /// over a page's links instead of a question about each.
+        fn choice_in(&self, root: &Path) -> ChoiceScorer {
+            ChoiceScorer::new(self.scorer_in(root))
         }
 
         /// A scorer pointed at this server whose root is `root`: the directory
@@ -1863,6 +2640,765 @@ mod tests {
             })
             .collect::<Map<String, Value>>();
         reply(answers)
+    }
+
+    // ------------------------------------------------------ the relative judge
+
+    /// A reply to the relative judge's request: the file's Score and a Noul
+    /// for each of its sections, and every Choice question answered with
+    /// `shares`, position by position, and `none` beside them.
+    ///
+    /// The answer carries the `choice` field the API sends — the option it
+    /// picked — so code that reads that instead of the distribution is visible.
+    /// A page split across posts is answered with the same shares in each, which
+    /// is what a test that is not about the split wants: an option the test did
+    /// not name is answered 0.0, and a chunk wider than the shares given is
+    /// answered with those zeros beside them.
+    fn choice_reply(
+        shares: Vec<f64>,
+        none: f64,
+        confidence: f64,
+    ) -> impl Fn(usize, &Value) -> (u16, String) {
+        move |_, request: &Value| {
+            let answered = request["questions"].get(CHOICE_QUESTION).map(|question| {
+                let options = question["criteria"]
+                    .as_object()
+                    .expect("a criteria map")
+                    .len()
+                    - 1;
+                let mut probabilities = Map::new();
+                for position in 0..options {
+                    probabilities.insert(
+                        position.to_string(),
+                        json!(shares.get(position).copied().unwrap_or(0.0)),
+                    );
+                }
+                probabilities.insert(NONE_OPTION.to_string(), json!(none));
+                json!({
+                    "type": "choice",
+                    "choice": "0",
+                    "probabilities": probabilities,
+                    "confidence": confidence,
+                })
+            });
+            let answers = request["questions"]
+                .as_object()
+                .expect("a question map")
+                .keys()
+                .map(|id| {
+                    let answer = if id == FILE_QUESTION {
+                        json!({"type": "score", "score": 2.0, "confidence": 0.87})
+                    } else if id == CHOICE_QUESTION {
+                        answered
+                            .clone()
+                            .expect("the choice question the request asked")
+                    } else {
+                        json!({"type": "noul", "noul": 0.6})
+                    };
+                    (id.clone(), answer)
+                })
+                .collect::<Map<String, Value>>();
+            (200, reply(answers))
+        }
+    }
+
+    /// One page under `dir` with `links` links of its own to pages written
+    /// beside it, and `out` links that leave the root. Both are written the way
+    /// a wiki writes them, so an option reads back as a page's own words.
+    fn linked_page(dir: &TempDir, links: usize, out: usize) -> ParsedFile {
+        let mut source = String::from("# Hub\n\nThe page under test.\n\n");
+        for index in 0..links {
+            let page = format!("page-{index:03}.md");
+            fs::write(
+                dir.path().join(&page),
+                format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
+            )
+            .expect("a generated page");
+            source.push_str(&format!(
+                "- [Page {index}]({page}) — step {index} of the runbook.\n"
+            ));
+        }
+        for index in 0..out {
+            source.push_str(&format!(
+                "- [Outside {index}](../outside-{index}.md) — not in the root.\n"
+            ));
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &source).expect("a generated hub");
+        parse::parse(&path, dir.path()).expect("a parse")
+    }
+
+    /// The Choice question one request asked, or a panic naming what it asked
+    /// instead.
+    fn choice_question_of(request: &Value) -> &Value {
+        request["questions"]
+            .get(CHOICE_QUESTION)
+            .unwrap_or_else(|| panic!("no choice question in {request}"))
+    }
+
+    /// The options of a Choice question: its criteria map.
+    fn options_of(request: &Value) -> &Map<String, Value> {
+        choice_question_of(request)["criteria"]
+            .as_object()
+            .expect("a criteria map")
+    }
+
+    /// The relative judge asks one Choice over a page's in-root links: an option
+    /// per link, keyed by its position, with the option that says none of them
+    /// beside it.
+    ///
+    /// A link that leaves the root is not a choice the caller could make, so it
+    /// is not an option — and the file's own questions are asked as they always
+    /// were, from a state that still carries the page's links, with no question
+    /// per link in it.
+    #[tokio::test]
+    async fn one_choice_over_the_in_root_links_is_what_the_relative_judge_asks() {
+        let dir = TempDir::new("choice-options");
+        let page = linked_page(&dir, 3, 1);
+        let api = FakeApi::new(choice_reply(vec![0.5, 0.3, 0.1], 0.1, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "the file's own questions, and the links': {requests:?}"
+        );
+
+        // The file's own questions: today's state, and no question per link.
+        let base = requests
+            .iter()
+            .find(|request| request["questions"].get(FILE_QUESTION).is_some())
+            .expect("the file's own questions");
+        assert_eq!(
+            base["state"]["links"].as_array().expect("links").len(),
+            page.links.len(),
+            "the page's links are in front of the file's own judgment, as they always were"
+        );
+        assert!(
+            base["questions"].get(link_question(0)).is_none(),
+            "and nothing is asked about them: they are the choice's business"
+        );
+
+        // The Choice question: one option per in-root link, and none.
+        let choice = requests
+            .iter()
+            .find(|request| request["questions"].get(CHOICE_QUESTION).is_some())
+            .expect("the choice question");
+        assert_eq!(
+            choice["state"]["links"].as_array().expect("links").len(),
+            0,
+            "the options are the links, and the state is the page they are on"
+        );
+        let options = options_of(choice);
+        assert_eq!(
+            options.keys().collect::<Vec<_>>(),
+            ["0", "1", "2", NONE_OPTION],
+            "three in-root links, keyed by position, and the way out"
+        );
+        assert_eq!(choice_question_of(choice)["type"], "choice");
+        assert_eq!(
+            choice_question_of(choice)["instructions"],
+            USEFUL_FOR.choice_question_two_hop.as_ref(),
+            "the mode's wording at the hop the state ships, as the Noul question's is"
+        );
+        assert_eq!(
+            options[NONE_OPTION], USEFUL_FOR.link_false,
+            "the option that leaves the page means what a link's no means"
+        );
+        assert_eq!(outcome.detail.requests, 2);
+        assert_eq!(outcome.detail.choice_confidence, [0.7]);
+
+        // Every in-root link is judged, in the page's own order, with the share
+        // the question gave its option; the one that leaves the root is not an
+        // option and so is not judged.
+        assert_eq!(
+            outcome
+                .judgment
+                .links
+                .iter()
+                .map(|link| (link.target.display().to_string(), link.scent, link.keep))
+                .collect::<Vec<_>>(),
+            [
+                ("page-000.md".to_string(), 0.5, true),
+                ("page-001.md".to_string(), 0.3, false),
+                ("page-002.md".to_string(), 0.1, false),
+            ],
+            "a cut of half, and the one link the model put above none"
+        );
+        assert_eq!(outcome.judgment.sections.len(), page.sections.len());
+    }
+
+    /// A page with more links than one Choice takes is asked in chunks of the
+    /// API's own limit, 254 links and the `none` option with them, each chunk
+    /// its own question and its own `none`.
+    #[tokio::test]
+    async fn a_page_with_more_links_than_a_choice_takes_is_asked_in_chunks() {
+        let dir = TempDir::new("choice-chunks");
+        let page = linked_page(&dir, LINKS_PER_CHOICE + 3, 0);
+        let api = FakeApi::new(choice_reply(vec![0.5, 0.2, 0.2], 0.1, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        let chunks: Vec<&Value> = requests
+            .iter()
+            .filter(|request| request["questions"].get(CHOICE_QUESTION).is_some())
+            .collect();
+        assert_eq!(chunks.len(), 2, "255 options is the API's ceiling");
+        assert_eq!(options_of(chunks[0]).len(), LINKS_PER_CHOICE + 1);
+        assert_eq!(
+            options_of(chunks[0]).keys().next_back().map(String::as_str),
+            Some(NONE_OPTION)
+        );
+        assert_eq!(
+            options_of(chunks[1]).len(),
+            4,
+            "the rest, and none with them"
+        );
+        for chunk in &chunks {
+            assert_within_budget(chunk);
+        }
+
+        // Every link is judged once, in the page's own order: the chunks are
+        // read back through the positions their own questions keyed.
+        assert_eq!(outcome.judgment.links.len(), page.links.len());
+        for (judged, link) in outcome.judgment.links.iter().zip(&page.links) {
+            assert_eq!(judged.target, link.target);
+        }
+        assert_eq!(
+            outcome
+                .judgment
+                .links
+                .iter()
+                .map(|link| link.scent)
+                .collect::<Vec<_>>()[..3],
+            [0.5, 0.2, 0.2],
+            "the shares of the chunk that asked about them"
+        );
+    }
+
+    /// The shares are read back onto the links in the order the options were
+    /// asked about, and a distribution that does not sum to one is scaled to
+    /// one: what the walk multiplies path scores by is a probability either way.
+    #[tokio::test]
+    async fn the_shares_land_on_their_links_and_add_up_to_one() {
+        let dir = TempDir::new("choice-shares");
+        let page = linked_page(&dir, 2, 0);
+        // 0.6 + 0.2 + 0.1 is 0.9: the model answered, a proxy rounded.
+        let api = FakeApi::new(choice_reply(vec![0.6, 0.2], 0.1, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+
+        let shares: Vec<f64> = outcome
+            .judgment
+            .links
+            .iter()
+            .map(|link| link.scent)
+            .collect();
+        assert_eq!(shares.len(), 2);
+        assert!((shares[0] - 0.6 / 0.9).abs() < 1e-12, "{shares:?}");
+        assert!((shares[1] - 0.2 / 0.9).abs() < 1e-12, "{shares:?}");
+        assert!(
+            outcome.judgment.links[0].keep && !outcome.judgment.links[1].keep,
+            "the cut is read off the scaled shares too"
+        );
+    }
+
+    /// An answer that omits an option is a hole in the page's ranking rather
+    /// than a link the model passed over, and is an error rather than a zero.
+    #[tokio::test]
+    async fn an_answer_that_omits_an_option_is_an_error() {
+        let dir = TempDir::new("choice-missing");
+        let page = linked_page(&dir, 2, 0);
+        let api = FakeApi::new(|_, request: &Value| {
+            let answered = json!({
+                "type": "choice",
+                "choice": "0",
+                "probabilities": {"0": 0.6, NONE_OPTION: 0.1},
+                "confidence": 0.7,
+            });
+            let answers = request["questions"]
+                .as_object()
+                .expect("a question map")
+                .keys()
+                .map(|id| {
+                    let answer = if id == FILE_QUESTION {
+                        json!({"type": "score", "score": 2.0, "confidence": 0.87})
+                    } else if id == CHOICE_QUESTION {
+                        answered.clone()
+                    } else {
+                        json!({"type": "noul", "noul": 0.6})
+                    };
+                    (id.clone(), answer)
+                })
+                .collect::<Map<String, Value>>();
+            (200, reply(answers))
+        });
+
+        let error = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect_err("an option nobody weighed");
+        assert!(
+            matches!(&error, ScorerError::MissingAnswer { id } if id.contains("[1]")),
+            "{error}"
+        );
+    }
+
+    /// A Choice question answered with a Noul is an answer of the wrong shape,
+    /// which is what the API's own tag is for.
+    #[tokio::test]
+    async fn a_choice_question_answered_with_a_noul_is_an_error() {
+        let dir = TempDir::new("choice-wrong-shape");
+        let page = linked_page(&dir, 1, 0);
+        let api = FakeApi::new(|_, request: &Value| {
+            let answers = request["questions"]
+                .as_object()
+                .expect("a question map")
+                .keys()
+                .map(|id| {
+                    let answer = if id == FILE_QUESTION {
+                        json!({"type": "score", "score": 2.0, "confidence": 0.87})
+                    } else {
+                        json!({"type": "noul", "noul": 0.6})
+                    };
+                    (id.clone(), answer)
+                })
+                .collect::<Map<String, Value>>();
+            (200, reply(answers))
+        });
+
+        let error = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect_err("a Noul is not a Choice");
+        assert!(
+            matches!(&error, ScorerError::WrongAnswerType { expected, found, .. } if *expected == "choice" && *found == "noul"),
+            "{error}"
+        );
+    }
+
+    /// An option says what the page says about the link — its anchor, the
+    /// sentence it sits in and the heading it sits under — and, only when the
+    /// run asks for one, what the target itself looks like.
+    #[tokio::test]
+    async fn an_option_carries_the_pages_own_words_and_a_preview_only_when_asked() {
+        let dir = TempDir::new("choice-option");
+        let page = linked_page(&dir, 1, 0);
+        let words = |text: &str| text.contains("\"Page 0\"") && text.contains("under \"Hub\"");
+        let look =
+            |text: &str| text.contains("The target is \"Page 0\"") && text.contains("it opens");
+
+        let without = FakeApi::new(choice_reply(vec![0.9], 0.1, 0.7));
+        without
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+        let option = options_of(
+            without
+                .requests()
+                .iter()
+                .find(|request| request["questions"].get(CHOICE_QUESTION).is_some())
+                .expect("the choice question"),
+        )["0"]
+            .as_str()
+            .expect("an option")
+            .to_string();
+        assert!(words(&option), "{option}");
+        assert!(!look(&option), "no preview was asked for: {option}");
+
+        let with = FakeApi::new(choice_reply(vec![0.9], 0.1, 0.7));
+        with.choice_in(dir.path())
+            .with_context(Context::DEFAULT)
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+        let option = options_of(
+            with.requests()
+                .iter()
+                .find(|request| request["questions"].get(CHOICE_QUESTION).is_some())
+                .expect("the choice question"),
+        )["0"]
+            .as_str()
+            .expect("an option")
+            .to_string();
+        assert!(words(&option) && look(&option), "{option}");
+    }
+
+    /// Every post a Choice request makes asks at least one question: the API
+    /// refuses a post whose `questions` map is empty with a 422, and a page the
+    /// walk is refused is one it never reaches past.
+    ///
+    /// The page's own judgment is what the links ride with — the file's Score
+    /// and its sections are the questions — so a hub whose link table does not
+    /// fit beside them leaves links out of the state rather than sending a post
+    /// about nothing. The links are asked about either way: the Choice question
+    /// describes every one of them.
+    ///
+    /// A page with no in-root link is asked nothing about them: no Choice post
+    /// at all, rather than one with no options.
+    #[tokio::test]
+    async fn every_post_a_choice_request_makes_asks_something() {
+        let dir = TempDir::new("choice-questions");
+        let hub = big_page(&dir);
+        let api = FakeApi::new(choice_reply(vec![0.9], 0.05, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &hub)
+            .await
+            .expect("a judgment");
+
+        assert_eq!(
+            api.requests().len(),
+            2,
+            "the page's own questions, and the links'"
+        );
+        for request in &api.requests() {
+            assert!(
+                !request["questions"]
+                    .as_object()
+                    .expect("a question map")
+                    .is_empty(),
+                "a post that asks nothing is one the API refuses: {request}"
+            );
+        }
+        assert_eq!(
+            outcome.judgment.links.len(),
+            hub.links.len(),
+            "every link is still asked about, in the post that asks for the choice"
+        );
+
+        // A page with no heading at all and a link table of the size [#37]
+        // measured: the one post it makes asks the file's Score, and the links
+        // are asked about in the post beside it.
+        let flat = generated(&dir, 0, 300);
+        let api = FakeApi::new(choice_reply(vec![0.9], 0.05, 0.7));
+        api.choice_in(dir.path())
+            .judge("how do I cut a release", &flat)
+            .await
+            .expect("a judgment");
+        assert_eq!(
+            api.requests().len(),
+            3,
+            "the file, and three hundred links in the API's two chunks of 254"
+        );
+        for request in &api.requests() {
+            assert!(
+                !request["questions"]
+                    .as_object()
+                    .expect("a question map")
+                    .is_empty(),
+                "a post that asks nothing is one the API refuses: {request}"
+            );
+        }
+
+        // A page with no in-root link has nothing to choose between.
+        let outside = linked_page(&dir, 0, 3);
+        let api = FakeApi::new(choice_reply(vec![0.9], 0.05, 0.7));
+        api.choice_in(dir.path())
+            .judge("how do I cut a release", &outside)
+            .await
+            .expect("a judgment");
+        assert!(
+            api.requests()
+                .iter()
+                .all(|request| request["questions"].get(CHOICE_QUESTION).is_none()),
+            "no options, no question"
+        );
+    }
+
+    /// The one link the model put above `none` is kept at the size of page the
+    /// private wiki showed: thirteen in-root links, one of them holding almost
+    /// all of the question's mass, and the way out at a hundredth of it.
+    ///
+    /// This is the shape that made the walk look as if it never left the entry
+    /// set ([#47](https://github.com/mikekelly/s1m/issues/47)): no cut comes
+    /// near 0.96, so the clause that keeps the model's own preference is what
+    /// decides it, and it has to fire.
+    #[test]
+    fn the_top_link_is_kept_on_a_thirteen_option_page() {
+        let rule = KeepRule::default();
+        let mut shares = vec![0.0025; 13];
+        shares[0] = 0.96;
+
+        let kept = rule.keeps(&shares, 0.01);
+
+        assert!(
+            kept[0],
+            "the link holding 0.96 of the mass, against none at 0.01"
+        );
+        assert_eq!(kept.iter().filter(|kept| **kept).count(), 1);
+        assert!(
+            !rule.keeps(&shares, 0.96)[0],
+            "and nothing when none matches it: a tie is not a preference"
+        );
+    }
+
+    /// The cut a share has to hold: the floor on a page of many links, the
+    /// k-scaled share on a page of some, and never above half.
+    #[test]
+    fn the_cut_moves_with_the_question_and_stops_at_half() {
+        let rule = KeepRule::default();
+        assert_eq!(
+            rule.cut(200),
+            0.02,
+            "the floor, where k/options is under it"
+        );
+        assert_eq!(rule.cut(10), 0.3, "k/options, on a page of some links");
+        assert_eq!(
+            rule.cut(4),
+            0.5,
+            "the ceiling, where k/options is over half"
+        );
+        assert_eq!(
+            rule.cut(2),
+            0.5,
+            "and on a page the ceiling is all there is"
+        );
+    }
+
+    /// The floor is what a page of many links leaves: on two hundred links the
+    /// k-scaled cut is under it, so every share above the floor is kept.
+    #[test]
+    fn the_floor_is_what_a_page_of_many_links_leaves() {
+        let rule = KeepRule::default();
+        let mut shares = vec![0.004; 199];
+        shares.push(0.05);
+
+        let kept = rule.keeps(&shares, 0.001);
+
+        assert_eq!(kept.iter().filter(|kept| **kept).count(), 1);
+        assert!(kept[199], "the one share above the floor");
+        assert!(!kept[0], "and none of the ones below it");
+    }
+
+    /// A page whose best option is `none` keeps nothing, whatever the cut would
+    /// have kept: the model was asked which of the links is worth the reader's
+    /// next step and answered that none of them is.
+    #[test]
+    fn a_page_whose_best_option_is_none_keeps_no_link() {
+        let rule = KeepRule::default();
+        assert_eq!(rule.keeps(&[0.5, 0.2], 0.6), [false, false]);
+        assert_eq!(
+            rule.keeps(&[0.4], 0.4),
+            [false],
+            "a tie is not the model preferring a link"
+        );
+    }
+
+    /// The one link the model put above `none` is kept whatever the cut: a page
+    /// the model would enter is entered by at least one way, which is what keeps
+    /// a page of two or three options followable at all.
+    #[test]
+    fn the_link_the_model_put_above_none_is_kept_whatever_the_cut() {
+        let rule = KeepRule::default();
+        assert_eq!(
+            rule.keeps(&[0.4, 0.35], 0.25),
+            [true, false],
+            "the highest share, under a cut of the ceiling"
+        );
+        assert_eq!(rule.keeps(&[0.6, 0.3], 0.1), [true, false]);
+        assert_eq!(
+            rule.keeps(&[0.9, 0.8], 0.1),
+            [true, true],
+            "and every link that holds the cut"
+        );
+    }
+
+    /// The relative judge's answer is kept on the request that produced it and
+    /// on the rule it is read by: a second run asks nothing, and a run at
+    /// another keep rule buys its own shares rather than reading a verdict
+    /// another rule reached.
+    #[tokio::test]
+    async fn a_choice_answer_is_kept_on_its_request_and_on_its_rule() {
+        let dir = TempDir::new("choice-cache");
+        let store = TempDir::new("choice-cache-store");
+        let page = linked_page(&dir, 2, 0);
+        let api = FakeApi::new(choice_reply(vec![0.4, 0.35], 0.25, 0.7));
+        let query = "how do I cut a release";
+
+        let scorer = CachedScorer::new(api.choice_in(dir.path()), store.path()).expect("a cache");
+        let kept = |judgment: &FileJudgment| {
+            judgment
+                .links
+                .iter()
+                .map(|link| link.keep)
+                .collect::<Vec<_>>()
+        };
+
+        let first = scorer.judge(query, &page).await.expect("a judgment");
+        assert_eq!(kept(first.judgment()), [true, false], "a cut of half");
+        assert_eq!(scorer.calls(), 1);
+
+        let again = scorer.judge(query, &page).await.expect("a judgment");
+        assert_eq!(scorer.calls(), 1, "the second run asked nothing");
+        assert!(matches!(again, Scored::Reused { .. }));
+
+        // The same request under another rule is another answer: the shares are
+        // the same and the verdicts are not.
+        let looser = CachedScorer::new(
+            api.choice_in(dir.path())
+                .with_keep(KeepRule { floor: 0.02, k: 1 }),
+            store.path(),
+        )
+        .expect("a cache");
+        let by_another_rule = looser.judge(query, &page).await.expect("a judgment");
+        assert_eq!(
+            kept(by_another_rule.judgment()),
+            [true, true],
+            "a cut of a third"
+        );
+        assert_eq!(
+            looser.calls(),
+            1,
+            "bought rather than read off the other rule"
+        );
+        assert_eq!(api.requests().len(), 4, "two answers of two posts each");
+    }
+
+    /// The Choice question is phrased at the hop the state ships: the two-hop
+    /// wording is what [#46] settled on for the link question, and the choice
+    /// asks the same thing of the same options, so its ablation is the same
+    /// switch.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_choice_question_is_asked_at_the_hops_the_state_ships() {
+        let dir = TempDir::new("choice-hops");
+        let page = linked_page(&dir, 1, 0);
+        let instructions = |api: &FakeApi| -> String {
+            let requests = api.requests();
+            let choice = requests
+                .iter()
+                .find(|request| request["questions"].get(CHOICE_QUESTION).is_some())
+                .expect("the choice question");
+            choice_question_of(choice)["instructions"]
+                .as_str()
+                .expect("instructions")
+                .to_string()
+        };
+
+        let two = FakeApi::new(choice_reply(vec![0.9], 0.1, 0.7));
+        two.choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+        let one = FakeApi::new(choice_reply(vec![0.9], 0.1, 0.7));
+        one.choice_in(dir.path())
+            .with_context(Context {
+                two_hop: false,
+                ..Context::DEFAULT
+            })
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+
+        assert_eq!(
+            instructions(&two),
+            USEFUL_FOR.choice_question_two_hop.as_ref(),
+            "what ships"
+        );
+        assert_eq!(
+            instructions(&one),
+            USEFUL_FOR.choice_question.as_ref(),
+            "and the one-hop ablation of it"
+        );
+    }
+
+    /// The `none` option is scaled with the shares it is weighed against: the
+    /// rule's two safety properties are one comparison, and half-scaling it
+    /// would answer "would the model enter this page at all" with arithmetic the
+    /// model never did.
+    #[tokio::test]
+    async fn an_answer_that_does_not_add_up_still_weighs_none_against_the_links() {
+        let dir = TempDir::new("choice-unscaled");
+        let page = linked_page(&dir, 1, 0);
+        // 0.30 + 0.35 is 0.65: scaled, the link is 0.4615 and `none` is 0.5385,
+        // so the model's own numbers put `none` first.
+        let api = FakeApi::new(choice_reply(vec![0.30], 0.35, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect("a judgment");
+
+        assert!((outcome.judgment.links[0].scent - 0.30 / 0.65).abs() < 1e-12);
+        assert!(
+            !outcome.judgment.links[0].keep,
+            "`none` is the top option once both sides are scaled to one"
+        );
+    }
+
+    /// An answer stored before `LinkJudgment::keep` existed still answers: the
+    /// field defaults to `true`, which is what a Noul judgment meant, so the
+    /// entries a report was paid for are read rather than bought again. A decode
+    /// failure is a silent miss, and the re-buy is silent too.
+    #[tokio::test]
+    async fn an_answer_stored_before_keep_existed_still_answers() {
+        let dir = TempDir::new("old-entry");
+        let store = TempDir::new("old-entry-store");
+        let page = linked_page(&dir, 1, 0);
+        let api = FakeApi::new(|_, request: &Value| (200, any_reply(request, 2.0)));
+        let cached = CachedScorer::new(api.scorer_in(dir.path()), store.path()).expect("a cache");
+        let query = "how do I cut a release";
+
+        cached.judge(query, &page).await.expect("a judgment");
+        assert_eq!(cached.calls(), 1);
+
+        // Rewrite the entry in the shape it had before `keep` and the choice
+        // confidence: the same key, one field gone from the judgment and one
+        // from the accounting beside it.
+        let entries: Vec<PathBuf> = fs::read_dir(cached.dir())
+            .expect("the entries")
+            .map(|entry| entry.expect("an entry").path())
+            .collect();
+        assert_eq!(entries.len(), 1, "one judgment, one entry");
+        let mut stored: Value =
+            serde_json::from_str(&fs::read_to_string(&entries[0]).expect("an entry"))
+                .expect("the entry is JSON");
+        for link in stored["judgment"]["links"]
+            .as_array_mut()
+            .expect("the judgment's links")
+        {
+            link.as_object_mut().expect("a link").remove("keep");
+        }
+        stored["detail"]
+            .as_object_mut()
+            .expect("the accounting")
+            .remove("choice_confidence");
+        fs::write(
+            &entries[0],
+            serde_json::to_vec(&stored).expect("the entry's bytes"),
+        )
+        .expect("a rewrite");
+
+        let again = cached.judge(query, &page).await.expect("a judgment");
+
+        assert_eq!(cached.calls(), 1, "the entry answered: nothing was bought");
+        assert!(matches!(again, Scored::Reused { .. }));
+        assert!(
+            again.judgment().links.iter().all(|link| link.keep),
+            "a link judged without a verdict is kept"
+        );
     }
 
     // ------------------------------------------------------------ the tests
@@ -3103,6 +4639,46 @@ mod tests {
         );
     }
 
+    /// A Choice post the API refuses fails the file, which is what makes a page
+    /// whose links could not be judged a page the walk skips rather than one it
+    /// silently records with nothing to follow ([#47]).
+    ///
+    /// The refusal is aimed at the Choice request alone: the file's own Score
+    /// and its sections are answered, and the post the API rejects — the 422 an
+    /// empty question map earns — is the one the links were asked in.
+    ///
+    /// [#47]: https://github.com/mikekelly/s1m/issues/47
+    #[tokio::test]
+    async fn a_refused_choice_post_fails_the_file() {
+        let dir = TempDir::new("choice-refused");
+        let page = linked_page(&dir, 2, 0);
+        let api = FakeApi::new(|_, request: &Value| {
+            match request["questions"].get(CHOICE_QUESTION).is_some() {
+                true => (
+                    422,
+                    r#"{"detail":{"error_type":"validation_error"}}"#.to_string(),
+                ),
+                false => (200, any_reply(request, 2.0)),
+            }
+        });
+
+        let error = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &page)
+            .await
+            .expect_err("a page whose links cannot be asked about has no judgment");
+
+        assert!(
+            matches!(&error, ScorerError::Status { status: 422, .. }),
+            "{error}"
+        );
+        assert_eq!(
+            api.requests().len(),
+            2,
+            "the file's own questions and the links': a refusal fails the file rather than being retried"
+        );
+    }
+
     #[tokio::test]
     async fn a_rate_limited_request_is_retried_then_answered() {
         let api = FakeApi::new(|attempt, _| {
@@ -3502,6 +5078,7 @@ mod tests {
             },
             Vec::new(),
             vec![link.clone()],
+            LinkQuestions::Asked,
         );
 
         assert_eq!(request.posts.len(), 1, "there is one link to ask about");
@@ -3531,6 +5108,7 @@ mod tests {
             },
             Vec::new(),
             vec![link],
+            LinkQuestions::Asked,
         );
         assert!(
             request.posts[0].body.state.links[0]
