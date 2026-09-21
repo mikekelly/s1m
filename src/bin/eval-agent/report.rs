@@ -52,6 +52,13 @@ pub fn render(
     stats: Option<&GraphStats>,
     method: &Method,
 ) -> Result<String, String> {
+    // Everything below is rendered from files this process did not write, so
+    // every string in them is checked before any of it is printed.
+    check(method)?;
+    if let Some(stats) = stats {
+        check_stats(stats)?;
+    }
+
     let mut out = String::from("# Evaluation: a reading list against an agent that explores\n\n");
     out.push_str(
         "s1m hands an agent a ranked reading list; a Claude Code Explore agent \
@@ -69,7 +76,7 @@ pub fn render(
     method_section(&mut out, method, aggregates);
     results_section(&mut out, aggregates)?;
     per_query_section(&mut out, aggregates)?;
-    caveats_section(&mut out, method);
+    caveats_section(&mut out);
     Ok(out)
 }
 
@@ -216,7 +223,7 @@ fn per_query_section(out: &mut String, aggregates: &Aggregates) -> Result<(), St
     Ok(())
 }
 
-fn caveats_section(out: &mut String, method: &Method) {
+fn caveats_section(out: &mut String) {
     out.push_str("## Caveats\n\n");
     for caveat in [
         "Recall and precision are against one gold set, written by reading the \
@@ -240,6 +247,14 @@ fn caveats_section(out: &mut String, method: &Method) {
          its tool definitions and every tool result it read; s1m's are the \
          characters of wiki text it asked for. The comparison that puts them \
          on one footing is `s1m-agent` against `explore`.",
+        "The `s1m-agent` condition's cost is the agent's plus what the reading \
+         list it was handed cost to buy, so the two agent conditions are \
+         priced on the same footing. A warm s1m run has bought nothing and adds \
+         nothing; the cold run is where a list's price shows.",
+        "An agent that answered without the list of files it was asked for is \
+         counted as unparsed beside the failure count. Those runs are still \
+         scored, and they score zero, so a condition with unparsed answers is \
+         reading lower than it looked.",
         "Wall time is one machine on one network, and the agent condition \
          depends on a service whose latency is not ours.",
         "The two conditions are not the same shape of work: s1m returns a \
@@ -248,25 +263,50 @@ fn caveats_section(out: &mut String, method: &Method) {
     ] {
         out.push_str(&format!("- {caveat}\n"));
     }
-    let _ = method;
 }
 
+/// How many runs are behind a row, and how many of them said nothing: a run
+/// that failed, and a run whose agent wrote no list of files to score.
 fn runs(group: &Group) -> String {
-    match group.failed {
-        0 => group.runs.to_string(),
-        failed => format!("{} ({failed} failed)", group.runs),
+    let mut notes = Vec::new();
+    if group.failed > 0 {
+        notes.push(format!("{} failed", group.failed));
+    }
+    if unparsed(group) > 0 {
+        notes.push(format!("{} unparsed", unparsed(group)));
+    }
+    match notes.is_empty() {
+        true => group.runs.to_string(),
+        false => format!("{} ({})", group.runs, notes.join(", ")),
     }
 }
 
-/// One metric's mean, with its spread where there is one.
+/// Runs whose agent answered without the list of files it was asked for.
+/// Those runs are scored — an agent that names nothing found nothing — but a
+/// column of zeroes from unanswered questions is not the same measurement as
+/// one from wrong answers, and the difference belongs beside the count.
+fn unparsed(group: &Group) -> usize {
+    group.metrics.get("relied_parsed").map_or(0, |stat| {
+        (stat.n as f64 * (1.0 - stat.mean)).round() as usize
+    })
+}
+
+/// One metric's mean, with its spread where there is one, and how many runs it
+/// came from where that is not every run that produced a measurement. A metric
+/// only some runs carry — a subagent's wall time, say — would otherwise read as
+/// an average over all of them.
 fn cell(group: &Group, metric: &str) -> String {
     let Some(stat) = group.metrics.get(metric) else {
         return "—".to_string();
     };
-    match stat.sd {
+    let mut cell = match stat.sd {
         Some(sd) => format!("{} ± {}", number(stat.mean), number(sd)),
         None => number(stat.mean),
+    };
+    if stat.n != group.runs - group.failed {
+        cell.push_str(&format!(" (n={})", stat.n));
     }
+    cell
 }
 
 /// A number at the precision it means something: money to six places, rates to
@@ -297,6 +337,63 @@ fn table_row(out: &mut String, cells: &[String]) {
         out.push_str(&format!(" {cell} |"));
     }
     out.push('\n');
+}
+
+/// The method, as a file gave it. A model, a flag or a condition is a label,
+/// and a prompt is a template: it has to still have its placeholders in it,
+/// because a prompt with the query substituted into it is a copy of the query.
+fn check(method: &Method) -> Result<(), String> {
+    safe(&method.claude_model)?;
+    for condition in &method.conditions {
+        safe(condition)?;
+    }
+    for flag in method.claude_flags.iter().chain(&method.s1m_flags) {
+        safe(flag)?;
+    }
+    template(&method.explore_prompt, &["<query>", "<entry>"])?;
+    if !method.s1m_agent_prompt.is_empty() {
+        template(&method.s1m_agent_prompt, &["<query>", "<files>"])?;
+    }
+    Ok(())
+}
+
+/// The graph statistics, as a file gave them. The only string in them is the
+/// entry page, and the only entry pages that may be named are the conventions
+/// this harness looks for — which are its own constants. A page the caller
+/// gave is reported as [`crate::graph::Entry::Given`] and never as itself.
+fn check_stats(stats: &GraphStats) -> Result<(), String> {
+    if let Some(crate::graph::Entry::Convention(convention)) = &stats.depth.entry
+        && !graph::ENTRY_CONVENTIONS.contains(&convention.as_str())
+    {
+        return Err(format!(
+            "{convention:?} is not an entry page convention: the report names \
+             the conventions this harness looks for, and nothing else a wiki holds"
+        ));
+    }
+    Ok(())
+}
+
+/// A prompt may be printed when it is still a template: every placeholder in
+/// place, and nothing in it that looks like a path.
+fn template(text: &str, placeholders: &[&str]) -> Result<(), String> {
+    for placeholder in placeholders {
+        if !text.contains(placeholder) {
+            return Err(format!(
+                "the prompt in the aggregates has no literal {placeholder}: a \
+                 prompt with the query or the pages substituted into it is not \
+                 a template, and the report prints the template"
+            ));
+        }
+    }
+    let lower = text.to_ascii_lowercase();
+    if text.contains('/')
+        || [".md", ".txt", ".markdown"]
+            .iter()
+            .any(|bad| lower.contains(bad))
+    {
+        return Err("the prompt in the aggregates names a path".to_string());
+    }
+    Ok(())
 }
 
 /// A label may be printed when it cannot be mistaken for a path and does not
@@ -368,7 +465,7 @@ mod tests {
             claude_flags: vec!["--output-format stream-json".to_string()],
             s1m_flags: vec!["--format json".to_string()],
             explore_prompt: "Answer <query> starting at <entry>.".to_string(),
-            s1m_agent_prompt: "Open only what you need.".to_string(),
+            s1m_agent_prompt: "Open what you need of <files> and answer <query>.".to_string(),
             chars_per_token: 4,
         }
     }
@@ -439,10 +536,8 @@ mod tests {
         assert_eq!(number(20737.0), "20737");
     }
 
-    #[test]
-    fn the_graph_statistics_are_the_first_table() {
-        let rows = vec![row("one", "how-to", "explore", 1.0)];
-        let stats = GraphStats {
+    fn graph_stats() -> GraphStats {
+        GraphStats {
             pages: 2000,
             words: 900_000,
             headings: 9000,
@@ -476,7 +571,13 @@ mod tests {
                 unreachable: 12,
             },
             largest_scc: 800,
-        };
+        }
+    }
+
+    #[test]
+    fn the_graph_statistics_are_the_first_table() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let stats = graph_stats();
         let report = render(&aggregate(&rows), Some(&stats), &method()).expect("a report");
         assert!(report.contains("## The wiki"), "{report}");
         assert!(report.contains("| Pages | 2000 |"), "{report}");
@@ -502,5 +603,96 @@ mod tests {
         assert!(report.contains("| 2 (1 failed) | 1.00 |"), "{report}");
         // And nothing from the failed row's raw half is in the report.
         assert!(!report.contains("page.md"), "{report}");
+    }
+
+    /// The aggregates and the graph statistics are files. A report rendered
+    /// from a file someone else wrote must not print what that file says:
+    /// every string in it goes through the same gate as a query id.
+    #[test]
+    fn a_crafted_aggregates_file_cannot_talk_through_the_method_table() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let aggregates = aggregate(&rows);
+
+        let crafted = |change: fn(&mut Method)| {
+            let mut method = method();
+            change(&mut method);
+            render(&aggregates, None, &method)
+        };
+
+        // A model, a flag or a condition that is really a path.
+        assert!(crafted(|m| m.claude_model = "/home/someone/private-wiki".to_string()).is_err());
+        assert!(
+            crafted(|m| m.claude_flags = vec!["--add-dir /home/someone/wiki".to_string()]).is_err()
+        );
+        assert!(crafted(|m| m.s1m_flags = vec!["--root concepts/release.md".to_string()]).is_err());
+        assert!(crafted(|m| m.conditions = vec!["notes/private.md".to_string()]).is_err());
+
+        // A prompt with the query substituted into it is not a template.
+        let filled = crafted(|m| {
+            m.explore_prompt = "Answer how do I cut a release starting at index.md.".to_string()
+        });
+        assert!(filled.is_err(), "a filled-in prompt was printed");
+        // A template is one because the placeholders are still in it.
+        assert!(crafted(|m| m.explore_prompt = "Answer <query> from <entry>.".to_string()).is_ok());
+        assert!(crafted(|m| m.explore_prompt = "Answer <query>.".to_string()).is_err());
+
+        // The prompts this harness actually sends are templates by that test.
+        let shipped = Method {
+            explore_prompt: crate::run::EXPLORE_PROMPT.to_string(),
+            s1m_agent_prompt: crate::run::S1M_AGENT_PROMPT.to_string(),
+            claude_flags: crate::run::method_flags(),
+            ..method()
+        };
+        let report = render(&aggregates, None, &shipped).expect("the shipped method");
+        assert!(report.contains("<query>"), "{report}");
+        assert!(!report.contains("how do I cut a release"), "{report}");
+    }
+
+    /// The same for the graph statistics: the entry page is a convention this
+    /// harness knows, or the report does not print it.
+    #[test]
+    fn a_crafted_graph_stats_file_cannot_name_a_page() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let mut stats = graph_stats();
+
+        stats.depth.entry = Some(crate::graph::Entry::Convention(
+            "private/index.md".to_string(),
+        ));
+        let error = render(&aggregate(&rows), Some(&stats), &method())
+            .expect_err("a convention no one has");
+        assert!(error.contains("convention"), "{error}");
+
+        // The two this harness looks for are fine, and so is a given page.
+        for entry in [
+            crate::graph::Entry::Convention("index.md".to_string()),
+            crate::graph::Entry::Convention("README.md".to_string()),
+            crate::graph::Entry::Given,
+        ] {
+            stats.depth.entry = Some(entry);
+            assert!(render(&aggregate(&rows), Some(&stats), &method()).is_ok());
+        }
+    }
+
+    /// A metric no run carried is not a metric every run carried, and an
+    /// answer with no file list is not an answer that relied on nothing.
+    #[test]
+    fn the_cells_say_how_many_runs_are_behind_them() {
+        let mut full = row("one", "how-to", "explore", 1.0);
+        full.metrics.insert("relied_parsed".to_string(), 1.0);
+        // A metric only one of the two runs carried.
+        full.metrics.insert("jev_cost_usd".to_string(), 0.002);
+        let mut thin = row("one", "how-to", "explore", 0.0);
+        thin.metrics.insert("relied_parsed".to_string(), 0.0);
+
+        let report = render(&aggregate(&[full, thin]), None, &method()).expect("a report");
+        // Two runs, one of which wrote no list of files.
+        assert!(
+            report.contains("| `explore` | 2 (1 unparsed) |"),
+            "{report}"
+        );
+        // Recall came from both runs and says nothing about how many; a metric
+        // only one run carried says which.
+        assert!(report.contains("| 0.50 ± 0.71 |"), "{report}");
+        assert!(report.contains("0.002000 (n=1)"), "{report}");
     }
 }

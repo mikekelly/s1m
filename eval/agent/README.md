@@ -89,10 +89,16 @@ The format the existing `eval` binary reads, plus a `category`:
 | `s1m` | the `s1m` binary at its defaults from the wiki directory, against `--cache-dir` | wall time, the files and ranges it returned, and what opening those ranges would cost an agent |
 | `s1m-cold` | the same, against a cache directory of its own | the same, plus the judgments it bought: Jev tokens and their cost |
 | `s1m-t<N>` | s1m at its defaults but `--threshold N`, warm only — `s1m-t0.4` is one | the same as `s1m`, so the report can show one threshold variant beside the defaults |
-| `s1m-agent` | `claude -p` handed s1m's reading list and told to open only what it needs | the agent's tokens, wall time and the files it opened |
+| `s1m-agent` | `claude -p` handed s1m's reading list and told to open only what it needs | the agent's tokens, wall time and the files it opened, plus what the reading list cost to buy |
 
 `s1m-agent` is the comparison that puts like with like: the same agent, the
-same question, one of them handed a reading list.
+same question, one of them handed a reading list. Repeat *k* of it is paired
+with repeat *k* of `s1m`: that is the run whose list it was handed, and whose
+`cost_usd` is added to its own so the Cost column compares like with like. A
+warm s1m run has bought nothing and adds nothing; the cold run is where a
+list's price shows. If the `s1m` row it needs is missing — a pass that names
+only `s1m-agent`, or a resume whose `s1m` row failed — that run is made first
+and recorded, rather than the agent run failing.
 
 ### Why `s1m-cold` and not `--no-cache`
 
@@ -131,9 +137,17 @@ apart. The run is `claude -p --output-format stream-json --verbose`, and:
 
 The transcript is what the subagent figure is summed from, because the stream
 writes a message once per streamed piece and only the last piece carries the
-message's final output count. The two agree as an identity worth checking:
+message's final output count. The two agree as an identity the tests hold to:
 subagent tokens plus parent tokens equal the session total that `modelUsage`
 reports.
+
+Every Explore subagent the parent spawned is measured and their tokens summed;
+the count is recorded as `tasks` and `explore_tasks`. That identity is also why
+a run whose subagent left no findable transcript is **not** a measurement: its
+tokens are in the session total and in neither the parent's nor any
+subagent's, so the run is recorded as failed rather than averaged in as though
+the parent had done the work. A parent that spawned some other kind of
+subagent is failed for the same reason.
 
 The agent runs with `--safe-mode` — no `CLAUDE.md`, plugins, hooks, MCP
 servers or custom agents from wherever the wiki happens to live — with
@@ -149,14 +163,23 @@ the answer, not the first.
   agent, they are scored on the files it *said* it relied on; the files it
   actually opened are scored separately under `read_recall` and
   `read_precision`, and the two sets are not the same.
+- **`relied_parsed`** is 0 when the agent answered without the list of files it
+  was asked for. That run is still scored, and it scores zero, so the report
+  prints the count of unparsed answers beside the failure count: a condition
+  with unparsed answers is reading lower than it looks.
 - **Agent tokens** for an agent condition are what it was billed for — its
   system prompt, its tool definitions and every tool result included. For s1m
   they are the characters of wiki text in the ranges it returned, at four
   characters a token. Those are different quantities, and the report says so.
 - **Cost** is what the CLI priced a whole run at, parent included;
   `agent_cost_share_usd` apportions it by tokens, which is an estimate and not
-  a price. For `s1m-cold` the cost is Jev's, at the list price in `src/jev.rs`.
+  a price. For an s1m run the cost is Jev's, at the list price in
+  `src/jev.rs`; for `s1m-agent` it is the agent's plus the paired s1m run's,
+  kept separately as `agent_cost_usd` and `s1m_cost_usd`.
 - **Wall time** is one machine on one network.
+- **A cell says `n=` when fewer runs are behind it than the condition
+  measured**, so a metric only some runs carried does not read as an average
+  over all of them.
 - A run that failed is written as a row with `ok: false` and **no metrics**,
   and is left out of every average, so a broken harness does not read as a bad
   method. The report counts it in the condition's `Runs` cell — `3 (1 failed)`

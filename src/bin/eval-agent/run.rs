@@ -187,6 +187,25 @@ pub fn run(options: &Options) -> Result<(), String> {
 
     for (at, job) in jobs.iter().enumerate() {
         let query = &gold.queries[job.query];
+        // A prerequisite may have made this run already.
+        let key = (query.id.clone(), job.condition.clone(), job.repeat);
+        if rows.iter().any(|row| row.key() == key) {
+            continue;
+        }
+        if let Some(needed) = prerequisite(job, &query.id, &rows) {
+            eprintln!(
+                "eval-agent: [{}/{}] {} {} repeat {} needs {} first",
+                at + 1,
+                jobs.len(),
+                query.id,
+                job.condition,
+                job.repeat,
+                needed.condition
+            );
+            let row = measure(options, query, &needed, &rows);
+            append(&options.out, &row)?;
+            rows.push(row);
+        }
         eprintln!(
             "eval-agent: [{}/{}] {} {} repeat {}",
             at + 1,
@@ -215,6 +234,19 @@ pub fn write_aggregates(options: &Options, rows: &[Row]) -> Result<(), String> {
     Ok(())
 }
 
+/// The agent's flags, as the report prints them.
+pub fn method_flags() -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        "--output-format stream-json".to_string(),
+        "--verbose".to_string(),
+        "--safe-mode".to_string(),
+        format!("--tools {EXPLORE_TOOLS}"),
+        format!("--allowedTools {EXPLORE_TOOLS}"),
+        "--permission-prompts none".to_string(),
+    ]
+}
+
 /// How the runs were made, for the report's method table. Every value here is
 /// a flag or a constant of this harness: no path, no query, no page.
 pub fn method(options: &Options) -> Method {
@@ -222,15 +254,7 @@ pub fn method(options: &Options) -> Method {
         repeats: options.repeats,
         conditions: options.conditions.clone(),
         claude_model: options.model.clone(),
-        claude_flags: vec![
-            "-p".to_string(),
-            "--output-format stream-json".to_string(),
-            "--verbose".to_string(),
-            "--safe-mode".to_string(),
-            format!("--tools {EXPLORE_TOOLS}"),
-            format!("--allowedTools {EXPLORE_TOOLS}"),
-            "--permission-prompts none".to_string(),
-        ],
+        claude_flags: method_flags(),
         s1m_flags: vec!["--format json".to_string(), "--root .".to_string()],
         explore_prompt: EXPLORE_PROMPT.to_string(),
         s1m_agent_prompt: S1M_AGENT_PROMPT.to_string(),
@@ -303,6 +327,12 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
     score(&mut metrics, "read_", &wanted, &read);
     metrics.insert("files_relied".to_string(), relied.len() as f64);
     metrics.insert("files_opened".to_string(), read.len() as f64);
+    metrics.insert(
+        "relied_parsed".to_string(),
+        f64::from(u8::from(agent.relied_parsed)),
+    );
+    metrics.insert("tasks".to_string(), agent.tasks as f64);
+    metrics.insert("explore_tasks".to_string(), agent.explore_tasks as f64);
     metrics.insert("wall_ms".to_string(), agent.wall_ms as f64);
     metrics.insert("cost_usd".to_string(), agent.cost_usd);
     metrics.insert(
@@ -329,6 +359,16 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
     Ok((metrics, agent.detail))
 }
 
+/// Where the warm runs' answers live: the directory the caller named, else one
+/// under `--out`. Both the warm runs and the cold runs' merge use this, so
+/// there is one answer to where a warm run reads from.
+fn warm_cache(options: &Options) -> PathBuf {
+    options
+        .cache_dir
+        .clone()
+        .unwrap_or_else(|| options.out.join("cache"))
+}
+
 /// The s1m condition: the binary, at its defaults, from the wiki directory.
 fn s1m_condition(
     options: &Options,
@@ -348,10 +388,7 @@ fn s1m_condition(
             .join(COLD_CACHE)
             .join(format!("{}-{}", query.id, job.repeat))
     } else {
-        options
-            .cache_dir
-            .clone()
-            .unwrap_or_else(|| options.out.join("cache"))
+        warm_cache(options)
     };
     fs::create_dir_all(&cache).map_err(|error| format!("{}: {error}", cache.display()))?;
     // What the cache already holds: whatever is there afterwards and was not
@@ -390,6 +427,9 @@ fn s1m_condition(
         options.timeout,
     )?;
     let wall = started.elapsed();
+    // Exit 1 is s1m saying nothing beyond the entry files cleared the
+    // threshold. That is a reading list of the entry files, which is a
+    // measurement — a bad one for the query, not a failed run.
     if !matches!(status, Some(0) | Some(1)) {
         return Err(format!(
             "s1m exited {}: {}",
@@ -423,10 +463,10 @@ fn s1m_condition(
     }
     if cold {
         // A cold run is the only one that leaves the shared cache able to serve
-        // the warm run that follows it.
-        if let Some(shared) = &options.cache_dir {
-            merge_cache(&cache, shared);
-        }
+        // the warm run that follows it — whether or not the caller named that
+        // cache, because a warm run against a cache the cold run did not fill
+        // buys everything again and is not warm at all.
+        merge_cache(&cache, &warm_cache(options));
     }
 
     Ok((
@@ -452,18 +492,15 @@ fn s1m_agent_condition(
     job: &Job,
     rows: &[Row],
 ) -> Result<Measured, String> {
-    let files = rows
-        .iter()
-        .rev()
-        .find(|row| row.query_id == query.id && row.condition == "s1m" && row.ok)
-        .and_then(|row| row.detail.as_ref())
-        .and_then(|detail| detail["files"].as_array().cloned())
-        .ok_or_else(|| {
-            "no s1m reading list for this query yet: run the `s1m` condition first".to_string()
-        })?;
+    let (files, s1m_cost) = reading_list(rows, &query.id, job.repeat).ok_or_else(|| {
+        format!(
+            "no s1m reading list for {} on repeat {}: the `s1m` run it is paired \
+             with did not produce one",
+            query.id, job.repeat
+        )
+    })?;
     let list = files
         .iter()
-        .filter_map(|file| file.as_str())
         .map(|file| format!("- {file}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -482,8 +519,17 @@ fn s1m_agent_condition(
     score(&mut metrics, "read_", &wanted, &read);
     metrics.insert("files_relied".to_string(), relied.len() as f64);
     metrics.insert("files_opened".to_string(), read.len() as f64);
+    metrics.insert(
+        "relied_parsed".to_string(),
+        f64::from(u8::from(agent.relied_parsed)),
+    );
     metrics.insert("wall_ms".to_string(), agent.wall_ms as f64);
-    metrics.insert("cost_usd".to_string(), agent.cost_usd);
+    // What this condition costs is the agent plus the reading list it was
+    // handed: the list is not free, and a cost column that left it out would
+    // compare an agent that was given the answer with one that had to look.
+    metrics.insert("s1m_cost_usd".to_string(), s1m_cost);
+    metrics.insert("agent_cost_usd".to_string(), agent.cost_usd);
+    metrics.insert("cost_usd".to_string(), agent.cost_usd + s1m_cost);
     // No subagent here: the agent that was handed the list is the one measured.
     tokens(&mut metrics, "agent_", agent.session);
     metrics.insert(
@@ -496,8 +542,14 @@ fn s1m_agent_condition(
 /// What one `claude -p` run reported, whichever condition asked for it.
 struct AgentRun {
     files_relied: Vec<PathBuf>,
+    /// Whether the answer carried a list of files at all.
+    relied_parsed: bool,
     files_read: Vec<PathBuf>,
-    /// The subagent's own tokens, or the parent's when nothing was spawned.
+    /// Subagents the parent spawned, and how many of them were Explore.
+    tasks: usize,
+    explore_tasks: usize,
+    /// The Explore subagents' own tokens, summed, or the parent's when nothing
+    /// was spawned.
     agent: Usage,
     parent: Usage,
     session: Usage,
@@ -561,38 +613,76 @@ fn agent_run(
         return Err(format!("the agent reported an error: {}", summary.answer));
     }
 
-    // The subagent's own transcript is the only place its turns carry their
-    // final token counts; the stream's copies are the counts so far.
-    let task = summary.tasks.first().cloned();
-    let transcript = task.as_ref().and_then(|task| {
-        let path = transcript_path(options, summary.session_id.as_deref()?, &task.agent_id)?;
-        let text = fs::read_to_string(&path).ok()?;
-        Some((path, explore::summarise_transcript(&text, &options.wiki)))
-    });
+    // Every subagent the parent spawned is measured, or the run is not a
+    // measurement: a subagent's tokens are in the session total and in neither
+    // the parent's nor any subagent's, so attributing the session total to the
+    // agent would quietly average a parent-plus-subagent figure in with
+    // subagent-only ones.
+    let explore: Vec<&explore::Task> = summary
+        .tasks
+        .iter()
+        .filter(|task| task.kind == EXPLORE_AGENT)
+        .collect();
+    if !summary.tasks.is_empty() && explore.is_empty() {
+        return Err(format!(
+            "the parent spawned {} subagent(s), none of them {EXPLORE_AGENT}: \
+             only {EXPLORE_AGENT} is measured, so this run is not one",
+            summary.tasks.len()
+        ));
+    }
 
-    let files_relied = explore::files_relied_on(&summary.answer, &options.wiki);
-    let (agent, files_read, turns, tool_uses, model) = match &transcript {
-        Some((_, subagent)) => (
-            subagent.usage,
-            subagent.files_read.clone(),
-            subagent.turns,
-            subagent.tool_uses,
-            subagent.model.clone(),
-        ),
-        // Nothing was spawned, or its transcript could not be found: the agent
-        // that ran is the parent, and the stream carries what it opened.
-        None => (
+    let mut transcripts = Vec::new();
+    for task in &explore {
+        // The subagent's own transcript is the only place its turns carry
+        // their final token counts; the stream's copies are the counts so far.
+        let session = summary.session_id.as_deref().unwrap_or_default();
+        let path = transcript_path(options, session, &task.agent_id).ok_or_else(|| {
+            format!(
+                "{} ran as agent {} but its transcript is not under the project \
+                 directories: its tokens cannot be told apart from the parent's",
+                task.kind, task.agent_id
+            )
+        })?;
+        let text =
+            fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+        transcripts.push((path, explore::summarise_transcript(&text, &options.wiki)));
+    }
+
+    let relied = explore::files_relied_on(&summary.answer, &options.wiki);
+    let relied_parsed = relied.is_some();
+    let files_relied = relied.unwrap_or_default();
+    let (agent, files_read, turns, tool_uses, model) = if transcripts.is_empty() {
+        // Nothing was spawned: the agent that ran is the parent, and the
+        // stream carries what it opened.
+        (
             summary.session_total,
             summary.parent_files_read.clone(),
             0,
             summary.parent_tool_uses,
             summary.model.clone(),
-        ),
+        )
+    } else {
+        let mut usage = Usage::default();
+        let mut files = BTreeSet::new();
+        let mut turns = 0;
+        let mut tool_uses = 0;
+        let mut model = None;
+        for (_, subagent) in &transcripts {
+            usage.add(subagent.usage);
+            files.extend(subagent.files_read.iter().cloned());
+            turns += subagent.turns;
+            tool_uses += subagent.tool_uses;
+            model = model.or_else(|| subagent.model.clone());
+        }
+        (usage, files.into_iter().collect(), turns, tool_uses, model)
     };
 
     Ok(AgentRun {
         files_relied: files_relied.clone(),
+        relied_parsed,
         files_read: files_read.clone(),
+        tasks: summary.tasks.len(),
+        explore_tasks: explore.len(),
         agent,
         parent: summary.parent_total,
         session: summary.session_total,
@@ -600,7 +690,12 @@ fn agent_run(
         tool_uses,
         cost_usd: summary.cost_usd,
         wall_ms: wall.as_millis(),
-        agent_wall_ms: task.as_ref().and_then(|task| task.duration_ms),
+        // Summed when more than one ran, which overstates them if they ran at
+        // the same time; the count is recorded beside it.
+        agent_wall_ms: explore
+            .iter()
+            .filter_map(|task| task.duration_ms)
+            .reduce(|total, ms| total + ms),
         detail: serde_json::json!({
             "query": query.query,
             "prompt": prompt,
@@ -609,11 +704,15 @@ fn agent_run(
             "files_relied": files_relied,
             "files_read": files_read,
             "wanted": query.wanted,
+            "relied_parsed": relied_parsed,
             "model": model.unwrap_or_else(|| options.model.clone()),
             "session_id": summary.session_id,
-            "task": task,
-            "subagent_usage_source": if transcript.is_some() { "transcript" } else { "stream" },
-            "transcript": transcript.as_ref().map(|(path, _)| path.display().to_string()),
+            "tasks": summary.tasks,
+            "subagent_usage_source": if transcripts.is_empty() { "stream" } else { "transcript" },
+            "transcripts": transcripts
+                .iter()
+                .map(|(path, _)| path.display().to_string())
+                .collect::<Vec<_>>(),
         }),
     })
 }
@@ -642,6 +741,46 @@ fn transcript_path(options: &Options, session: &str, agent: &str) -> Option<Path
         }
     }
     None
+}
+
+/// The subagent this harness measures: Claude Code's built-in read-only
+/// explorer.
+pub const EXPLORE_AGENT: &str = "Explore";
+
+/// The reading list s1m returned for one query on one repeat, and what that
+/// run cost.
+///
+/// Repeat k of an agent condition is paired with repeat k of `s1m`: the list an
+/// agent was handed has to be the list that run produced, or the two rows are
+/// not about the same reading list.
+fn reading_list(rows: &[Row], query: &str, repeat: usize) -> Option<(Vec<String>, f64)> {
+    let row = rows.iter().rev().find(|row| {
+        row.query_id == query && row.condition == "s1m" && row.repeat == repeat && row.ok
+    })?;
+    let files = row.detail.as_ref()?["files"]
+        .as_array()?
+        .iter()
+        .filter_map(|file| file.as_str().map(str::to_string))
+        .collect();
+    Some((files, row.metrics.get("cost_usd").copied().unwrap_or(0.0)))
+}
+
+/// The run that has to happen before `job` can be measured, when it has not
+/// already.
+///
+/// `s1m-agent` is handed a reading list, so the `s1m` run for the same query
+/// and repeat is its prerequisite rather than its neighbour: a pass that names
+/// only `s1m-agent`, or a resume whose `s1m` row is missing, makes the run it
+/// needs instead of failing.
+fn prerequisite(job: &Job, query: &str, rows: &[Row]) -> Option<Job> {
+    if job.condition != "s1m-agent" || reading_list(rows, query, job.repeat).is_some() {
+        return None;
+    }
+    Some(Job {
+        query: job.query,
+        condition: "s1m".to_string(),
+        repeat: job.repeat,
+    })
 }
 
 /// The threshold a condition names, or `None` when it names none.
@@ -974,5 +1113,221 @@ mod tests {
                 .iter()
                 .all(|job| job.query != 0)
         );
+    }
+
+    /// Options pointing at a wiki and an out directory, with binaries that do
+    /// not exist: the tests that need one replace it.
+    fn options(wiki: &TempDir, out: &TempDir) -> Options {
+        Options {
+            wiki: wiki.path().to_path_buf(),
+            gold: PathBuf::new(),
+            out: out.path().to_path_buf(),
+            repeats: 1,
+            conditions: vec!["s1m".to_string()],
+            cache_dir: None,
+            entry: vec!["index.md".to_string()],
+            model: "sonnet".to_string(),
+            s1m: PathBuf::from("s1m"),
+            claude: PathBuf::from("claude"),
+            transcripts: None,
+            cold_repeats: 1,
+            queries: Vec::new(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// A shell script at `<dir>/s1m` that answers like s1m and buys one
+    /// judgment into whatever cache it was pointed at.
+    #[cfg(unix)]
+    fn fake_s1m(dir: &TempDir) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        dir.write(
+            "s1m",
+            "#!/bin/sh\n\
+             mkdir -p \"$S1M_CACHE_DIR/judgments\"\n\
+             printf '{\"format\":3,\"judgment\":{},\"detail\":{\"input_tokens\":1000,\"output_tokens\":10}}' \
+             > \"$S1M_CACHE_DIR/judgments/bought.json\"\n\
+             printf '{\"query\":\"q\",\"mode\":\"useful-for\",\"visited\":1,\"calls\":1,\"results\":[{\"path\":\"index.md\",\"relevance\":0.9,\"scent\":null,\"via\":[],\"links\":[],\"sections\":[{\"heading\":null,\"lines\":[1,1],\"score\":0.9}]}]}'\n",
+        );
+        let binary = dir.path().join("s1m");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("an executable");
+        binary
+    }
+
+    /// The cold run buys into a cache of its own, and the warm run that
+    /// follows has to be able to read what it bought — including when the
+    /// caller named no cache directory, which is the case that silently
+    /// charged every warm run cold prices.
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_run_fills_the_cache_the_warm_run_reads() {
+        let wiki = TempDir::new("cold-wiki");
+        wiki.write("index.md", "# Index\n");
+        let out = TempDir::new("cold-out");
+        let fake = TempDir::new("cold-s1m");
+        let options = Options {
+            s1m: fake_s1m(&fake),
+            ..options(&wiki, &out)
+        };
+        fs::create_dir_all(out.path().join(RAW)).expect("a raw directory");
+
+        let query = &gold().queries[0];
+        let job = Job {
+            query: 0,
+            condition: "s1m-cold".to_string(),
+            repeat: 0,
+        };
+        let (metrics, _) =
+            s1m_condition(&options, query, &job, true, None).expect("a cold measurement");
+
+        // What it bought is what it is charged for: 1000 input tokens.
+        assert_eq!(metrics["jev_input_tokens"], 1000.0);
+        assert!(
+            (metrics["cost_usd"] - 1000.0 / 1_000_000.0 * s1m::jev::PRICE_PER_MTOK).abs() < 1e-12
+        );
+
+        // And the warm cache now holds it, with no `--cache-dir` in sight.
+        assert!(
+            warm_cache(&options).join("judgments/bought.json").is_file(),
+            "the cold run's answers did not reach {}",
+            warm_cache(&options).display()
+        );
+    }
+
+    /// The agent conditions are handed a reading list, so the run that makes
+    /// it is a prerequisite and not a neighbour — and it is the run from the
+    /// same repeat.
+    #[test]
+    fn the_reading_list_an_agent_is_handed_is_its_own_repeats() {
+        let list = |repeat: usize, file: &str, cost: f64| Row {
+            query_id: "one".to_string(),
+            category: "how-to".to_string(),
+            condition: "s1m".to_string(),
+            repeat,
+            ok: true,
+            metrics: BTreeMap::from([("cost_usd".to_string(), cost)]),
+            detail: Some(serde_json::json!({ "files": [file] })),
+        };
+        let rows = vec![list(0, "a.md", 0.002), list(1, "b.md", 0.0)];
+
+        assert_eq!(
+            reading_list(&rows, "one", 1),
+            Some((vec!["b.md".to_string()], 0.0))
+        );
+        assert_eq!(
+            reading_list(&rows, "one", 0),
+            Some((vec!["a.md".to_string()], 0.002))
+        );
+        assert_eq!(reading_list(&rows, "one", 2), None);
+        assert_eq!(reading_list(&rows, "two", 0), None);
+
+        let agent = |repeat: usize| Job {
+            query: 0,
+            condition: "s1m-agent".to_string(),
+            repeat,
+        };
+        // The repeat that has its list needs nothing first.
+        assert_eq!(prerequisite(&agent(0), "one", &rows), None);
+        // The one that does not asks for its own repeat, not any repeat.
+        assert_eq!(
+            prerequisite(&agent(2), "one", &rows),
+            Some(Job {
+                query: 0,
+                condition: "s1m".to_string(),
+                repeat: 2
+            })
+        );
+        // A failed s1m row is not a reading list.
+        let mut failed = list(3, "c.md", 0.0);
+        failed.ok = false;
+        let rows = [rows, vec![failed]].concat();
+        assert!(prerequisite(&agent(3), "one", &rows).is_some());
+        // Nothing else has a prerequisite.
+        for condition in ["explore", "s1m", "s1m-cold"] {
+            let job = Job {
+                query: 0,
+                condition: condition.to_string(),
+                repeat: 9,
+            };
+            assert_eq!(prerequisite(&job, "one", &rows), None);
+        }
+    }
+
+    /// A shell script at `<dir>/claude` that prints `stream`.
+    #[cfg(unix)]
+    fn fake_claude(dir: &TempDir, stream: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        dir.write(
+            "claude",
+            &format!("#!/bin/sh\ncat <<'STREAM'\n{stream}\nSTREAM\n"),
+        );
+        let binary = dir.path().join("claude");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755)).expect("an executable");
+        binary
+    }
+
+    /// A subagent ran and its transcript cannot be found. Its tokens are in the
+    /// session total and in nothing else, so calling the session total the
+    /// agent's would average a parent-plus-subagent figure in with
+    /// subagent-only ones. That is not a measurement, and it is not recorded
+    /// as one.
+    #[cfg(unix)]
+    #[test]
+    fn a_subagent_with_no_transcript_is_not_a_measurement() {
+        let wiki = TempDir::new("stream-wiki");
+        wiki.write("index.md", "# Index\n");
+        let out = TempDir::new("stream-out");
+        let empty = TempDir::new("stream-projects");
+
+        let stream = |kind: &str| {
+            [
+                r#"{"type":"system","subtype":"init","session_id":"S9"}"#.to_string(),
+                format!(
+                    r#"{{"type":"system","subtype":"task_started","session_id":"S9","task_id":"agent9","subagent_type":"{kind}"}}"#
+                ),
+                r#"{"type":"result","subtype":"success","session_id":"S9","is_error":false,"total_cost_usd":0.01,"duration_ms":10,"usage":{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4},"modelUsage":{"claude-sonnet-5":{"inputTokens":9,"outputTokens":9,"cacheReadInputTokens":9,"cacheCreationInputTokens":9}},"result":"done [\"index.md\"]"}"#.to_string(),
+            ]
+            .join("\n")
+        };
+
+        let job = Job {
+            query: 0,
+            condition: "explore".to_string(),
+            repeat: 0,
+        };
+        let query = &gold().queries[0];
+        fs::create_dir_all(out.path().join(RAW)).expect("a raw directory");
+
+        // An Explore subagent whose transcript is nowhere to be found.
+        let fake = TempDir::new("stream-claude");
+        let options = Options {
+            claude: fake_claude(&fake, &stream(EXPLORE_AGENT)),
+            transcripts: Some(empty.path().to_path_buf()),
+            conditions: vec!["explore".to_string()],
+            ..options(&wiki, &out)
+        };
+        let row = measure(&options, query, &job, &[]);
+        assert!(!row.ok);
+        assert!(row.metrics.is_empty(), "{:?}", row.metrics);
+        let reason = row.detail.expect("the raw half")["error"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+        assert!(reason.contains("transcript"), "{reason}");
+
+        // A subagent that is not the one this harness measures is the same
+        // problem by another route.
+        let other = TempDir::new("stream-claude-other");
+        let options = Options {
+            claude: fake_claude(&other, &stream("general-purpose")),
+            ..options
+        };
+        let row = measure(&options, query, &job, &[]);
+        assert!(!row.ok);
+        let reason = row.detail.expect("the raw half")["error"]
+            .as_str()
+            .expect("a reason")
+            .to_string();
+        assert!(reason.contains(EXPLORE_AGENT), "{reason}");
     }
 }

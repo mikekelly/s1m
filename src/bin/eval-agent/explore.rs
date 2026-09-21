@@ -36,7 +36,7 @@ impl Usage {
         self.input + self.cache_read + self.cache_create
     }
 
-    fn add(&mut self, other: Usage) {
+    pub fn add(&mut self, other: Usage) {
         self.input += other.input;
         self.output += other.output;
         self.cache_read += other.cache_read;
@@ -45,7 +45,13 @@ impl Usage {
 }
 
 /// The relative paths an agent named as the ones it relied on: the last JSON
-/// array of strings in its answer, fenced or not.
+/// array of strings in its answer, fenced or not, and `None` when it wrote no
+/// array at all.
+///
+/// An answer with no list is not an answer with an empty one. An agent that was
+/// asked for a list and did not write one has not said it relied on nothing —
+/// it has failed to answer the question that is being scored — and a run scored
+/// zero for that reads as a bad method rather than a lost measurement.
 ///
 /// An agent that was asked for a final JSON array sometimes writes one and then
 /// says something after it, and sometimes wraps it in a code fence; and it
@@ -53,7 +59,7 @@ impl Usage {
 /// wins, absolute paths under the wiki come back relative to it, and anything
 /// that is not a path under the wiki is kept as written — a file named outside
 /// the wiki is a fact about the answer, not something to hide.
-pub fn files_relied_on(answer: &str, wiki: &Path) -> Vec<PathBuf> {
+pub fn files_relied_on(answer: &str, wiki: &Path) -> Option<Vec<PathBuf>> {
     let bytes = answer.as_bytes();
     for (start, _) in answer.char_indices().rev().filter(|(_, c)| *c == '[') {
         // The shortest slice from this bracket that parses as an array of
@@ -64,9 +70,9 @@ pub fn files_relied_on(answer: &str, wiki: &Path) -> Vec<PathBuf> {
         let Ok(values) = serde_json::from_str::<Vec<String>>(&answer[start..=end]) else {
             continue;
         };
-        return values.iter().map(|path| relative(path, wiki)).collect();
+        return Some(values.iter().map(|path| relative(path, wiki)).collect());
     }
-    Vec::new()
+    None
 }
 
 /// The bracket that closes the one at `start`, ignoring anything inside a JSON
@@ -275,7 +281,8 @@ pub struct TranscriptSummary {
 /// message's final output count. The piece with the most output tokens is that
 /// one, so summing per message id over the largest piece is the billed usage.
 pub fn summarise_transcript(transcript: &str, wiki: &Path) -> TranscriptSummary {
-    // The last piece of a message wins, and the pieces arrive in order.
+    // The piece with the most output tokens wins, which is the final one: the
+    // pieces are not assumed to arrive in order, only to grow.
     let mut turns: std::collections::BTreeMap<String, Usage> = std::collections::BTreeMap::new();
     let mut model = None;
     let mut tool_uses = 0;
@@ -345,7 +352,10 @@ mod tests {
                 "The answer is 20.\n\n```json\n[\"index.md\", \"concepts/node.md\"]\n```\n",
                 wiki
             ),
-            vec![PathBuf::from("index.md"), PathBuf::from("concepts/node.md")]
+            Some(vec![
+                PathBuf::from("index.md"),
+                PathBuf::from("concepts/node.md")
+            ])
         );
 
         // A bare array, with prose after it, and an earlier array that is not
@@ -355,19 +365,25 @@ mod tests {
                 "I considered [\"a.md\"] first.\nFiles: [\"b.md\", \"c.md\"]\nThat is all.",
                 wiki
             ),
-            vec![PathBuf::from("b.md"), PathBuf::from("c.md")]
+            Some(vec![PathBuf::from("b.md"), PathBuf::from("c.md")])
         );
 
         // Paths as the agent opened them: absolute under the wiki, or `./`.
         assert_eq!(
             files_relied_on("[\"/wiki/a.md\", \"./b.md\"]", wiki),
-            vec![PathBuf::from("a.md"), PathBuf::from("b.md")]
+            Some(vec![PathBuf::from("a.md"), PathBuf::from("b.md")])
         );
 
-        // An answer with no array at all names no files.
-        assert!(files_relied_on("I could not find it.", wiki).is_empty());
+        // An answer with no array at all did not answer, which is not the same
+        // as answering that it relied on nothing.
+        assert_eq!(files_relied_on("I could not find it.", wiki), None);
         // An array that is not of strings is not a file list.
-        assert!(files_relied_on("scores: [1, 2, 3]", wiki).is_empty());
+        assert_eq!(files_relied_on("scores: [1, 2, 3]", wiki), None);
+        // An empty array is an answer: it relied on nothing.
+        assert_eq!(
+            files_relied_on("Nothing helped: []", wiki),
+            Some(Vec::new())
+        );
     }
 
     /// Trimmed from a real run: a parent that spawned the Explore subagent in
@@ -484,5 +500,20 @@ mod tests {
             summary.files_read,
             vec![PathBuf::from("concepts/node.md"), PathBuf::from("index.md")]
         );
+    }
+
+    /// The whole point of reading two files instead of one: what the subagent
+    /// was billed for and what the parent was billed for add up to what the
+    /// run was billed for. If they ever stop adding up, one of the two is
+    /// being read wrong and every comparison in the report is wrong with it.
+    #[test]
+    fn the_parent_and_the_subagent_account_for_the_whole_session() {
+        let wiki = Path::new("/wiki");
+        let stream = summarise_stream(STREAM, wiki).expect("a finished run");
+        let subagent = summarise_transcript(TRANSCRIPT, wiki);
+
+        let mut total = stream.parent_total;
+        total.add(subagent.usage);
+        assert_eq!(total, stream.session_total);
     }
 }
