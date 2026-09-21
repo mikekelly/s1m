@@ -10,3 +10,7 @@ Rules for any coding session on this repository, whoever starts it.
 - Plan and design goals live in [`docs/initial-plan.md`](docs/initial-plan.md).
 - Never reference a private wiki or repository in code, fixtures, docs, PRs or
   comments: this repository is open source.
+- An eval run's `--out` directory is never committed — it holds the queries and
+  the file names of whatever wiki was measured. Only the rendered report is,
+  and that is numbers, query ids and category labels
+  ([`eval/agent/README.md`](eval/agent/README.md)).

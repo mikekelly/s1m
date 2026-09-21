@@ -6,7 +6,9 @@
 
 use std::path::{Path, PathBuf};
 
-use s1m::parse::{FrontmatterField, Link, ParseError, ParsedFile, Section, parse, preview};
+use s1m::parse::{
+    FrontmatterField, Link, LinkKind, ParseError, ParsedFile, Section, parse, preview,
+};
 
 /// Every page in the fixture wiki. The line-range invariant runs over all of
 /// them, so a page missing from here is a page whose ranges stop being checked.
@@ -546,4 +548,27 @@ fn unreadable_and_mixed_base_inputs_are_errors() {
         parse(Path::new("index.md"), Path::new("/tmp/wiki")),
         Err(ParseError::BaseMismatch { .. })
     ));
+}
+
+/// A link carries the syntax it was written in, because a wiki's link style is
+/// a fact about the wiki: the graph statistics count `[[wikilinks]]` against
+/// `[markdown](links.md)`, and only the parser knows which a target came from.
+#[test]
+fn a_link_reports_the_syntax_it_was_written_in() {
+    let index = doc("index.md");
+
+    // `[payments](payments/README.md)`.
+    assert_eq!(
+        link_to(&index, "payments/README.md").kind,
+        LinkKind::Markdown
+    );
+    // `[[settlement]]`, resolved by file name.
+    assert_eq!(
+        link_to(&index, "payments/settlement.md").kind,
+        LinkKind::Wikilink
+    );
+    // `[[ledger|the ledger]]`: an alias does not change the syntax.
+    assert_eq!(link_to(&index, "notes/ledger.md").kind, LinkKind::Wikilink);
+    // `[outside the root](../outside.md)`: an escaping target is still markdown.
+    assert_eq!(link_to(&index, "../outside.md").kind, LinkKind::Markdown);
 }

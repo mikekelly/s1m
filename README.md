@@ -202,6 +202,9 @@ Both lists are elided for length: the run returns three results and reports two 
 The `--threshold` and `--max-files` defaults are backed by numbers in
 [eval/REPORT.md](eval/REPORT.md), and the decisions are recorded in
 [docs/initial-plan.md](docs/initial-plan.md#defaults-from-the-evaluation).
+A second harness, [`eval/agent/README.md`](eval/agent/README.md), measures the
+same reading list against a Claude Code Explore agent on the same queries — on
+any wiki, with nothing about it committed.
 
 ### Hidden flags
 

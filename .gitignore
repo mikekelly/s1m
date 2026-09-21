@@ -6,3 +6,6 @@
 !.env.example
 
 .DS_Store
+
+# The raw half of an eval-agent run: rows that quote queries and name files.
+/eval/agent/out/
