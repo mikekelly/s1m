@@ -89,7 +89,8 @@ counts them and the results together.
 --format picks how that list is printed. json is the plan's shape, for a caller
 that parses it: each link carries the scent it was given and what the walk did
 about it — `followed`, or a `reason` naming the rule that queued nothing
-(`below-threshold`, `out-of-root`, `past-depth`, `already-reached`, `not-kept`).
+(`below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`,
+`already-reached`, `already-queued`).
 md is what to read, to paste into a task: the files that earned a place, each
 with the lines worth reading, the heading to look for and the scores, most
 relevant first. tree is the walk's link tree: every file it visited, walked files

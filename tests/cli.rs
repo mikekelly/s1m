@@ -1060,6 +1060,24 @@ fn a_links_reason_names_the_rule_that_queued_nothing() {
         "a link that queued its target says so, and nothing else"
     );
 
+    // Two entry files that both link to `next.md`: the first one to be recorded
+    // queues it, the second's link queues nothing because a path at least as
+    // good is already on the frontier — the ledger case, where the file the
+    // walk may never reach must not read as one it has.
+    let output = run_with(&[QUERY, BROKEN_LINK_ENTRY, ENTRY], &api, &cache);
+    let list = json(&output);
+    assert_eq!(
+        link(&list, ENTRY, NEXT)["reason"],
+        "already-queued",
+        "the other entry queued it first"
+    );
+    assert_eq!(link(&list, ENTRY, NEXT)["followed"], false);
+    assert_eq!(
+        result(&list, NEXT)["links"][0]["target"],
+        DEEP,
+        "and the walk still visits the page the link queued nothing for"
+    );
+
     // The fixture wiki: a page whose link leaves the root, and the links of the
     // pages one hop in, which the depth budget stops.
     let output = run_with(&[QUERY, WIKI_ENTRY, "--max-depth", "1"], &api, &cache);

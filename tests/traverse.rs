@@ -1027,6 +1027,14 @@ async fn the_best_path_to_a_file_wins() {
         judged(visited(&found, "payments/README.md")),
         [link("payments/settlement.md", 0.8, false)]
     );
+    assert_eq!(
+        reason(
+            visited(&found, "payments/README.md"),
+            "payments/settlement.md"
+        ),
+        Some(Reason::AlreadyQueued),
+        "the index had already queued it higher, and the first path is the one kept"
+    );
     // One call per file, however many paths reach it.
     assert_eq!(
         scorer.called(),
@@ -1154,6 +1162,48 @@ async fn a_link_that_queues_nothing_carries_the_walks_reason() {
     assert_eq!(
         reason(readme, "payments/cutoffs.md"),
         Some(Reason::PastDepth)
+    );
+}
+
+/// A link whose target another path had already queued at a score at least as
+/// good says `already-queued`, not `already-reached`: the walk may never reach
+/// that file. Here the file budget runs out in the round the link is judged in,
+/// so the path that held the target is dropped and the page is nowhere in the
+/// reading list — which a reader told `already-reached` would not know.
+#[tokio::test]
+async fn a_link_to_a_page_the_budget_dropped_is_not_already_reached() {
+    let scorer = Fake::new(&[
+        (
+            "index.md",
+            Entry::new(
+                0.9,
+                &[("payments/README.md", 0.95), ("notes/ledger.md", 0.9)],
+            ),
+        ),
+        // The only path to the ledger through the README is weaker than the one
+        // the index already queued, so this link queues nothing.
+        (
+            "payments/README.md",
+            Entry::new(0.6, &[("notes/ledger.md", 0.9)]),
+        ),
+        ("notes/ledger.md", Entry::new(0.6, &[])),
+    ]);
+
+    let found = Settings::new(&["index.md"]).max_files(1).run(&scorer).await;
+
+    assert_eq!(
+        paths(&found),
+        ["index.md", "payments/README.md"],
+        "the budget ends the walk before the ledger is visited"
+    );
+    assert_eq!(
+        reason(visited(&found, "payments/README.md"), "notes/ledger.md"),
+        Some(Reason::AlreadyQueued),
+        "a better path was on the frontier, and the ledger is not a page the walk reached"
+    );
+    assert!(
+        reason(visited(&found, "index.md"), "notes/ledger.md").is_none(),
+        "the index's own link to it is the one that queued it"
     );
 }
 

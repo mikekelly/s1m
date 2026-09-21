@@ -659,6 +659,22 @@ impl<'a> Search<'a> {
         self.prune(source, &link.target, link.scent, reason);
     }
 
+    /// Why a link that cleared every other test queued nothing: the walk had
+    /// already dealt with its target.
+    ///
+    /// The two cases are not the same fact. A target the walk has popped is
+    /// `already-reached` — it is a file the reading list holds. One whose
+    /// better path is merely on the frontier is `already-queued`: the beam or
+    /// the file budget can drop that path, and then nothing ever reaches the
+    /// target, so a reader must not be told the walk did.
+    fn held(&self, target: &Path) -> Reason {
+        if self.settled.contains(target) {
+            Reason::AlreadyReached
+        } else {
+            Reason::AlreadyQueued
+        }
+    }
+
     /// One path the walk queued and dropped before visiting it, as the trace
     /// reports it. The source is the file whose link queued the path, which
     /// every path on the frontier has: the entries were named and are not
@@ -864,10 +880,7 @@ impl<'a> Search<'a> {
                     trace.admitted(&path, &link.target, link_scent);
                 }
             } else {
-                // The target is visited already, or a path at least as good was
-                // queued for it: the first path to reach a file at its best
-                // score is the one the walk keeps.
-                self.pass_over(&path, link, Reason::AlreadyReached);
+                self.pass_over(&path, link, self.held(&link.target));
             }
         }
 

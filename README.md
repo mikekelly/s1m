@@ -83,8 +83,11 @@ path — and `walked`, the files the walk visited without earning one. Each resu
 relevance the model gave it, the scent of the link that reached it, the path that got there,
 the ranges worth reading, and its outgoing links as they were judged — `followed` says whether
 a link queued its target, and a link that queued nothing carries the `reason` the walk read it
-by: `below-threshold`, `out-of-root`, `past-depth`, `already-reached`, `not-kept` or
-`unjudged`, so no caller has to infer why from the scent and the rest of the list. `scent` is
+by: `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`, `already-reached`
+or `already-queued`, so no caller has to infer why from the scent and the rest of the list.
+`already-reached` says the target is a file the list holds; `already-queued` says another path
+had already queued it at a score at least as good, and that path the beam or the file budget
+can still drop, so the target may be no page of the list. `scent` is
 `null` and `via` is empty for an entry file, which no link reached; a file a link reached
 carries the scent of that link and the `via` path it came along. A link whose target resolves
 outside `--root` is never followed, whatever its scent.
@@ -288,7 +291,7 @@ which is how `via` and a link's target are spelled within a run.
 | `requested` | `path`, `post_index` | One request for the file, once per post: a page whose sections and links do not fit one request is asked about in several, and each is a record of its own, in the order they were sent. |
 | `answered` | `path`, `latency_ms`, `relevance`, `cached`, `sections`, `links` | The scorer's answer: the file's relevance, a score per heading section and a scent per link, each as the scorer gave it. `cached` is `true` when the answer came off the disk, and `latency_ms` is what the call that bought it took — whenever that was, so a warm replay can be told from a cold one. |
 | `admitted` | `source`, `target`, `scent` | A link queued its target, at `scent` of the source's path score. |
-| `pruned` | `source`, `target`, `scent`, `reason` | Either a link that queued nothing — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`, `already-reached`, `ignored` — or a path the walk queued and then dropped: `beam`, `max-files`. The same reasons a reading list spells out on a link ([#50](https://github.com/mikekelly/s1m/issues/50)) |
+| `pruned` | `source`, `target`, `scent`, `reason` | Either a link that queued nothing — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`, `already-reached`, `already-queued`, `ignored` — or a path the walk queued and then dropped: `beam`, `max-files`. The same reasons a reading list spells out on a link ([#50](https://github.com/mikekelly/s1m/issues/50)) |
 | `result` | `path`, `relevance`, `earned_a_place` | The file was visited, with the reading list's own verdict on it: relevance or a section at or above `--threshold`. |
 
 A path can be admitted and pruned later, by `beam` or by `max_files`: both budgets are read when
@@ -372,15 +375,17 @@ and what the walk did about it, in one of three marks:
 
 | Mark | The link |
 | --- | --- |
-| `followed` | queued its target, which is why the target is a line below it |
-| `already reached` | points at a file the walk already had — an entry file, or a page another link reached first — so queueing it would add nothing |
-| `pruned` | queued nothing for any other reason: a scent below `--threshold`, a target outside `--root`, one past `--max-depth`, or a link the model named no scent for |
+| `followed` | queued its target — and the target is a line under it when the walk went on to visit it, which a beam or the file budget can stop |
+| `already reached` | points at a file the walk already had — an entry file, or a page another link reached first — so the link queued nothing and the page is a line of the tree elsewhere |
+| `pruned` | queued nothing for anything else: a scent below `--threshold`, a share the scorer did not keep, a link the model named no scent for, a target outside `--root`, one past `--max-depth`, or a target another path had already queued at a score at least as good |
 
-The last two are the difference the JSON spells out as a link's `reason`, and the distinction
-matters because the two lines look identical otherwise: `pruned` is a page the walk dropped, and
-`already reached` is a page it may already be holding above
-([#50](https://github.com/mikekelly/s1m/issues/50)). Before that change both printed `pruned`,
-which is what misled two analyses of runs like the one below.
+Only the middle one says the page is in the walk's hands. The JSON's `reason` tells the `pruned`
+ones apart — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`,
+`already-queued` — and an `already-queued` target is the one page that may never be reached at
+all: the path that held it is dropped if a beam or the file budget runs out. Before
+[#50](https://github.com/mikekelly/s1m/issues/50) every one of these printed `pruned`, which is
+what misled two analyses of runs like the one below. A `followed` link with no line under it is
+the other half of the same thing: the target was queued, and the walk stopped before its turn.
 
 ```bash
 s1m --format tree "how do I cut a release and publish the package" \

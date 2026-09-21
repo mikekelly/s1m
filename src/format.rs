@@ -287,10 +287,16 @@ fn node(
 }
 
 /// What the tree says the walk did with one of a file's links: `followed` when
-/// it queued the link's target, `already reached` when that file was one the
-/// walk already held, and `pruned` for every other reason — a scent below
-/// `--threshold`, a target outside the root, one past `--max-depth`, or a link
-/// the model named no scent for.
+/// it queued the link's target, `already reached` when the walk already had
+/// that file, and `pruned` for every other reason.
+///
+/// `pruned` covers the rest, and the JSON's `reason` says which one it was: a
+/// scent below `--threshold`, a share the scorer did not keep, a link the model
+/// named no scent for, a target outside the root or one past `--max-depth`, and
+/// — the one an `already reached` line used to swallow — a target another path
+/// had already queued at a score at least as good. That last one is
+/// [`Reason::AlreadyQueued`] and not `already reached` because the walk may
+/// never visit it: a beam or the file budget can drop the path that held it.
 ///
 /// Two marks were not enough. `pruned` covered both a link the walk dropped and
 /// a link whose target it already had, and the two lines look identical, so a
@@ -904,6 +910,10 @@ wiki/index.md  entry file; relevance 0.62
     /// and printing the last as `pruned` made a reader infer which of the two a
     /// line was ([#50]).
     ///
+    /// A target another path had already queued is not the walk's file yet —
+    /// the budget can still drop that path — so it stays `pruned` here, with
+    /// the JSON's `already-queued` saying why.
+    ///
     /// [#50]: https://github.com/mikekelly/s1m/issues/50
     #[test]
     fn tree_marks_a_link_to_a_file_the_walk_already_reached() {
@@ -918,11 +928,16 @@ wiki/index.md  entry file; relevance 0.62
                         Some(Reason::AlreadyReached),
                     ),
                     (
+                        "wiki/notes/scratch.md",
+                        Some(0.68),
+                        Some(Reason::AlreadyQueued),
+                    ),
+                    (
                         "wiki/notes/ledger.md",
                         Some(0.24),
                         Some(Reason::BelowThreshold),
                     ),
-                    ("wiki/notes/scratch.md", None, Some(Reason::Unjudged)),
+                    ("wiki/notes/reading.md", None, Some(Reason::Unjudged)),
                 ],
             ),
             linking(
@@ -946,8 +961,9 @@ wiki/index.md  entry file; relevance 0.62
   wiki/payments/README.md  followed; scent 0.88; relevance 0.81
     wiki/payments/settlement.md  followed; scent 0.94; relevance 0.94
   wiki/payments/settlement.md  already reached; scent 0.71
+  wiki/notes/scratch.md  pruned; scent 0.68
   wiki/notes/ledger.md  pruned; scent 0.24
-  wiki/notes/scratch.md  pruned; scent unknown
+  wiki/notes/reading.md  pruned; scent unknown
 "
         );
     }

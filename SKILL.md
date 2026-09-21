@@ -115,9 +115,10 @@ How to act on it:
 - `scent` is the link that reached the file and `via` is the path it came along, so you can see
   why it is in the list.
 - `links` is what the walk judged and what became of each one: `followed`, or a `reason` naming
-  the rule that queued nothing — `below-threshold`, `out-of-root`, `past-depth`,
-  `already-reached`, `not-kept`, `unjudged`. Useful when a page you expected is missing: it may
-  have been passed over below `--threshold`, or another path may have reached it first.
+  the rule that queued nothing — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`,
+  `past-depth`, `already-reached` (the target is in this list), `already-queued` (another path
+  had already queued it, and may yet be dropped). Useful when a page you expected is missing: it
+  may have been passed over below `--threshold`, or another path may have reached it first.
 - A result with no `sections` cleared `--threshold` on its relevance alone: it is in the list but
   has nothing worth quoting.
 

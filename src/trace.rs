@@ -362,10 +362,20 @@ pub enum Reason {
     OutOfRoot,
     /// Its target is a hop past the depth budget.
     PastDepth,
-    /// Its target has been visited, or a path at least as good was already
-    /// queued for it: the first path to reach a file at its best score is the
-    /// one kept.
+    /// Its target was already the walk's: it has been popped, and the first
+    /// path to reach a file is the one the walk keeps. A page that was popped
+    /// and could not be judged is here too — it was reached, and `stderr` says
+    /// why it is not in the reading list.
     AlreadyReached,
+    /// A path at least as good was already queued for its target, so this link
+    /// queued nothing: the first path to reach a file at its best score is the
+    /// one kept.
+    ///
+    /// Not [`Self::AlreadyReached`]: the target may never be visited at all.
+    /// The beam and the file budget are read when the walk takes a path off the
+    /// frontier, so the path that held the target can be dropped, and then a
+    /// reader told `already-reached` would look for a file the walk never read.
+    AlreadyQueued,
     /// The root's `.s1mignore` matched its target, which is never read, never
     /// sent and never judged.
     Ignored,

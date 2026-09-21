@@ -405,10 +405,21 @@ pub struct RankedLink {
     pub followed: bool,
     /// Why it queued nothing, when it did not: what the walk made of the link,
     /// so a caller reads the rule rather than inferring it from the scent and
-    /// the rest of the list. One of the walk's own reasons — `below-threshold`,
-    /// `out-of-root`, `past-depth`, `already-reached`, `not-kept`, `unjudged` —
-    /// and `null` for a link that queued its target, which `followed` has
-    /// already said ([#50]).
+    /// the rest of the list ([#50]). One of the walk's own reasons:
+    ///
+    /// - `below-threshold` or `not-kept` — the scent, or the scorer's own rule,
+    ///   did not admit it;
+    /// - `out-of-root` or `past-depth` — the root, or the depth budget, stops
+    ///   the walk there;
+    /// - `already-reached` — the target was already visited, so the file is in
+    ///   this list;
+    /// - `already-queued` — a path at least as good was already queued for it,
+    ///   and the first path is the one kept: the beam or the file budget can
+    ///   still drop that path, so the target may be no page of this list;
+    /// - `unjudged` — the model named no scent for the link at all.
+    ///
+    /// `null` for a link that queued its target, which `followed` has already
+    /// said.
     ///
     /// [#50]: https://github.com/mikekelly/s1m/issues/50
     pub reason: Option<Reason>,
