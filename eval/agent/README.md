@@ -195,6 +195,12 @@ the hook let through is work counted as the Explore agent's.
 `s1m-agent` keeps `--tools Read` and gets a hookless `agent-settings.json`: it
 was handed the list, and reading it is the whole job.
 
+**The parent dispatches it at thoroughness `medium`.** The built-in Explore
+agent takes a thoroughness from whoever dispatches it, and how hard it looks is
+most of what a run measures — the same query at *quick* and at *very thorough*
+are different experiments. The word is in the prompt and the report states it
+in the method table.
+
 **What model the Explore agent runs on.** 2.1.278 states no declared model for
 its built-in agents anywhere reachable: `claude agents --json` lists *running
 background sessions*, not agent definitions, and the stream's `init` event

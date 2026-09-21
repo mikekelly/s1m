@@ -32,9 +32,9 @@ pub const COLD_CACHE: &str = "cold-cache";
 /// what it is asked for is the subagent's answer unchanged. Anything it added
 /// of its own would be a second agent's work counted as the first's.
 pub const EXPLORE_PROMPT: &str = "\
-Hand this whole task to the Explore agent. You may not read, glob or grep \
-yourself: those tools are blocked for you and only the Explore agent may use \
-them.
+Hand this whole task to the Explore agent with thoroughness \"medium\". You \
+may not read, glob or grep yourself: those tools are blocked for you and only \
+the Explore agent may use them.
 Its task: answer this query from the wiki in the current directory, starting \
 at these pages: <entry>
 The query: <query>
@@ -282,6 +282,7 @@ pub fn method(options: &Options) -> Method {
         s1m_flags: vec!["--format json".to_string(), "--root .".to_string()],
         explore_prompt: EXPLORE_PROMPT.to_string(),
         s1m_agent_prompt: S1M_AGENT_PROMPT.to_string(),
+        thoroughness: THOROUGHNESS.to_string(),
         chars_per_token: reading::CHARS_PER_TOKEN,
     }
 }
@@ -834,6 +835,14 @@ pub fn claude_arguments(
 /// The subagent this harness measures: Claude Code's built-in read-only
 /// explorer.
 pub const EXPLORE_AGENT: &str = "Explore";
+
+/// How hard the Explore agent is told to look.
+///
+/// The built-in agent takes a thoroughness from whoever dispatches it, and it
+/// is most of what a run measures: the same query at "quick" and at "very
+/// thorough" are different experiments. It is said in the prompt and stated in
+/// the report rather than left to the parent to guess.
+pub const THOROUGHNESS: &str = "medium";
 
 /// The reading list s1m returned for one query on one repeat, and what that
 /// run cost.
@@ -1483,5 +1492,17 @@ mod tests {
                 "{flag}: {arguments:?}"
             );
         }
+    }
+
+    /// The built-in Explore agent takes a thoroughness from whoever dispatches
+    /// it, and how hard it looks is most of what a run measures. Left unsaid it
+    /// is the subagent's guess, and two runs of the same query are not the same
+    /// experiment. The prompt says it, so the report can state it.
+    #[test]
+    fn the_prompt_dispatches_the_explore_agent_at_a_stated_thoroughness() {
+        assert!(EXPLORE_PROMPT.contains(THOROUGHNESS), "{EXPLORE_PROMPT}");
+        assert!(EXPLORE_PROMPT.contains("thoroughness"), "{EXPLORE_PROMPT}");
+        // It is the word the subagent is given, not one the report invented.
+        assert_eq!(THOROUGHNESS, "medium");
     }
 }

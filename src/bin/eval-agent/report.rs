@@ -27,6 +27,10 @@ pub struct Method {
     /// the entry page are substituted into it at run time and are not here.
     pub explore_prompt: String,
     pub s1m_agent_prompt: String,
+    /// How hard the Explore agent was told to look. Empty in a run made
+    /// before it was said, which is a run that did not say.
+    #[serde(default)]
+    pub thoroughness: String,
     pub chars_per_token: usize,
 }
 
@@ -110,10 +114,22 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         flags(&method.claude_flags)
     ));
     out.push_str(&format!("| s1m flags | {} |\n", flags(&method.s1m_flags)));
+    if !method.thoroughness.is_empty() {
+        out.push_str(&format!(
+            "| Explore thoroughness | `{}` |\n",
+            method.thoroughness
+        ));
+    }
     out.push_str(&format!(
         "| Agent tokens | returned characters at {} a token |\n",
         method.chars_per_token
     ));
+    out.push_str(
+        "\nThe Explore agent is dispatched by the parent, and on this build it \
+         inherits the session's model rather than declaring one of its own: \
+         with no model named it takes whatever Claude Code would have used, and \
+         with one named it takes that. What answered is recorded per run.\n",
+    );
     out.push_str(
         "\nThe agent was asked, with the query and the entry page \
                   substituted in:\n\n",
@@ -365,6 +381,9 @@ fn check(method: &Method) -> Result<(), String> {
     for flag in method.claude_flags.iter().chain(&method.s1m_flags) {
         safe(flag)?;
     }
+    if !method.thoroughness.is_empty() {
+        safe(&method.thoroughness)?;
+    }
     template(&method.explore_prompt, &["<query>", "<entry>"])?;
     if !method.s1m_agent_prompt.is_empty() {
         template(&method.s1m_agent_prompt, &["<query>", "<files>"])?;
@@ -479,6 +498,7 @@ mod tests {
             claude_model: "claude-sonnet-5".to_string(),
             claude_flags: vec!["--output-format stream-json".to_string()],
             s1m_flags: vec!["--format json".to_string()],
+            thoroughness: "medium".to_string(),
             explore_prompt: "Answer <query> starting at <entry>.".to_string(),
             s1m_agent_prompt: "Open what you need of <files> and answer <query>.".to_string(),
             chars_per_token: 4,
@@ -735,5 +755,34 @@ mod tests {
             report.contains("no `--model` flag"),
             "the table does not say the models were Claude Code's own:\n{report}"
         );
+    }
+
+    /// How hard the Explore agent was told to look is part of the method, and
+    /// so is the fact that it answered on the session's model rather than one
+    /// of its own.
+    #[test]
+    fn the_method_states_the_thoroughness_and_the_inherited_model() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let report = render(&aggregate(&rows), None, &method()).expect("a report");
+        assert!(
+            report.contains("| Explore thoroughness | `medium` |"),
+            "{report}"
+        );
+        assert!(report.contains("inherits the session's model"), "{report}");
+
+        // A run made before the thoroughness was said does not claim one.
+        let silent = Method {
+            thoroughness: String::new(),
+            ..method()
+        };
+        let report = render(&aggregate(&rows), None, &silent).expect("a report");
+        assert!(!report.contains("Explore thoroughness"), "{report}");
+
+        // And it is a label like any other: a file cannot talk through it.
+        let crafted = Method {
+            thoroughness: "notes/private.md".to_string(),
+            ..method()
+        };
+        assert!(render(&aggregate(&rows), None, &crafted).is_err());
     }
 }
