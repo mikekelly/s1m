@@ -153,7 +153,7 @@ the README's table rather than a diff.
 
 ### Output
 
-Results are sorted by file relevance, and only the files that earn a place on their own are in them: relevance at or above `--threshold`, or at least one section at or above it. A hub is worth walking through and not worth reading, so every other file the walk visited is reported under `walked` instead — `path`, `relevance`, `scent`, `via` and `links`, and no `sections` — which is what keeps `tree` and the explainability goal intact; `visited` counts both lists. `via` is the link path that reached the file, and `links` lists the outgoing links that were judged, so the caller can see what was followed and what was passed over. `md` prints `results`; `tree` prints `results` and `walked`, because a page the walk passed through is the line its links hang from ([#40](https://github.com/mikekelly/s1m/issues/40)).
+Results are sorted by file relevance, and only the files that earn a place on their own are in them: relevance at or above `--threshold`, or at least one section at or above it. A hub is worth walking through and not worth reading, so every other file the walk visited is reported under `walked` instead — `path`, `relevance`, `scent`, `via` and `links`, and no `sections` — which is what keeps `tree` and the explainability goal intact; `visited` counts both lists. `via` is the link path that reached the file, and `links` lists the outgoing links that were judged, each with the scent it was given and what the walk did about it: `followed`, or a `reason` naming the rule that queued nothing — `below-threshold`, `not-kept`, `unjudged`, `out-of-root`, `past-depth`, `already-reached`, `already-queued` ([#50](https://github.com/mikekelly/s1m/issues/50)) — so the caller sees what was followed and what was passed over rather than inferring it. `tree` spells the same answers `followed`, `already reached` and `pruned`. `md` prints `results`; `tree` prints `results` and `walked`, because a page the walk passed through is the line its links hang from ([#40](https://github.com/mikekelly/s1m/issues/40)).
 
 ```json
 {
@@ -171,8 +171,8 @@ Results are sorted by file relevance, and only the files that earn a place on th
         {"heading": "Instant payout windows", "lines": [42, 88], "score": 0.93}
       ],
       "links": [
-        {"target": "wiki/payments/cutoffs.md", "scent": 0.78, "followed": true},
-        {"target": "wiki/company/history.md", "scent": 0.04, "followed": false}
+        {"target": "wiki/payments/cutoffs.md", "scent": 0.78, "followed": true, "reason": null},
+        {"target": "wiki/company/history.md", "scent": 0.04, "followed": false, "reason": "below-threshold"}
       ]
     }
   ],
@@ -183,8 +183,8 @@ Results are sorted by file relevance, and only the files that earn a place on th
       "scent": 0.84,
       "via": ["wiki/index.md"],
       "links": [
-        {"target": "wiki/payments/settlement.md", "scent": 0.82, "followed": true},
-        {"target": "wiki/payments/cutoffs.md", "scent": 0.31, "followed": false}
+        {"target": "wiki/payments/settlement.md", "scent": 0.82, "followed": true, "reason": null},
+        {"target": "wiki/payments/cutoffs.md", "scent": 0.31, "followed": false, "reason": "below-threshold"}
       ]
     }
   ]

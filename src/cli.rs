@@ -14,7 +14,8 @@
 //!   judged against, how many files were visited and how many calls they cost,
 //!   and one entry per file that earned a place with its relevance, the scent
 //!   of the link that reached it, the `via` path, the line ranges worth reading
-//!   and the outgoing links that were judged.
+//!   and the outgoing links that were judged — each with the scent it was given
+//!   and why the walk queued it or left it ([`RankedLink`]).
 //! - `results` holds the files that earn a place on their own: relevance at or
 //!   above `threshold`, or a section at or above it
 //!   ([`crate::traverse::VisitedFile::earns_a_place`]). A hub is worth walking
@@ -61,7 +62,7 @@ use crate::cache::{Cacheable, CachedScorer};
 use crate::ignore::{Ignore, IgnoreError};
 use crate::parse::{self, ParseError, ParsedFile};
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
-use crate::trace::Trace;
+use crate::trace::{Reason, Trace};
 use crate::traverse::{
     Admission, Config, FailedFile, Failure, JudgedSection, Traversal, TraverseError, traverse,
 };
@@ -266,8 +267,8 @@ impl<S: Cacheable> Judge for Uncached<S> {
 /// Field names and order are that section: `query`, `mode`, `visited`, `calls`,
 /// `results`, and per result `path`, `relevance`, `scent`, `via`, `sections`,
 /// `links`, each section carrying `heading`, `lines` and `score` and each link
-/// `target`, `scent` and `followed`. [`Self::walked`] is the walk's other half,
-/// appended: the same file as a result without `sections`.
+/// `target`, `scent`, `followed` and `reason`. [`Self::walked`] is the walk's
+/// other half, appended: the same file as a result without `sections`.
 #[derive(Debug, Serialize)]
 pub struct ReadingList {
     /// The query, unchanged.
@@ -402,6 +403,26 @@ pub struct RankedLink {
     /// Whether this link queued its target: inside the root, at or above the
     /// threshold, and within the depth budget.
     pub followed: bool,
+    /// Why it queued nothing, when it did not: what the walk made of the link,
+    /// so a caller reads the rule rather than inferring it from the scent and
+    /// the rest of the list ([#50]). One of the walk's own reasons:
+    ///
+    /// - `below-threshold` or `not-kept` — the scent, or the scorer's own rule,
+    ///   did not admit it;
+    /// - `out-of-root` or `past-depth` — the root, or the depth budget, stops
+    ///   the walk there;
+    /// - `already-reached` — the target was already visited, so the file is in
+    ///   this list;
+    /// - `already-queued` — a path at least as good was already queued for it,
+    ///   and the first path is the one kept: the beam or the file budget can
+    ///   still drop that path, so the target may be no page of this list;
+    /// - `unjudged` — the model named no scent for the link at all.
+    ///
+    /// `null` for a link that queued its target, which `followed` has already
+    /// said.
+    ///
+    /// [#50]: https://github.com/mikekelly/s1m/issues/50
+    pub reason: Option<Reason>,
 }
 
 /// Why a run produced no reading list. Every one of these is exit 2.
@@ -565,6 +586,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
                 target: display(&root, &link.target),
                 scent: link.scent,
                 followed: link.followed,
+                reason: link.reason,
             })
             .collect::<Vec<_>>();
 
@@ -899,6 +921,7 @@ mod tests {
                                 "target": "tests/fixtures/cli/deep.md",
                                 "scent": 0.9,
                                 "followed": true,
+                                "reason": null,
                             },
                         ],
                     },
@@ -915,6 +938,7 @@ mod tests {
                                 "target": "tests/fixtures/cli/next.md",
                                 "scent": 0.9,
                                 "followed": true,
+                                "reason": null,
                             },
                         ],
                     },
@@ -994,11 +1018,13 @@ mod tests {
                         "target": "tests/fixtures/cli/deep.md",
                         "scent": 0.9,
                         "followed": true,
+                        "reason": null,
                     },
                     {
                         "target": "tests/fixtures/cli/preamble.md",
                         "scent": 0.9,
                         "followed": true,
+                        "reason": null,
                     },
                 ],
             }),
@@ -1116,6 +1142,7 @@ mod tests {
                 target: "tests/fixtures/cli/next.md".to_string(),
                 scent: Some(0.59),
                 followed: false,
+                reason: Some(Reason::BelowThreshold),
             }]
         );
     }
@@ -1198,6 +1225,7 @@ mod tests {
                 target: "tests/fixtures/cli/next.md".to_string(),
                 scent: Some(0.9),
                 followed: true,
+                reason: None,
             }],
             "the entry file's own judgment is untouched by the page it points at"
         );

@@ -133,9 +133,9 @@ impl Dispositions {
 /// nothing it admits is refused.
 ///
 /// This is where a round loop that ends with work still on the heap would show,
-/// and it is the check behind a `tree` line that reads `pruned; scent 0.85`: on
-/// this wiki every one of those is a target another parent's link reached
-/// first, not a file the walk dropped.
+/// and it is the check behind a `tree` line that reads `already reached; scent
+/// 0.85`: on this wiki every one of those is a target another parent's link
+/// reached first, not a file the walk dropped.
 #[tokio::test]
 async fn the_walk_with_no_budget_leaves_nothing_queued_or_admitted() {
     const THRESHOLD: f64 = 0.6;

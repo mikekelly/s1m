@@ -27,6 +27,17 @@ const ENTRY: &str = "tests/fixtures/cli/entry.md";
 const NEXT: &str = "tests/fixtures/cli/next.md";
 const DEEP: &str = "tests/fixtures/cli/deep.md";
 
+/// A hub that links to `deep.md` and `preamble.md`, so one page's links can be
+/// judged against each other.
+const HUB: &str = "tests/fixtures/cli/hub.md";
+const PREAMBLE: &str = "tests/fixtures/cli/preamble.md";
+
+/// The fixture wiki the format snapshots walk over: the one root in the tree
+/// whose pages link out of it, which is a reason no `cli/` fixture can show.
+const WIKI_ENTRY: &str = "tests/fixtures/wiki/index.md";
+const WIKI_README: &str = "tests/fixtures/wiki/payments/README.md";
+const OUTSIDE: &str = "tests/fixtures/outside.md";
+
 /// An entry file that is not there, for the run that must name it.
 const GONE: &str = "tests/fixtures/cli/gone.md";
 
@@ -925,6 +936,17 @@ fn result<'a>(list: &'a Value, path: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("{path} should be in the reading list"))
 }
 
+/// The one link of `path`'s links that points at `target`, as the reading list
+/// prints it.
+fn link<'a>(list: &'a Value, path: &str, target: &str) -> &'a Value {
+    result(list, path)["links"]
+        .as_array()
+        .expect("links should be an array")
+        .iter()
+        .find(|link| link["target"] == target)
+        .unwrap_or_else(|| panic!("{path} should judge a link to {target}"))
+}
+
 /// The records of a trace file, each line parsed on its own: a trace is JSON
 /// Lines, and every line of it stands alone.
 fn records(path: &Path) -> Vec<Value> {
@@ -996,7 +1018,7 @@ fn a_run_returns_the_reading_list_as_json_and_exits_0() {
     );
     assert_eq!(
         entry["links"],
-        json!([{"target": NEXT, "scent": 0.9, "followed": true}])
+        json!([{"target": NEXT, "scent": 0.9, "followed": true, "reason": null}])
     );
 
     let deep = result(&list, DEEP);
@@ -1005,6 +1027,97 @@ fn a_run_returns_the_reading_list_as_json_and_exits_0() {
     assert_eq!(deep["via"], json!([ENTRY, NEXT]), "two hops from the entry");
     assert_eq!(deep["links"], json!([]), "nothing links on from here");
     assert_eq!(api.answered(), 3, "one call per file judged");
+}
+
+/// A link that queued nothing says why, on the link itself, in the caller's
+/// JSON: `below-threshold`, `out-of-root`, `past-depth`, `already-reached` or
+/// `not-kept` — the walk's own answer, so no reader has to infer it from the
+/// scent and which files the list happens to hold ([#50]).
+///
+/// A link that queued its target carries no reason at all: `followed: true` has
+/// already said what happened, and the field is `null`.
+///
+/// [#50]: https://github.com/mikekelly/s1m/issues/50
+#[test]
+fn a_links_reason_names_the_rule_that_queued_nothing() {
+    // Two entry files: the entry reaches `next.md` above the threshold, and
+    // `next.md`'s own strong link to `deep.md` queues nothing because the hub
+    // had already reached it. The scent alone cannot say that, which is what
+    // misled two analyses of runs like this one.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY, HUB], &api, &cache);
+    let list = json(&output);
+
+    assert_eq!(
+        link(&list, NEXT, DEEP)["reason"],
+        "already-reached",
+        "the walk was already holding the page the hub queued"
+    );
+    assert_eq!(
+        result(&list, ENTRY)["links"],
+        json!([{"target": NEXT, "scent": 0.9, "followed": true, "reason": null}]),
+        "a link that queued its target says so, and nothing else"
+    );
+
+    // Two entry files that both link to `next.md`: the first one to be recorded
+    // queues it, the second's link queues nothing because a path at least as
+    // good is already on the frontier — the ledger case, where the file the
+    // walk may never reach must not read as one it has.
+    let output = run_with(&[QUERY, BROKEN_LINK_ENTRY, ENTRY], &api, &cache);
+    let list = json(&output);
+    assert_eq!(
+        link(&list, ENTRY, NEXT)["reason"],
+        "already-queued",
+        "the other entry queued it first"
+    );
+    assert_eq!(link(&list, ENTRY, NEXT)["followed"], false);
+    assert_eq!(
+        result(&list, NEXT)["links"][0]["target"],
+        DEEP,
+        "and the walk still visits the page the link queued nothing for"
+    );
+
+    // The fixture wiki: a page whose link leaves the root, and the links of the
+    // pages one hop in, which the depth budget stops.
+    let output = run_with(&[QUERY, WIKI_ENTRY, "--max-depth", "1"], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let list = json(&output);
+    let outside = link(&list, WIKI_ENTRY, OUTSIDE);
+    assert_eq!(outside["reason"], "out-of-root");
+    assert_eq!(
+        outside["followed"], false,
+        "outside the root, whatever the scent says"
+    );
+    for link in result(&list, WIKI_README)["links"]
+        .as_array()
+        .expect("links should be an array")
+    {
+        assert_eq!(link["reason"], "past-depth", "{link}");
+    }
+
+    // The two rules that decide what the walk is worth, each named on the link
+    // it refused: the caller's floor, and the scorer's own share.
+    let under = FakeApi::new(3.0, 0.1, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY], &under, &cache);
+    let list = json(&output);
+    assert_eq!(link(&list, ENTRY, NEXT)["reason"], "below-threshold");
+
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, HUB, "--scorer", "choice"], &api, &cache);
+    let list = json(&output);
+    assert_eq!(
+        link(&list, HUB, DEEP)["reason"],
+        Value::Null,
+        "the share that won its page"
+    );
+    assert_eq!(
+        link(&list, HUB, PREAMBLE)["reason"],
+        "not-kept",
+        "the share that lost to the option beside it"
+    );
 }
 
 /// `calls` is what the API was asked, not what the walk visited: the same

@@ -340,8 +340,13 @@ enum Event<'a> {
 /// queues it — so a `pruned` record is not always the other half of an
 /// `admitted` one. What a player knows from the pair is that the path never
 /// became a visit.
+///
+/// One vocabulary, two documents: a `pruned` record in the trace and a link's
+/// `reason` in the reading list spell the same reasons the same way, hyphenated
+/// the way the CLI's own values are (`useful-for`), so a reader comparing them
+/// never meets two names for one thing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum Reason {
     /// Its scent did not clear the walk's floor
     /// ([`crate::traverse::Admission::Threshold`]). A scent outside 0 to 1
@@ -356,11 +361,21 @@ pub enum Reason {
     /// Its target is outside the root, which is never followed.
     OutOfRoot,
     /// Its target is a hop past the depth budget.
-    MaxDepth,
-    /// Its target has been visited, or a path at least as good was already
-    /// queued for it: the first path to reach a file at its best score is the
-    /// one kept.
+    PastDepth,
+    /// Its target was already the walk's: it has been popped, and the first
+    /// path to reach a file is the one the walk keeps. A page that was popped
+    /// and could not be judged is here too — it was reached, and `stderr` says
+    /// why it is not in the reading list.
     AlreadyReached,
+    /// A path at least as good was already queued for its target, so this link
+    /// queued nothing: the first path to reach a file at its best score is the
+    /// one kept.
+    ///
+    /// Not [`Self::AlreadyReached`]: the target may never be visited at all.
+    /// The beam and the file budget are read when the walk takes a path off the
+    /// frontier, so the path that held the target can be dropped, and then a
+    /// reader told `already-reached` would look for a file the walk never read.
+    AlreadyQueued,
     /// The root's `.s1mignore` matched its target, which is never read, never
     /// sent and never judged.
     Ignored,
