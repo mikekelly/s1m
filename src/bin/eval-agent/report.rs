@@ -39,7 +39,7 @@ const LABEL_LIMIT: usize = 64;
 
 /// The metrics the results table shows, in order, with the heading each one
 /// prints under. A metric no condition measured is left out of the table.
-const COLUMNS: [(&str, &str); 10] = [
+const COLUMNS: [(&str, &str); 11] = [
     ("recall", "Recall"),
     ("precision", "Precision"),
     ("agent_read_tokens", "Agent tokens"),
@@ -49,6 +49,7 @@ const COLUMNS: [(&str, &str); 10] = [
     ("parent_tool_denials", "Parent blocked"),
     ("cost_usd", "Cost (USD)"),
     ("wall_ms", "Wall (ms)"),
+    ("jev_input_tokens", "Jev input tokens"),
     ("jev_cost_usd", "Jev cost (USD)"),
 ];
 
@@ -270,6 +271,11 @@ fn caveats_section(out: &mut String) {
         "Cost is what the CLI priced the whole run at, parent included. A \
          subagent's share of it is apportioned by tokens, which is an estimate \
          and not a price.",
+        "Jev's input tokens are of the same order as an exploring agent's: it \
+         reads every page the walk visits whole, plus a preview of each of that \
+         page's links. What differs is the price of a token and the cache — a \
+         judgment already bought is not bought again, and a warm run reads \
+         nothing at all.",
         "s1m's tokens are the characters in the ranges it returned, counted at \
          the rate in the method table. Nothing here tokenises, and an agent \
          that opens a returned file whole reads more than that.",
@@ -330,6 +336,9 @@ fn cell(group: &Group, metric: &str) -> String {
     let Some(stat) = group.metrics.get(metric) else {
         return "—".to_string();
     };
+    if nothing_to_report(group, metric) {
+        return "—".to_string();
+    }
     let mut cell = match stat.sd {
         Some(sd) => format!("{} ± {}", number(stat.mean), number(sd)),
         None => number(stat.mean),
@@ -338,6 +347,18 @@ fn cell(group: &Group, metric: &str) -> String {
         cell.push_str(&format!(" (n={})", stat.n));
     }
     cell
+}
+
+/// Whether a metric is a number the run never went and got. A warm s1m run
+/// bought no judgment, so it read no tokens; that zero is the cache's doing
+/// and not the walk's, and printing it beside a cold run's tokens would
+/// compare a price with an absence.
+fn nothing_to_report(group: &Group, metric: &str) -> bool {
+    metric == "jev_input_tokens"
+        && group
+            .metrics
+            .get("jev_calls")
+            .is_some_and(|calls| calls.max == 0.0)
 }
 
 /// A number at the precision it means something: money to six places, rates to
@@ -784,5 +805,44 @@ mod tests {
             ..method()
         };
         assert!(render(&aggregate(&rows), None, &crafted).is_err());
+    }
+
+    /// What Jev read is the number s1m's cost is made of, so it belongs beside
+    /// the cost. A warm run bought nothing and read nothing: printing its zero
+    /// would read as a walk that was judged for free rather than one whose
+    /// answers were already paid for.
+    #[test]
+    fn jev_input_tokens_are_shown_where_something_was_bought() {
+        let bought = |id: &str, calls: f64, input: f64| {
+            let mut row = row(id, "how-to", "s1m", 1.0);
+            row.metrics.insert("jev_calls".to_string(), calls);
+            row.metrics.insert("jev_input_tokens".to_string(), input);
+            row.metrics
+                .insert("jev_cost_usd".to_string(), input / 1e6 * 0.042);
+            row
+        };
+        let rows = vec![bought("cold-one", 6.0, 30000.0)];
+        let report = render(&aggregate(&rows), None, &method()).expect("a report");
+        assert!(report.contains("Jev input tokens"), "{report}");
+        assert!(report.contains("| 30000 |"), "{report}");
+
+        // A warm run: no call, so nothing to report but the zero it did spend.
+        let rows = vec![bought("warm-one", 0.0, 0.0)];
+        let report = render(&aggregate(&rows), None, &method()).expect("a report");
+        let line = report
+            .lines()
+            .find(|line| line.contains("warm-one"))
+            .expect("the per-query row");
+        assert!(line.contains("—"), "{line}");
+        assert!(!line.contains("| 0.00 | 0.00 |"), "{line}");
+
+        // An agent condition never calls Jev at all, and says so the same way.
+        let report = render(
+            &aggregate(&[row("one", "how-to", "explore", 1.0)]),
+            None,
+            &method(),
+        )
+        .expect("a report");
+        assert!(report.contains("—"), "{report}");
     }
 }
