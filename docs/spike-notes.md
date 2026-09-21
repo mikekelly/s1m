@@ -43,9 +43,10 @@ From [Models](https://docs.typesafe.ai/models) and the
 
 The 32k figure is the one that binds a file: a hub page's link table grows with its link count,
 and the link table is part of the state. `src/jev.rs` caps the file's own content at 40,000
-characters (~10k tokens) and each preview's first paragraph at 600 characters, and says so in
-the text it truncates. Nothing here converts characters to tokens; four characters per token is
-the rule of thumb used to set those caps, not a measurement.
+characters and every part of a preview — the title and the first paragraph at 600 characters
+each, the frontmatter at 1,200 — and says so in the text it truncates. Four characters per token
+was the rule of thumb those caps were set with, and a measurement since put a link table at 2.5
+to 3: the split now measures at two ([#37](#the-state-budget-measured-on-the-counter-that-enforces-it)).
 
 ## What one call cost and took
 
@@ -157,7 +158,69 @@ cargo run -- score-file "how do I cut a release and publish the package" \
 
 Two requests of about 42k tokens each: one request could not have carried them, and the API
 accepted both. The split is decided before sending, from the JSON of each part at four
-characters per token, with a margin, so it needs no error to trigger it.
+characters per token, with a margin, so it needs no error to trigger it — and that conversion is
+what the next section corrects.
+
+## The state budget, measured on the counter that enforces it
+
+Measured 2026-09-21 for [#37](https://github.com/mikekelly/s1m/issues/37), against the same API
+and the same alias. The page the issue reports — 16,984 characters, 22 headings, 92 links to
+pages with frontmatter — was one request, and the API refused it:
+
+```
+s1m: <page> could not be judged: https://api.typesafe.ai/v1/systemone returned 400:
+     {"detail":{"error_type":"max_tokens_exceeded"}}
+```
+
+Reproduced as a generated page of exactly that shape (17,009 characters, 23 sections, 92 links,
+every target with a frontmatter block), the pre-split code sent **one post of about 127,000
+characters whose state alone was about 95,000**: the estimator divided characters by four and
+compared the whole post against 32k, so it read that state as 24k tokens and did not split. What
+the API's own `usage` says a state costs, over the runs that were accepted:
+
+| Shape | State characters | Input tokens the API reported | Characters per token |
+| --- | --- | --- | --- |
+| 17k-character page, 92 previewed links, post 1 | 76,869 | 43,191 (109 questions) | 2.9 to 3.1 of the state |
+| The same page, post 2 | 22,539 | 8,136 (7 questions) | — |
+| 50 previewed links, 74 questions | 53,019 | 28,588 | 3.1 |
+| 60 previewed links, 84 questions | 59,796 | 32,728 | — |
+| The spike's hundred-link hub, tiny previews | ~2,300 | 25,358 (101 questions) | 2.5 of the whole request |
+
+The link table is JSON — short quoted strings, paths, punctuation — and it measures **2.5 to 3
+characters per token**, not four. Prose measures better (this repository's plan: 4.6), and the
+estimate takes the worst of them, because the link table is the part that grows with the page.
+
+So the split now measures two things, at two characters per token, against the two budgets the
+docs state:
+
+- the **state** — the query, the file, its section entries, and each link's entry with its
+  preview — plus the longest question, against 32k tokens (64,000 characters), and
+- the **whole request** against 64k tokens (128,000 characters).
+
+Every part of a preview is bounded as well, because the target is a page the walk did not
+choose: the first paragraph and the title at 600 characters each, the frontmatter at 1,200
+characters of whole fields (the largest on either vendored wiki is 653 characters of text, 562 as
+that counts them). A page
+whose own state leaves no room for a previewed link drops its previews rather than its links: a
+link judged from its anchor is worth more than a link never judged.
+
+The same generated page, with the fix, in the same run against the API:
+
+```bash
+cargo run --bin s1m -- score-file "how do I cut a release and publish the package" \
+  /tmp/issue-37/hub.md --root /tmp/issue-37
+# call  jev-1.13.0  116 questions in 2 request(s)  51,295 tokens in + 2,179 out  0.49 s
+```
+
+Two posts, of 62,499 and 36,836 characters of state, and the API answered both: 34,723 and
+16,572 input tokens. One post could not have carried that state — 32k tokens is where the API
+stops, and the state alone was about 95,000 characters.
+
+The earlier claim in these notes — "the docs' 32k budget for state plus the longest question
+therefore binds at roughly 100–120 links with previews" — measured the *questions* (about 250
+tokens a link) and not the state, and it is what let a 92-link page through unsplit. A link with
+a preview is about 900 characters of state after the bounds above, so the state budget binds at
+around **65 previewed links**, and the request budget later than that.
 
 ## Do target previews earn their tokens
 

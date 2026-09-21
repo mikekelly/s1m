@@ -29,16 +29,18 @@
 //!
 //! - 0 when the walk reached a file beyond the entry files, which is a reading
 //!   list the caller could not have written itself.
-//! - 1 when nothing cleared the threshold: the model judged the entry files'
-//!   links and none passed, so the list is the entry files and nothing more.
-//!   The list is still printed — a caller that wants it gets it — with one line
-//!   on stderr saying why the code is not 0.
+//! - 1 when the walk reached nothing beyond the entry files: the model judged
+//!   the entry files' links and none passed, or the page one of them reached
+//!   could not be judged. The list is still printed — a caller that wants it
+//!   gets it — with one line on stderr saying why the code is not 0.
 //! - 2 for anything that stops a list being an answer: bad flags, no query, an
 //!   entry file that cannot be read, an entry file the root's `.s1mignore`
 //!   covers ([`Error::Ignored`]), a `.s1mignore` that cannot be read or parsed,
-//!   a missing `TYPESAFE_API_KEY`, and a judgment that failed. A *reached* file
-//!   that cannot be read is not in this list; see [`run`].
+//!   a missing `TYPESAFE_API_KEY`, and a run that judged nothing at all. A
+//!   *reached* file that cannot be read, and a reached file whose judgment
+//!   failed, are not in this list; see [`run`].
 
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -306,9 +308,16 @@ pub enum Error {
     /// silently dropped would answer a question the caller did not ask.
     #[error("{path} is matched by {file}: s1m never reads an ignored file")]
     Ignored { path: String, file: String },
-    /// A file the walk reached could not be judged. A reading list with a hole
-    /// where a judgment should be is a different answer, and a caller could not
-    /// tell the difference, so there is no list.
+    /// Nothing was judged: a file the walk reached could not be judged and no
+    /// other page was, so there is no reading list at all. Exit 2, because a
+    /// caller that asked about a wiki and got an empty answer could not tell
+    /// that from a wiki that holds nothing.
+    ///
+    /// A judgment that fails on any other file is not this: the file is named
+    /// on stderr as skipped, its links are not followed, and the pages that
+    /// were judged are the reading list ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
     #[error("{path} could not be judged: {source}")]
     Judge {
         path: String,
@@ -323,7 +332,11 @@ pub enum Error {
 /// and s1m cannot read is the caller's mistake, and finding that out after
 /// paying for a round of judgments would be too late. A link to a file that is
 /// not there is the opposite case — the wiki's business, not the caller's — so
-/// it is named on stderr as skipped and the walk carries on.
+/// it is named on stderr as skipped and the walk carries on. A page that is
+/// there but cannot be judged is the wiki's business too, for the same reason
+/// and with the same one line on stderr: the walk keeps what it reached, and
+/// only a run that judged nothing at all is an error
+/// ([#37](https://github.com/mikekelly/s1m/issues/37)).
 ///
 /// The root's `.s1mignore` is read first, and it is what the whole run is
 /// bounded by: an entry file the caller names that matches is
@@ -364,20 +377,36 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
     let Traversal {
         results, failed, ..
     } = traversal;
+    // One page that cannot be judged is a hole in the ranking, not the end of
+    // the walk: it is named on stderr, the rest of the frontier keeps its
+    // place, and the reading list is what was judged — the walk does not pay
+    // again for what it already bought ([#37]).
+    //
+    // A run that judged nothing at all is the exception. An entry file whose
+    // judgment failed, with no other page reached, has no reading list to
+    // print, so the failure is the run's error rather than a line on stderr.
+    //
+    // [#37]: https://github.com/mikekelly/s1m/issues/37
+    let mut unjudged = Vec::new();
     for FailedFile { path, failure } in failed {
         match failure {
             // One broken link does not cost the reading list, but the gap it
             // leaves must not be silent either.
-            Failure::Parse(source) => {
-                eprintln!("s1m: skipped {}: {source}", display(&root, &path));
-            }
-            Failure::Score(source) => {
-                return Err(Error::Judge {
-                    path: display(&root, &path),
-                    source,
-                });
-            }
+            Failure::Parse(source) => skipped(&root, &path, &source),
+            Failure::Score(source) => unjudged.push((path, source)),
         }
+    }
+    let mut unjudged = unjudged.into_iter();
+    if results.is_empty()
+        && let Some((path, source)) = unjudged.next()
+    {
+        return Err(Error::Judge {
+            path: display(&root, &path),
+            source,
+        });
+    }
+    for (path, source) in unjudged {
+        skipped(&root, &path, format_args!("could not be judged: {source}"));
     }
 
     let results = results
@@ -407,6 +436,21 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         calls: judge.calls(),
         results,
     })
+}
+
+/// One line on stderr for a page the walk reached and dropped, and why.
+///
+/// One line because a caller reading stderr is parsing it, and the reason can
+/// come from outside: a judgment that failed carries the API's own response
+/// body, which a proxy is free to send with newlines in it
+/// ([`crate::scorer::ScorerError::Status`]). `main.rs` flattens the same kind
+/// of message on its way out of a run.
+fn skipped(root: &Path, path: &Path, reason: impl Display) {
+    eprintln!(
+        "s1m: skipped {}: {}",
+        display(root, path),
+        reason.to_string().replace(['\n', '\r'], " ")
+    );
 }
 
 /// A walk's path as the reading list spells it: the root joined back on, so the
@@ -832,16 +876,84 @@ mod tests {
         assert!(error.to_string().contains("gone.md"), "{error}");
     }
 
-    /// A judgment that fails leaves a hole in the ranking, so there is no
-    /// reading list at all, and the file whose question failed is named.
+    /// A judgment that fails on a reached page is a hole in the ranking, not
+    /// the end of the walk: the page is dropped, the walk carries on with what
+    /// it already reached, and the exit code is the list's own ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
     #[tokio::test]
-    async fn a_failed_judgment_is_an_error_naming_the_file() {
-        let error = run_with(ENTRY, &Fake::refusing(by_relevance, 0.9, "next.md"))
+    async fn a_failed_judgment_drops_its_page_and_the_walk_carries_on() {
+        // The entry links to `next.md`, which is where the failure is; `deep.md`
+        // is one hop further on and unreachable without it, so the list is the
+        // entry file and the exit code says nothing cleared the threshold.
+        let list = run_with(ENTRY, &Fake::refusing(by_relevance, 0.9, "next.md"))
             .await
-            .expect_err("a hole in the ranking is not an answer");
+            .expect("one page failing is not the end of the walk");
+
+        assert_eq!(list.exit_code(), 1);
+        assert_eq!(list.visited, 1);
+        assert_eq!(list.results[0].path, ENTRY);
+        assert_eq!(
+            list.results
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec![ENTRY],
+            "the page that failed is not in the list, and nothing reached past it"
+        );
+        assert_eq!(
+            list.results[0].links,
+            vec![RankedLink {
+                target: "tests/fixtures/cli/next.md".to_string(),
+                scent: Some(0.9),
+                followed: true,
+            }],
+            "the entry file's own judgment is untouched by the page it points at"
+        );
+    }
+
+    /// The same, where the walk reaches a page beyond the entry by another
+    /// path: the result is a reading list that got past the entry files, so it
+    /// exits 0, and only the page that failed is missing ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    #[tokio::test]
+    async fn a_failed_judgment_on_a_reached_page_leaves_the_rest_of_the_walk() {
+        // `broken.md` links on to `next.md`, and `next.md` is the only way to
+        // `deep.md` — which is the page that fails. `broken.md` and `next.md`
+        // are judged, so the run has a reading list and earns a 0.
+        let list = run_with(BROKEN, &Fake::refusing(by_relevance, 0.9, "deep.md"))
+            .await
+            .expect("one page failing is not the end of the walk");
+
+        assert_eq!(list.exit_code(), 0, "the walk reached beyond the entry");
+        let paths: Vec<&str> = list.results.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["tests/fixtures/cli/next.md", BROKEN],
+            "every page that was judged is in the list"
+        );
+        assert_eq!(
+            list.results[0].via,
+            vec![BROKEN.to_string()],
+            "and the page that failed is not in the path that reached it"
+        );
+    }
+
+    /// Nothing judged at all: an entry file whose judgment failed, with no
+    /// other page reached, is the one judgment failure that is an error. There
+    /// is no reading list to print, so a caller is told rather than handed an
+    /// empty answer ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    #[tokio::test]
+    async fn an_entry_file_that_cannot_be_judged_with_nothing_else_is_an_error() {
+        let error = run_with(ENTRY, &Fake::refusing(by_relevance, 0.9, "entry.md"))
+            .await
+            .expect_err("there is no reading list");
 
         match error {
-            Error::Judge { path, .. } => assert_eq!(path, "tests/fixtures/cli/next.md"),
+            Error::Judge { path, .. } => assert_eq!(path, "tests/fixtures/cli/entry.md"),
             other => panic!("expected a failed judgment, got {other:?}"),
         }
     }

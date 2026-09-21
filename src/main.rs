@@ -83,9 +83,16 @@ matches is an error rather than a silent read.
 
 Exit codes:
   0  the walk reached files beyond the entry files
-  1  nothing cleared the threshold: only the entry files were reached
+  1  nothing beyond the entry files is in the list: no link cleared the
+     threshold, or the page a link reached could not be judged
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
+
+A page the walk reached but could not judge is not an error: it is named on
+stderr as skipped, its links are not followed, and the reading list keeps every
+page that was judged. The code is the list's own, so a walk that got past the
+entry files still exits 0 with one page missing. Only a run that judged nothing
+at all — an entry file whose judgment failed with nothing else reached — is 2.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, a score per section and a scent
@@ -268,8 +275,9 @@ async fn main() {
             Ok(code) => {
                 if code != 0 {
                     eprintln!(
-                        "s1m: no file beyond the entry files was reached: \
-                         nothing cleared the threshold"
+                        "s1m: nothing beyond the entry files is in the reading list: \
+                         nothing cleared the threshold, or the page a link reached \
+                         could not be judged"
                     );
                 }
                 std::process::exit(code);

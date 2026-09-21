@@ -325,6 +325,14 @@ frontmatter costs 0.21 of mean recall (0.67 → 0.46) for 43% of the input token
 dropping previews altogether costs 0.28, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
+Every part of a preview is bounded, because a preview is a hint about a target and the target is
+a page this walk did not choose — one page's frontmatter would otherwise be added whole to the
+state of every page that links to it ([#37](https://github.com/mikekelly/s1m/issues/37)): the
+first paragraph is cut at 600 characters, the title at 600, and the frontmatter at 1,200
+characters of whole fields in the target's own order. The largest frontmatter block on either
+vendored wiki is 653 characters of text, which that cap counts as 562, so no measured page is
+cut by any of those bounds.
+
 ### Keeping paths out of it: `.s1mignore`
 
 A wiki that holds anything private needs to say so, because this is a run that sends what it
@@ -376,13 +384,19 @@ Exit codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | The walk reached files beyond the entry files |
-| 1 | Nothing cleared the threshold: the model judged the entry files' links and none passed, so the list is the entry files and nothing more. The JSON is still on stdout, and one line on stderr says so |
-| 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, an entry file the root's `.s1mignore` covers, a `.s1mignore` that cannot be read or parsed, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a judgment that failed. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
+| 1 | Nothing beyond the entry files is in the list: either the model judged the entry files' links and none passed the threshold, or the page a link did reach could not be judged. The JSON is still on stdout, and one line on stderr says so |
+| 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, an entry file the root's `.s1mignore` covers, a `.s1mignore` that cannot be read or parsed, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a run that judged nothing at all. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
 
 A file the walk *reached* but could not read is neither an error nor a silent omission: a link
 to a page that is not there is the wiki's business, so it is named on stderr as skipped and the
-walk carries on. A *judgment* that fails is an error, because a reading list with a hole in its
-ranking is a different answer.
+walk carries on. A page that *is* there but whose judgment failed is the same case: the API
+refusing one page — a state over its budget, a page whose text will not decode — is the wiki's
+business too, so that page is named on stderr as skipped, its links are not followed, and the
+walk keeps what it judged. The exit code is the reading list's, so a walk that got past the
+entry files still exits 0 with one page missing and one line saying which
+([#37](https://github.com/mikekelly/s1m/issues/37)). A run that judged nothing at all — an
+entry file whose judgment failed with no other page reached — is exit 2, because there is no
+list to print.
 
 ### Environment
 
@@ -514,7 +528,7 @@ the CLI, so they can be driven directly from tests:
 | `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
 | `ignore::Ignore` | The root's `.s1mignore`: `Ignore::at(root)` reads it (a root without one matches nothing, a file that cannot be read or parsed is an error, and `Ignore::none()` is the empty set), `matched(relative_path)` answers for a path or any directory above it. One value a run is built around, asked by the CLI for its entry files, by the walk for what it may read and link to |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1), one `SectionJudgment` (`heading`, `lines` as the parser gave them, `score` 0 to 1) per section and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, each in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
-| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's sections and links would not fit the API's 32k state budget in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
+| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's state and questions would not fit the API's budgets in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. The split measures what it sends — the file's text, every link's entry and preview, and the questions — at two characters per token against both of the API's budgets, `state` plus the longest question (32k) and the whole request (64k): the JSON of a link table measures 2.5 to 3 characters per token on the API's counter, which is why four was too optimistic ([#37](https://github.com/mikekelly/s1m/issues/37)). `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
