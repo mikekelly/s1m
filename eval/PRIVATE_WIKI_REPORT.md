@@ -59,13 +59,17 @@ The `s1m-agent` condition was asked, with the reading list substituted in:
 
 Every cell is the mean over the runs, with the sample standard deviation after it where there was more than one run.
 
+## What the Explore condition measured
+
+This baseline was run before the harness forced delegation. The parent `claude -p` session was given `Read`, `Glob`, `Grep` and `Task` and asked to use the Explore subagent; every one of the 60 runs did dispatch exactly one `Explore` subagent, and the "Agent tokens" column is that subagent's own usage from its transcript. But the parent also read the wiki itself, about 20 `Read`/`Grep`/`Glob` calls a run (918, 153 and 108 over the 60 runs), so "Billed tokens" and "Cost" include a parent that explored too. The subagent ran on `claude-sonnet-5`, inherited from the parent's `--model sonnet`: on Claude Code 2.1.278 in `-p` mode the built-in Explore agent declares no model of its own and takes the session's. The harness now blocks the parent's reads with a PreToolUse hook and passes an explicit thoroughness, so a rerun would measure the subagent alone; this run is kept as the baseline as it was measured.
+
 ## Reading the numbers
 
 The Explore agent finds more and reads far more. Its recall is 0.85 against 0.59 for s1m's reading list at defaults, and it gets there by reading 310k tokens a query at $0.29 and 78 s, against s1m's 9.5k tokens of returned ranges at $0.02 cold and 1.5 s, or 0.2 s warm. Handing that list to an agent (`s1m-agent`) costs a third of Explore's tokens and money and a quarter of its time, and answers with much higher precision (0.42 against 0.17), but its recall falls to 0.43: the agent trusts the list, and on the 5 queries where the walk missed every wanted page (recall 0 for `s1m`) it has nothing to recover from, while Explore greps its way there. Lowering the threshold to 0.4 buys little (recall 0.62, twice the ranges). On this wiki the link scent from the hub pages is the limit, not the budget: the walk stops at 20 to 25 files and the wanted pages sit two or three hops down. Where the list is right it is by far the cheapest route to the answer; where it is wrong, nothing downstream notices.
 
 ## Where the private material lives
 
-The wiki clone, the gold set, every raw run row, the agent transcripts and the s1m cache for these runs are under `~/private-eval/` on the machine that ran them (`wiki/`, `gold.json`, `out/`, `cache/`), outside any checkout. The 78 agent runs from the eighth query onward were re-run after a Claude usage-limit outage returned no output; the failed rows were dropped before the resume, so every run above completed. The two sections above are hand-written; `eval-agent report` regenerates the rest from `out/aggregates.json` and `out/graph_stats.json`.
+The wiki clone, the gold set, every raw run row, the agent transcripts and the s1m cache for these runs are under `~/private-eval/` on the machine that ran them (`wiki/`, `gold.json`, `out/`, `cache/`), outside any checkout. The 78 agent runs from the eighth query onward were re-run after a Claude usage-limit outage returned no output; the failed rows were dropped before the resume, so every run above completed. The three hand-written sections are this one and the two above; `eval-agent report` regenerates the rest from `out/aggregates.json` and `out/graph_stats.json`.
 
 ## Per query
 
