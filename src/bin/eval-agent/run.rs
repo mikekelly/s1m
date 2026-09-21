@@ -134,9 +134,10 @@ pub fn pending(
                 wanted.push(condition.clone());
                 for condition in wanted {
                     let key = Key {
-                        // Membership is the query, condition and repeat: the
-                        // wiki revision and the model were settled when the
-                        // ledger was read.
+                        // Membership is the query, condition, repeat and the
+                        // model the condition was asked for: the wiki revision
+                        // was settled when the ledger was read, and the model is
+                        // held by `Done`.
                         wiki: String::new(),
                         query: query.id.clone(),
                         condition: condition.clone(),
@@ -164,17 +165,29 @@ fn triple(key: &Key) -> Triple {
     (key.query.clone(), key.condition.clone(), key.repeat)
 }
 
+/// A run as it is matched on: the triple, and the model the condition was asked
+/// for — `None` on a condition that runs no agent, which is the same run
+/// whatever the pass names.
+///
+/// It is the ledger's [key](crate::ledger::Id) without the wiki revision, so
+/// the two records are read the same way and a directory cannot call a run
+/// measured at another tier measured at this one.
+type Run = (Triple, Option<String>);
+
 /// What has already been measured: one set of runs, read from two records that
 /// are held to two different rules.
 ///
 /// This directory's rows are its own record, so a run in it has happened and is
 /// not made again whatever wiki revision it was made against: a pass resumed on
 /// a directory from before revisions were recorded does not pay for all of it
-/// again to learn what its rows already say.
+/// again to learn what its rows already say. The model asked for is part of the
+/// run, though, the same way it is in the ledger: a pass at another tier into
+/// this directory owes every run whose row was measured at another one, which is
+/// what makes a screening pass into an existing directory buy anything at all.
 ///
 /// The ledger's entries are every directory's record, so they are held to the
-/// key: only the ones for the wiki revision being measured now, and only the
-/// ones bought at the model being asked for — where the condition takes a
+/// whole key: only the ones for the wiki revision being measured now, and only
+/// the ones bought at the model being asked for — where the condition takes a
 /// model at all. The same query against another cut or at another tier is
 /// another measurement, and a screening pass at a cheaper model has to be able
 /// to make it.
@@ -182,7 +195,11 @@ fn triple(key: &Key) -> Triple {
 /// `--retry-failed` puts back the runs that failed — here and in the ledger —
 /// and nothing else.
 pub struct Done {
-    runs: BTreeSet<Triple>,
+    runs: BTreeSet<Run>,
+    /// The model this pass asks for, `None` where it names none. Held to the
+    /// condition when a run is looked up, because an `s1m` run is the same run
+    /// whatever the pass names.
+    model: Option<String>,
 }
 
 impl Done {
@@ -191,6 +208,7 @@ impl Done {
     pub fn nothing() -> Done {
         Done {
             runs: BTreeSet::new(),
+            model: None,
         }
     }
 
@@ -203,10 +221,15 @@ impl Done {
         model: Option<&str>,
         retry_failed: bool,
     ) -> Done {
-        let mut runs: BTreeSet<Triple> = rows
+        let mut runs: BTreeSet<Run> = rows
             .iter()
             .filter(|row| !(retry_failed && !row.ok))
-            .map(|row| triple(&row.key()))
+            .map(|row| {
+                (
+                    triple(&row.key()),
+                    asked_for(&row.condition, row.model_asked_for.as_deref()),
+                )
+            })
             .collect();
         runs.extend(
             recorded
@@ -219,16 +242,25 @@ impl Done {
                     Some(false) => !retry_failed,
                     Some(true) => true,
                 })
-                .filter(|entry| {
-                    entry.key.wiki == wiki && entry.model == asked_for(&entry.key.condition, model)
-                })
-                .map(|entry| triple(&entry.key)),
+                .filter(|entry| entry.key.wiki == wiki)
+                .map(|entry| {
+                    (
+                        triple(&entry.key),
+                        asked_for(&entry.key.condition, entry.model.as_deref()),
+                    )
+                }),
         );
-        Done { runs }
+        Done {
+            runs,
+            model: model.map(str::to_string),
+        }
     }
 
     pub fn contains(&self, key: &Key) -> bool {
-        self.runs.contains(&triple(key))
+        self.runs.contains(&(
+            triple(key),
+            asked_for(&key.condition, self.model.as_deref()),
+        ))
     }
 
     /// How many runs are behind it.
@@ -1576,26 +1608,40 @@ mod tests {
             }
         };
         let recorded: BTreeMap<Id, Entry> = BTreeMap::from([
-            // The same run, against this revision, at this model.
+            // The same run, against this revision, naming no model.
             listed(WIKI, "explore", None, Some(true)),
             // Another cut of the wiki.
             listed("sha256:ff", "s1m-agent", None, Some(true)),
-            // Another tier.
-            listed(WIKI, "s1m", Some("haiku"), Some(true)),
+            // The first run again, at another tier: `Entry::buying` at haiku is
+            // what a screening pass writes, and one run at two tiers is two
+            // entries.
+            listed(WIKI, "explore", Some("haiku"), Some(true)),
         ]);
 
-        let done = Done::read(&[], &recorded, WIKI, None, false);
-        let known = |condition: &str| {
-            done.contains(&Key {
+        // A run is read back at the model the pass asks for — held to the
+        // condition, because an `s1m` run takes no model — so the same ledger
+        // answers differently to two passes.
+        let known = |model: Option<&str>, condition: &str| {
+            Done::read(&[], &recorded, WIKI, model, false).contains(&Key {
                 wiki: String::new(),
                 query: "one".to_string(),
                 condition: condition.to_string(),
                 repeat: 0,
             })
         };
-        assert!(known("explore"), "the ledger's own run is measured");
-        assert!(!known("s1m-agent"), "another revision is not this one");
-        assert!(!known("s1m"), "another model is another measurement");
+        assert!(known(None, "explore"), "the ledger's own run is measured");
+        assert!(
+            !known(None, "s1m-agent"),
+            "another revision is not this one"
+        );
+        assert!(
+            known(Some("haiku"), "explore"),
+            "the tier it was bought at is the one that is measured"
+        );
+        assert!(
+            !known(Some("sonnet"), "explore"),
+            "another model is another measurement"
+        );
 
         // This directory's rows are its own record, and hold whatever revision
         // they were written against: a resumed pass on an old directory does
@@ -1655,6 +1701,53 @@ mod tests {
             condition: "s1m-agent".to_string(),
             repeat: 0
         }));
+    }
+
+    /// The directory's rows are the same key as the ledger's, minus the wiki
+    /// revision: a row measured at another tier is another measurement there
+    /// too, so a pass pinned to a cheaper model into a directory that already
+    /// holds an expensive one owes every job rather than reporting them all
+    /// measured.
+    #[test]
+    fn a_directorys_row_at_another_tier_is_another_measurement() {
+        let key = |condition: &str| Key {
+            wiki: WIKI.to_string(),
+            query: "one".to_string(),
+            condition: condition.to_string(),
+            repeat: 0,
+        };
+        let at_sonnet = vec![
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "explore", 0, true)
+            },
+            // An `s1m` row of the same directory: no agent, so no model.
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "s1m", 0, true)
+            },
+        ];
+        let read = |model: &str| Done::read(&at_sonnet, &BTreeMap::new(), WIKI, Some(model), false);
+
+        assert!(read("sonnet").contains(&key("explore")), "the same tier");
+        let haiku = read("haiku");
+        assert!(
+            !haiku.contains(&key("explore")),
+            "another tier is another measurement"
+        );
+        let owed = pending(&gold(), &["explore".to_string()], 1, 0, &haiku);
+        assert_eq!(owed.len(), 2, "the owed job and the one nothing measured");
+        assert!(owed.contains(&Job {
+            query: 0,
+            condition: "explore".to_string(),
+            repeat: 0
+        }));
+        // An s1m run takes a threshold rather than a model, so naming one for
+        // the pass must not make the directory's s1m rows another pass's.
+        assert!(
+            haiku.contains(&key("s1m")),
+            "an s1m row is the same run whatever the pass names"
+        );
     }
 
     /// `--retry-failed` puts back the runs that failed and nothing else: a run
