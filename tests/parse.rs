@@ -316,6 +316,118 @@ fn every_link_form_is_reported_in_document_order() {
     }
 }
 
+/// The line a link is written on, counted the way the sections count: what
+/// tells a caller which part of a page the link is in, which is how an
+/// oversized page is split into chunks it fits in ([#53]).
+///
+/// [#53]: https://github.com/mikekelly/s1m/issues/53
+#[test]
+fn a_link_reports_the_line_it_starts_on() {
+    let line = |page: &str, target: &str| link_to(&doc(page), target).line;
+
+    // The file's own lines, frontmatter included: index.md's first link is on
+    // line 8, below the frontmatter and the heading.
+    assert_eq!(line("index.md", "payments/README.md"), 8);
+    // Under a soft break in the same paragraph, which is one source line later
+    // than the text run that opened the paragraph.
+    assert_eq!(line("index.md", "payments/cutoffs.md"), 9);
+    // A wikilink, and the alias of one: both on the line they are written on.
+    assert_eq!(line("index.md", "payments/settlement.md"), 11);
+    assert_eq!(line("index.md", "notes/ledger.md"), 11);
+    // A link that leaves the root, and a broken one: reported the same way.
+    assert_eq!(line("index.md", "../outside.md"), 16);
+    assert_eq!(line("index.md", "payments/missing.md"), 16);
+    // A page with no frontmatter counts from its first line.
+    assert_eq!(line("notes/scratch.md", "notes/ledger.md"), 5);
+    // The same target linked twice is reported twice, each on its own line.
+    assert_eq!(
+        doc("payments/README.md")
+            .links
+            .iter()
+            .filter(|link| link.target == Path::new("notes/ledger.md"))
+            .map(|link| link.line)
+            .collect::<Vec<_>>(),
+        [3, 11]
+    );
+    // The README's fence names no page: the markdown link inside it is code
+    // rather than a link, and the `[[not a wikilink]]` beside it resolves to no
+    // file, so nothing is reported from below line 15.
+    let readme = doc("payments/README.md");
+    assert!(
+        readme.links.iter().all(|link| link.line <= 15),
+        "a link inside the code block was reported: {:?}",
+        readme
+            .links
+            .iter()
+            .map(|link| (link.target.display().to_string(), link.line))
+            .collect::<Vec<_>>()
+    );
+
+    // Every link of every fixture page is on a line the file has.
+    for page in PAGES {
+        let source = std::fs::read_to_string(root().join(page)).unwrap();
+        let last = source.lines().count();
+        for link in &doc(page).links {
+            assert!(
+                (1..=last).contains(&link.line),
+                "{page}: {} is not on a line of a {last}-line file: {}",
+                link.target.display(),
+                link.line
+            );
+        }
+    }
+}
+
+/// A link is reported on the line its anchor starts on, whatever run of text it
+/// arrived in: a fenced block's body arrives as one run covering several lines,
+/// and a wikilink may be split across two by a break ([#53]).
+///
+/// The walker scans a fenced block's body for wikilinks, which the module doc
+/// says it excludes — a quirk of the walk rather than this test's subject. What
+/// is asserted here is the line one is reported on.
+///
+/// [#53]: https://github.com/mikekelly/s1m/issues/53
+#[test]
+fn a_link_is_reported_on_the_line_its_anchor_starts_on() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parse-link-lines");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("a directory to parse in");
+    std::fs::write(dir.join("target.md"), "# Target\n\nText on the page.\n").expect("a target");
+    let source = "\
+# Hub
+
+prose
+
+```md
+not this line
+[[target]]
+```
+
+wrapped [[target
+]] here
+";
+    let path = dir.join("page.md");
+    std::fs::write(&path, source).expect("a page");
+    let parsed = parse(&path, &dir).expect("a parse");
+
+    assert_eq!(
+        parsed
+            .links
+            .iter()
+            .map(|link| (link.line, link.target.display().to_string()))
+            .collect::<Vec<_>>(),
+        [
+            // The wikilink inside the fenced block: the block's body is one run
+            // of text, and the line is the anchor's own rather than the line
+            // that run begins on.
+            (7, "target.md".to_string()),
+            // A wikilink split across a break: the line it starts on.
+            (10, "target.md".to_string()),
+        ],
+        "in {source:?}"
+    );
+}
+
 #[test]
 fn the_sentence_is_the_one_the_link_sits_in() {
     assert_eq!(

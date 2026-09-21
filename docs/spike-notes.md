@@ -42,9 +42,12 @@ From [Models](https://docs.typesafe.ai/models) and the
 | Errors | 401, 422 (validation, names the offending field), 429, 529; retry the last two with backoff and honour `retry-after` |
 
 The 32k figure is the one that binds a file: a hub page's link table grows with its link count,
-and the link table is part of the state. `src/jev.rs` caps the file's own content at 40,000
+and the link table is part of the state. `src/jev.rs` caps one post's own text at 40,000
 characters and every part of a preview — the title and the first paragraph at 600 characters
-each, the frontmatter at 1,200 — and says so in the text it truncates. Four characters per token
+each, the frontmatter at 1,200 — and says so in the text it truncates. A page longer than the cap
+is no longer cut at it: it is split by its own heading tree, and the 40,000 is what one of its
+chunks is measured against ([#53](#a-page-over-the-content-cap-split-by-its-own-heading-tree)).
+Four characters per token
 was the rule of thumb those caps were set with, and a measurement since put a link table at 2.5
 to 3: the split now measures at two ([#37](#the-state-budget-measured-on-the-counter-that-enforces-it)).
 
@@ -134,8 +137,13 @@ What a section question reads, and what it does not:
   `state.file.content`, and a parent section contains its subsections' text, so copying each
   section's text into its own state entry would multiply the state by the nesting depth. A
   duplicated heading ("See also" appears under several pages) is told apart by its depth and
-  lines, and a section of a file long enough to be truncated is judged from its heading alone,
-  the way a link with no readable target is judged from its anchor.
+  lines, the way a link with no readable target is judged from its anchor. A section of a file
+  long enough to be truncated used to be judged from its heading alone; since [#53](#a-page-over-the-content-cap-split-by-its-own-heading-tree)
+  a page that long is sent in chunks, and a section inside one chunk's text is judged from the
+  whole of it. What still splits a section across chunks is size: a section longer than the cap
+  is cut at its own subsections the way the page is cut at its top-level ones, so a parent long
+  enough to need that is judged from the chunk its heading is in, and each of its leaves — the
+  common case — from the chunk that carries it whole.
 - **Both parents and leaves.** A parent owns the prose between its heading and its first
   subsection, which no leaf covers, so judging leaves only would strand it. A parent that is a
   mix of useful and useless subsections lands near the middle of the scale, which is what the
@@ -689,3 +697,76 @@ section question should expect the file rows to move with it.
 - **What a stricter section question costs the walked-but-not-returned pages.** The default returns
   126 files where it returned 129 for the same wanted pages; what moved into `walked` is a reader's
   question about the JSON, not one this experiment asked.
+
+## A page over the content cap, split by its own heading tree
+
+Measured 2026-09-21 for [#53](https://github.com/mikekelly/s1m/issues/53), against the same API
+and the same alias. Until this change a page longer than the 40,000 characters one post carries
+was cut at the cap: the tail was replaced by a truncation marker, no judgment ever read it, and a
+section written past it was asked about from its heading, its depth and its lines — which is the
+one thing a section question cannot answer from the heading alone.
+
+The cap is now the size of a **chunk**, not of the page. A page over it is split where the page
+already has a boundary: the headings directly under it, recursively, and the pieces are merged
+again while they fit, so a page of many small sections is a few posts rather than one per
+heading. A section is carried by the chunk its heading line is in and a link by the chunk its
+anchor starts in, so every section is asked about in a state that holds the whole of it, every
+link is judged beside the text it sits in, and the answers merge as they did before: the file's
+relevance is the best of its chunks', since what a reader wants is the part of a long page that
+is worth reading.
+
+Three runs against the API, each a page generated for the shape or one of this repository's own
+pages:
+
+```bash
+# A generated 64,350-character page, eight 8,000-character sections, the answer in the last of
+# them at 56,241 characters.
+cargo run --bin s1m -- score-file "what is the settlement cut-off for instant payouts" \
+  /tmp/issue-53/hub.md --no-cache
+# call  jev-1.13.0  11 questions in 2 request(s)  16,206 tokens in + 202 out  0.24 s  $0.000681
+# relevance 2.98 of 3   confidence 0.98
+# 0.97  lines 33-38  Step 7      <- the answer, past the cap
+# 0.04  lines 25-28  Step 5      <- a section that starts at 40,187 characters
+
+# This repository's README, 51,972 bytes of real prose with fourteen links, whose last section
+# opens at 50,076 characters.
+cargo run --bin s1m -- score-file \
+  "how do I run the tests, the lints and CI before opening a pull request" README.md --no-cache
+# call  jev-1.13.0  43 questions in 2 request(s)  29,076 tokens in + 789 out  0.34 s  $0.001221
+# relevance 3.00 of 3   confidence 1.00
+# 0.97  lines 714-736  Development
+
+# The walk, over a 42,439-character hub whose last section and only link are in its tail.
+cargo run --bin s1m -- --no-cache "what is the settlement cut-off for instant payouts" hub.md
+# visited 2  calls 2
+# hub.md  relevance 1.00  "Cut-offs" (lines 29-32) 0.98  link window.md 0.96 followed
+# window.md  relevance 1.00  via hub.md
+```
+
+Two requests apiece, and the API accepted every one of them: the posts are inside both budgets by
+the estimate [#37](#the-state-budget-measured-on-the-counter-that-enforces-it) measures with, and
+a page of this size is now judged for about double the tokens of the same page cut at the cap,
+because the tail is in the state and is no longer a marker. The sections the cap used to hide are
+the ones the numbers above are about: `Step 7` and `Development` open at 56k and 50k characters,
+and both came back as the page's most relevant section.
+
+What holds the other direction — that a page **inside** the cap sends exactly what it sent before
+— is the committed bytes rather than a number: `tests/snapshots/request-default.json` pins the
+default request byte for byte, and the committed evaluation cache still answers
+`tests/eval.rs`'s run with no key, so a chunk that leaked into an ordinary page's request would
+show up as a diff or as a miss.
+
+Two limits worth knowing, both of them the heading tree having nothing to cut at:
+
+- **A run of text no heading divides is still cut at the cap** — a single section longer than
+  40,000 characters, or a page with no heading in it at all. It is sent anyway, clamped, and says
+  so in its text. That is the one place the marker survives.
+- **A section that spans chunks is judged from the chunk that carries its heading.** A page whose
+  own H1 covers every section under it has a section range longer than any chunk, so its answer
+  comes from the chunk holding its heading and its own opening text, not from the whole page. The
+  leaves under it are unaffected: each is carried whole.
+
+Not measured here: the private wiki the issue counts three pages over 40k characters on. The
+numbers above are a generated page and two pages of this repository, which is enough to show the
+split, its cost and that the API takes it — not enough to say what it does to a wiki's recall.
+

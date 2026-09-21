@@ -98,6 +98,11 @@ pub struct Link {
     /// The innermost heading the link sits under, `None` before the first one.
     /// A link on a heading line belongs to that heading.
     pub heading: Option<String>,
+    /// The 1-based line the anchor starts on, counted the way
+    /// [`Section::lines`] counts, so that the part of a page a link is written
+    /// in can be told without reading the file again. A link that spans lines
+    /// is reported on the line it starts.
+    pub line: usize,
     /// `false` when the target escapes `root`. These must never be followed.
     pub in_root: bool,
     /// The syntax the link was written in.
@@ -174,8 +179,6 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
 
     let source = read(path)?;
     let scan = Scan::of(&source);
-    let starts = line_starts(&source);
-    let last_line = line_count(&source);
 
     let links = links(&scan, path, root);
     let title = scan_title(&scan, path);
@@ -183,7 +186,13 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
         path: path.to_path_buf(),
         title,
         frontmatter: scan.frontmatter,
-        sections: sections(&scan.headings, &source, &starts, scan.body_start, last_line),
+        sections: sections(
+            &scan.headings,
+            &source,
+            &scan.starts,
+            scan.body_start,
+            scan.last_line,
+        ),
         links,
     })
 }
@@ -216,6 +225,7 @@ fn links(scan: &Scan, path: &Path, root: &Path) -> Vec<Link> {
             anchor: raw.anchor.clone(),
             sentence: raw.sentence.clone(),
             heading: raw.heading.clone(),
+            line: scan.line(raw.at),
             in_root: resolved.in_root,
             kind,
         });
@@ -309,6 +319,12 @@ struct Scan {
     frontmatter_title: Option<String>,
     /// Byte offset where the body starts: after the frontmatter.
     body_start: usize,
+    /// Byte offset of every line's first byte, in order, plus one past the end
+    /// when the source ends in a newline: [`line_of`] reads an offset's line
+    /// off this and [`Scan::line`] is what a link's own line comes from.
+    starts: Vec<usize>,
+    /// How many lines the source has, counted the way `lines()` counts them.
+    last_line: usize,
     headings: Vec<Heading>,
     first_h1: Option<String>,
     first_paragraph: Option<String>,
@@ -330,10 +346,18 @@ impl Scan {
                 frontmatter,
                 frontmatter_title,
                 body_start,
+                starts: line_starts(source),
+                last_line: line_count(source),
                 ..Scan::default()
             },
         }
         .run()
+    }
+
+    /// The 1-based line `offset` falls on, counted the way [`Section::lines`]
+    /// counts.
+    fn line(&self, offset: usize) -> usize {
+        line_of(&self.starts, self.last_line, offset)
     }
 }
 
@@ -355,6 +379,9 @@ struct RawLink {
     /// text: together they sort the links into document order.
     block: usize,
     offset: usize,
+    /// Byte offset in the source of the text the link was read from: the line
+    /// it starts on is what a caller is told ([`Link::line`]).
+    at: usize,
 }
 
 /// A destination as written, before it is resolved.
@@ -376,6 +403,11 @@ struct Block {
     links: Vec<Pending>,
     /// Offset in `text` up to which wikilinks have been looked for.
     scanned_to: usize,
+    /// Where the scan was left, and the source offset of the run of text that
+    /// left it there: a wikilink whose `[[` straddles two runs — the text
+    /// arrives split at every bracket, and a break inside a wikilink splits it
+    /// again — is on the line of the run that opened it ([`Link::line`]).
+    open_at: Option<(usize, usize)>,
 }
 
 impl Block {
@@ -386,6 +418,7 @@ impl Block {
             text: String::new(),
             links: Vec::new(),
             scanned_to: 0,
+            open_at: None,
         }
     }
 
@@ -393,24 +426,42 @@ impl Block {
     /// display text behind so that sentences read as prose — including the
     /// brackets of a wikilink that resolves to no file, which is dropped later.
     ///
+    /// `at` is the source byte offset of the run of text this was called for: a
+    /// wikilink read out of one run is on the line that offset falls on.
+    ///
     /// Text arrives split at every bracket, so this runs after each addition
     /// and picks up where it left off.
-    fn resolve_wikilinks(&mut self, heading: Option<usize>) {
+    fn resolve_wikilinks(&mut self, heading: Option<usize>, at: usize) {
         loop {
             let Some(open) = self.text[self.scanned_to..]
                 .find("[[")
                 .map(|at| self.scanned_to + at)
             else {
                 // Nothing open. Leave a trailing `[` unscanned: the text
-                // arrives split at brackets, so its partner may be next.
+                // arrives split at brackets, so its partner may be next — and
+                // remember which run left it, because the `[[` it is waiting for
+                // may be the one whose first bracket is already there
+                // ([`Block::open_at`]). Nothing else is pending: the scan is at
+                // the end of the text, and the run that comes next opens
+                // whatever it finds.
                 self.scanned_to = match self.text.char_indices().next_back() {
                     Some((index, '[')) => index,
                     _ => self.text.len(),
                 };
+                self.open_at = match self.text[self.scanned_to..].starts_with('[') {
+                    true => Some((self.scanned_to, at)),
+                    false => None,
+                };
                 return;
             };
             let Some(close) = self.text[open + 2..].find("]]") else {
-                // An unclosed `[[`: whatever closes it may still arrive.
+                // An unclosed `[[`: whatever closes it may still arrive. The run
+                // that opened it is the one the scan was already waiting in, so
+                // an opener recorded at this same position keeps its line and a
+                // later run — a break inside the link — does not take it over.
+                if self.open_at.is_none_or(|(left, _)| left != open) {
+                    self.open_at = Some((open, at));
+                }
                 self.scanned_to = open;
                 return;
             };
@@ -429,6 +480,12 @@ impl Block {
                 offset: open,
                 heading,
                 block: self.index,
+                // The run that opened the link, not the one that closed it: a
+                // link split across two is on the line it starts on.
+                at: match self.open_at {
+                    Some((left, at)) if left == open => at,
+                    _ => at,
+                },
             });
         }
     }
@@ -452,6 +509,9 @@ struct Pending {
     offset: usize,
     heading: Option<usize>,
     block: usize,
+    /// Byte offset in the source of the text this was read from
+    /// ([`RawLink::at`]).
+    at: usize,
 }
 
 #[derive(Debug)]
@@ -460,6 +520,8 @@ struct OpenLink {
     /// Offset of the anchor in the block's text.
     offset: usize,
     block: usize,
+    /// Byte offset in the source of the link's opening bracket.
+    at: usize,
 }
 
 struct Walker<'a> {
@@ -489,10 +551,10 @@ impl<'a> Walker<'a> {
                 Event::End(tag) => self.end(tag),
                 Event::Text(text) => {
                     let linkable = self.verbatim == 0;
-                    self.plain(&text, linkable);
+                    self.text_run(&text, linkable, range.start);
                 }
-                Event::Code(code) => self.plain(&code, false),
-                Event::SoftBreak | Event::HardBreak => self.plain(" ", true),
+                Event::Code(code) => self.text_run(&code, false, range.start),
+                Event::SoftBreak | Event::HardBreak => self.plain(" ", true, range.start),
                 // Raw HTML is not text, so it cannot be part of a wikilink.
                 Event::Html(_) | Event::InlineHtml(_) => self.break_scan(),
                 _ => {}
@@ -541,6 +603,7 @@ impl<'a> Walker<'a> {
                         dest: RawDest::Markdown(dest_url.to_string()),
                         offset,
                         block,
+                        at,
                     });
                 }
             }
@@ -569,6 +632,7 @@ impl<'a> Walker<'a> {
                     offset: open.offset,
                     heading: self.current,
                     block: open.block,
+                    at: open.at,
                 });
             }
             TagEnd::Image => self.verbatim = self.verbatim.saturating_sub(1),
@@ -590,13 +654,36 @@ impl<'a> Walker<'a> {
         }
     }
 
+    /// One run of text from the source, read a line at a time.
+    ///
+    /// A paragraph's text arrives split at every break, but a fenced block's
+    /// body is one run covering every line of it: reading it line by line is
+    /// what keeps `at` — and so the line a wikilink inside it is on — the line
+    /// the text is written on ([`Link::line`]) rather than the run's first. The
+    /// block's own text is the same either way: whitespace collapses to one
+    /// space wherever the characters arrive, and no character is dropped.
+    fn text_run(&mut self, text: &str, linkable: bool, at: usize) {
+        if !text.contains('\n') {
+            self.plain(text, linkable, at);
+            return;
+        }
+        let mut at = at;
+        for line in text.split_inclusive('\n') {
+            self.plain(line, linkable, at);
+            at += line.len();
+        }
+    }
+
     /// Adds prose to the innermost block, whitespace collapsed. The block's
     /// text never starts with whitespace, so an offset into it stays valid
     /// after the trailing whitespace is trimmed at flush time.
     ///
     /// `linkable` is false for text that is not prose: code, and the display
     /// text of a link or image.
-    fn plain(&mut self, text: &str, linkable: bool) {
+    ///
+    /// `at` is where this text starts in the source, which is what tells a
+    /// wikilink found in it the line it is on ([`Link::line`]).
+    fn plain(&mut self, text: &str, linkable: bool, at: usize) {
         self.ensure_block();
         let heading = self.current;
         let Some(block) = self.blocks.last_mut() else {
@@ -612,7 +699,7 @@ impl<'a> Walker<'a> {
             }
         }
         if linkable {
-            block.resolve_wikilinks(heading);
+            block.resolve_wikilinks(heading, at);
         } else {
             block.scanned_to = block.text.len();
         }
@@ -657,6 +744,7 @@ impl<'a> Walker<'a> {
                 heading,
                 block: pending.block,
                 offset: pending.offset,
+                at: pending.at,
             });
         }
         if block.kind == BlockKind::Paragraph && !text.is_empty() {

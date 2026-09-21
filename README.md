@@ -22,8 +22,9 @@ and letting the agent browse burns context on what is a string of quick relevanc
 > title, frontmatter, heading sections with line ranges, and outgoing links), the Jev judgment
 > from [#5](https://github.com/mikekelly/s1m/issues/5) (`s1m::jev` scores one file per request,
 > returning a relevance score for the file, a score per heading section and a scent for each of
-> its links; a file whose sections and links do not fit the API's state budget in one request is
-> split across several), the walk from
+> its links; one whose sections and links do not fit the API's state budget in one request is
+> split across several, and one longer than the 40,000 characters a post carries is split by its
+> own heading tree, so the tail the cap used to cut is judged like the rest of it), the walk from
 > [#6](https://github.com/mikekelly/s1m/issues/6) (`s1m::traverse` searches the link graph
 > best-first against an injected `s1m::scorer::Scorer`), the cache from
 > [#7](https://github.com/mikekelly/s1m/issues/7), which keeps those answers on disk so a repeat
@@ -764,8 +765,9 @@ licence and commit
 `eval/cache/` holds the answers [`eval/REPORT.md`](eval/REPORT.md) was written from, which is
 what lets that report be checked without a key. `src/jev.rs` tags each answer with the question id it
 came back under, so answers land on their own section and their own link; a link whose target
-cannot be read is still judged, from the text the caller wrote about it, and a section of a file
-long enough to be truncated is judged from its heading and lines, the same way.
+cannot be read is still judged, from the text the caller wrote about it, and a page longer than
+one post carries is split by its own heading tree, so a section past the cap is judged from the
+text it is written in rather than from its heading.
 
 ## Development
 
