@@ -286,8 +286,12 @@ which is how `via` and a link's target are spelled within a run.
 
 A path can be admitted and pruned later, by `beam` or by `max_files`: both budgets are read when
 the walk takes a path off the frontier and not when a link queues it, so a replay has both
-records and knows the path never became a visit. A file the walk could not judge keeps what
-happened to it — a `popped`, a `requested`, and no `answered`.
+records and knows the path never became a visit. A path can also be popped more than once — a
+round's own answers can overtake a file it popped, and the walk puts it back on the frontier with
+the answer it already bought — in which case its `requested` and `answered` come with the first
+pop and its `result` with the last. A file the walk could not judge keeps what happened to it: a
+`popped`, and a `requested` when it reached the scorer. A page that could not be read never
+reached it, so its trace is the pop alone, and no `answered` is written for either.
 
 ```bash
 s1m --trace run.jsonl "how do I cut a release and publish the package" \

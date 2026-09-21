@@ -6,8 +6,9 @@
 //! trace says what it did, in the order it did it, so a player can animate the
 //! crawl and the list filling in. Every record is written as its event
 //! happens, and nothing is held back beyond the line being written, so a run
-//! that is killed leaves a trace of everything up to the kill, and a record is
-//! a whole line or no line at all.
+//! that is killed leaves a trace of everything up to the kill — and a record is
+//! a whole line or no line at all: a write that fails part way through is rolled
+//! back to the last whole line, and there the trace ends.
 //!
 //! Off is off. No record is built and no call site does anything but ask
 //! whether a trace was asked for; a record never changes what the walk decides;
@@ -55,14 +56,18 @@ pub struct Trace {
     warned: AtomicBool,
 }
 
-/// The writer: the file, and the one line at a time that is being written.
+/// The writer: the file, the one line at a time that is being written, and how
+/// much of the file is whole lines.
 ///
 /// The buffer is kept across records rather than allocated per record, and a
-/// record is serialized into it whole and written with one `write_all`, so a
-/// killed run leaves no half-written line for a reader to trip over.
+/// record is serialized into it whole and written with one `write_all`. `written`
+/// is the length of the file at the last whole line, which is what a write that
+/// fails part way through is rolled back to: what is left on disk is a shorter
+/// trace and never a fragment for a reader to trip over.
 struct Out {
     file: File,
     line: Vec<u8>,
+    written: u64,
 }
 
 /// The root and the cutoff, and not the file or the line being written:
@@ -87,8 +92,11 @@ impl Trace {
     pub fn create(path: &Path, root: &Path, threshold: f64) -> io::Result<Trace> {
         Ok(Trace {
             out: Mutex::new(Out {
+                // `create` truncates, so nothing is written before the first
+                // record and the whole-line length starts at zero.
                 file: File::create(path)?,
                 line: Vec::new(),
+                written: 0,
             }),
             start: Instant::now(),
             root: root.to_path_buf(),
@@ -106,6 +114,13 @@ impl Trace {
     /// A file the walk took off the frontier, entries and all: the entry files
     /// the caller named are popped first, at path score 1, depth 0 and no
     /// `via`.
+    ///
+    /// A path can be popped more than once. A round's own answers can overtake a
+    /// file the round popped — a better path to it arrived while the round was
+    /// being scored — and the walk puts it back on the frontier with the answer
+    /// it has already bought, so its turn comes again. Both pops are in the
+    /// trace: the first is where the request and the answer for that file are,
+    /// the last is the one the visit follows.
     pub fn popped(&self, path: &Path, path_score: f64, depth: usize, via: &[PathBuf]) {
         self.record(Event::Popped {
             t_ms: self.now(),
@@ -193,27 +208,56 @@ impl Trace {
     ///
     /// Best-effort, the way a cache entry that cannot be stored is: a trace that
     /// cannot be written must not fail a run whose judgments are already paid
-    /// for. The first failure says so once on stderr rather than silently,
-    /// because a caller who asked for a trace is reading it.
+    /// for. The first failure says so once on stderr and stops the tracing
+    /// rather than silently carrying on, because a caller who asked for a trace
+    /// is reading it — and a file that failed once is one no later record can be
+    /// trusted to land in.
     fn record(&self, event: Event<'_>) {
-        // A thread that panicked while holding the lock left a line buffer and
-        // a file that are still usable: a trace with a gap in it beats no trace.
+        // A thread that panicked while holding the lock left a file that is
+        // still usable: a trace with a gap in it beats no trace.
         let mut out = self
             .out
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let Out { file, line } = &mut *out;
-        line.clear();
-        let written = match serde_json::to_writer(&mut *line, &event) {
-            Ok(()) => {
-                line.push(b'\n');
-                file.write_all(line).map_err(|source| source.to_string())
-            }
-            Err(source) => Err(source.to_string()),
-        };
-        if let Err(reason) = written
-            && !self.warned.swap(true, Ordering::Relaxed)
+        if self.warned.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut failure = None;
         {
+            let Out {
+                file,
+                line,
+                written,
+            } = &mut *out;
+            line.clear();
+            match serde_json::to_writer(&mut *line, &event) {
+                Ok(()) => {
+                    line.push(b'\n');
+                    match file.write_all(line) {
+                        Ok(()) => *written += line.len() as u64,
+                        Err(source) => {
+                            // `write_all` can leave part of the record behind,
+                            // so the file goes back to the last whole line: the
+                            // trace is shorter than the run, and a reader never
+                            // meets a line it cannot parse.
+                            let _ = file.set_len(*written);
+                            failure = Some(source.to_string());
+                        }
+                    }
+                }
+                Err(source) => failure = Some(source.to_string()),
+            }
+        }
+        if let Some(reason) = failure {
+            self.failed(&reason);
+        }
+    }
+
+    /// One line on stderr the first time a record cannot be written, and the end
+    /// of this run's tracing: the file is left as the trace of what happened up
+    /// to there.
+    fn failed(&self, reason: &str) {
+        if !self.warned.swap(true, Ordering::Relaxed) {
             eprintln!("s1m: could not write the trace: {reason}");
         }
     }

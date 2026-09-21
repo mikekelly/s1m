@@ -247,14 +247,17 @@ impl Scorer for Fake {
 }
 
 /// The request the CLI's judge builds for a page: the page itself, which is all
-/// the fake's answer depends on.
+/// the fake's answer depends on. The query is asserted here because this is where
+/// a run's query arrives — the run goes through [`Uncached`], which builds the
+/// request and calls [`Cacheable::call`] rather than [`Scorer::score`].
 #[async_trait::async_trait]
 impl Cacheable for Fake {
     type Request = PathBuf;
     /// What a call cost: nothing the tests read, so nothing is reported.
     type Detail = ();
 
-    fn request(&self, _query: &str, file: &ParsedFile) -> Result<PathBuf, ScorerError> {
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<PathBuf, ScorerError> {
+        assert_eq!(query, QUERY, "the run's query reaches the scorer");
         Ok(file.path.clone())
     }
 

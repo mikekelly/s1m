@@ -2211,6 +2211,71 @@ async fn the_answers_a_cache_served_are_reported_as_cached() {
     );
 }
 
+/// A page that is not there is reached and never read: the trace has its pop and
+/// nothing else, because there is no request to make for a file that could not be
+/// parsed — which is a different shape from a page the scorer was asked about and
+/// refused.
+#[tokio::test]
+async fn a_file_that_could_not_be_read_has_only_its_pop() {
+    let tree = Tree::new("trace-unreadable");
+    // The entry links a page that is not written, which is a broken link.
+    tree.page("index.md", &["gone.md".to_string()]);
+    let traced = Traced::new("trace-unreadable-file", &tree.root(), 0.6);
+    let scorer = traced
+        .judge(Fake::new(&[("index.md", Entry::new(0.9, &[("gone.md", 0.9)]))]).over(tree.root()));
+
+    let traversal = Settings::over(tree.root(), &["index.md"])
+        .traced(&scorer, traced.walk())
+        .await;
+
+    assert_eq!(failures(&traversal).len(), 1, "the one page that failed");
+    assert_eq!(
+        traced
+            .records()
+            .iter()
+            .filter(|record| record["path"] == "gone.md")
+            .map(|record| record["event"].as_str().expect("an event name"))
+            .collect::<Vec<_>>(),
+        ["popped"],
+        "a page that could not be read is never sent and never answered"
+    );
+}
+
+/// A file that links twice to a target the root's `.s1mignore` matches has one
+/// link there, the way a file that links twice to a target the scorer judged has
+/// one: the trace reports a target once whether it was judged or never sent at
+/// all, and a player is not asked to draw the same edge twice.
+#[tokio::test]
+async fn a_matched_target_named_twice_is_reported_once() {
+    let tree = Tree::new("trace-ignored-twice");
+    tree.page(
+        "index.md",
+        &["private/x.md".to_string(), "private/x.md".to_string()],
+    );
+    fs::write(tree.root().join(".s1mignore"), "private/\n").expect("a .s1mignore");
+    let traced = Traced::new("trace-ignored-twice-file", &tree.root(), 0.6);
+    let scorer = traced.judge(Fake::new(&[("index.md", Entry::new(0.9, &[]))]).over(tree.root()));
+
+    Settings::over(tree.root(), &["index.md"])
+        .traced(&scorer, traced.walk())
+        .await;
+
+    let records = traced.records();
+    let pruned: Vec<&Value> = records
+        .iter()
+        .filter(|record| record["event"] == "pruned")
+        .collect();
+    assert_eq!(
+        pruned.len(),
+        1,
+        "one record for the two links to the matched page: {records:?}"
+    );
+    assert_eq!(pruned[0]["source"], "index.md");
+    assert_eq!(pruned[0]["target"], "private/x.md");
+    assert_eq!(pruned[0]["scent"], Value::Null);
+    assert_eq!(pruned[0]["reason"], "ignored");
+}
+
 /// A link that queued nothing is in the trace with the reason the walk read it
 /// by: the depth budget for a hop past it, and no judgment at all for a target
 /// the scorer named no scent for.

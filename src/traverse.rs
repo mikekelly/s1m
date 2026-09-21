@@ -736,13 +736,18 @@ impl<'a> Search<'a> {
         let scorer = self.scorer;
         join_all(batch.iter().map(|entry| async move {
             let mut file = parse(root.join(&entry.path), root)?;
-            let mut ignored = Vec::new();
+            let mut ignored: Vec<PathBuf> = Vec::new();
             file.links.retain(|link| {
-                let matched = ignore.matched(&link.target);
-                if matched {
+                if !ignore.matched(&link.target) {
+                    return true;
+                }
+                // One entry per target, the way the file's judged links are
+                // reported: a file that links twice to a matched target has one
+                // link there and not two.
+                if !ignored.contains(&link.target) {
                     ignored.push(link.target.clone());
                 }
-                !matched
+                false
             });
             let judgment = scorer.score(query, &file).await?;
             Ok(Answered {
