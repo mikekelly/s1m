@@ -60,7 +60,7 @@ Each round expands the top-k frontier files concurrently, so latency is one roun
 
 ### One request per file
 
-Jev answers independent questions over the same state in parallel, so each visited file is a single request — unless its sections and links do not fit the API's 32k state budget in one, when it is split and the answers merged (see `docs/spike-notes.md`). The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph) read from disk.
+Jev answers independent questions over the same state in parallel, so each visited file is a single request — unless its sections and links do not fit the API's 32k state budget in one, when it is split and the answers merged (see `docs/spike-notes.md`). The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph, its H2/H3 headings and the anchors of its own in-root links, since [#46](https://github.com/mikekelly/s1m/issues/46)) read from disk.
 
 | Judgment | Primitive | Question | Used for |
 | --- | --- | --- | --- |
@@ -128,15 +128,24 @@ flags above. No default moved:
 
 | Flag | Default | What the numbers say |
 | --- | --- | --- |
-| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.64 over 35771 read tokens, 0.5 lifts recall to 0.72 for +41% of the reading, 0.7 drops it to 0.47 for -27% and 0.8 to 0.33 for -70%. The walk's own decisions carry the same signal — the links it followed reach a wanted page 0.37 of the time, the ones it passed over 0.11 |
+| `--threshold` | 0.6 | The knee of the sweep at `--max-files` 10: the walk at 0.6 has a mean recall of 0.83 over 68663 read tokens, 0.5 lifts recall to 0.88 for +50% of the reading, 0.7 drops it to 0.67 for -40% and 0.8 to 0.53 for -70%. The links the walk followed reach a wanted page 0.18 of the time against 0.14 for the ones it passed over — thinner than the 0.37/0.11 the same walk showed before [#46](https://github.com/mikekelly/s1m/issues/46), because a richer link state puts more links over the line. The knee is where it was; whether 0.6 is still the best cut under the new state is a question for the next tuning pass |
 | `--max-files` | 25 | Not what binds on this corpus: 25 judges 87 files instead of 85 and returns 73 of them instead of 71, for the same mean recall of 0.64 and 40468 read tokens instead of 35771. On 19 pages a budget of 25 can hold the corpus, so this is a statement about a corpus this size — a larger one is unmeasured |
 | ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
 | ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
 
-Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.18 of
-recall (0.64 → 0.46) for -44% of the input tokens, and dropping previews altogether costs 0.26 —
+Previews stay on, frontmatter included: at `--max-files` 10, dropping the frontmatter costs 0.08 of
+recall (0.83 → 0.75) for -33% of the input tokens, and dropping previews altogether costs 0.47 —
 the frontmatter is the larger half of what a preview buys, `related:` being why (`eval/REPORT.md`,
 the preview experiment).
+
+What a preview was missing is now in it. [#46](https://github.com/mikekelly/s1m/issues/46) measured
+three additions against the one-hop state — the target's H2/H3 headings, the anchor text of its own
+in-root links, and the link question asked about two hops — and all three ship: 0.64 → 0.83 mean
+recall on the vendored wiki and 0.57 → 0.87 on a private one, for 2.3× the input tokens, at
+precision 0.26 and 0.21. The probe the spike left open — the `via` path in the state — was measured
+and dropped (no effect on either set). The ablations, both gold sets and the decision are in
+`eval/REPORT.md` and `docs/spike-notes.md`, and the three hidden flags that take each part away are
+what keeps them measurable.
 
 The flag table above is what the code holds — `src/main.rs` for the numbers, `JevScorer::from_env`
 for previews with frontmatter and the frontmatter inside them — so the decision is this record and
@@ -200,12 +209,20 @@ The tool description agents see should state plainly that s1m reads local files 
 - [ ] Python or TypeScript? Both have TypeSafe SDKs.
 - [x] Does a link preview (title plus first paragraph) improve scent enough to justify the extra
   tokens? **Yes, and the frontmatter is the larger half of it.** At `--max-files` 10 on the eval
-  wiki, dropping the frontmatter costs 0.18 of recall (0.64 → 0.46) for 44% of the input tokens
-  saved, and dropping previews altogether costs 0.26; on the hub page the frontmatter is what lifts
+  wiki, dropping the frontmatter costs 0.08 of recall (0.83 → 0.75) for a third of the input tokens
+  saved, and dropping previews altogether costs 0.47; on the hub page the frontmatter is what lifts
   the links to two of the wanted pages over `--threshold`. `related:` making every page look
   connected is the opposite failure to the one [#10](https://github.com/mikekelly/s1m/issues/10)
   feared. Previews therefore ship whole, with no caller flag (`eval/REPORT.md`, the preview
   experiment).
+- [x] Is one hop of preview enough for a link two hops from the answer? **No: the target's headings
+  and its own link anchors belong in the preview, and the link question should say how far it
+  reaches.** [#46](https://github.com/mikekelly/s1m/issues/46) measured the three additions and all
+  three ship: 0.64 → 0.83 mean recall on the vendored wiki, 0.57 → 0.87 on a private one with its
+  five zero-recall queries all found, for 2.3× the input tokens. The `via` path in the state was
+  measured and dropped. What remains unreached is the page nothing links to well, which is
+  [#42](https://github.com/mikekelly/s1m/issues/42)'s catalogue pass
+  (`docs/spike-notes.md`, "The link context"; `eval/REPORT.md`, the link-context ablations).
 - [x] Is a Score the right primitive for file relevance, or is a Noul simpler and good enough?
   **Keep the Score.** The reading list is ordered and sorted by relevance, and a Score answers on
   that scale where a Noul's 0.5 means unsure rather than middling; its separate `confidence` is

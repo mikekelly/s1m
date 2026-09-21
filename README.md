@@ -117,54 +117,57 @@ buys one answer per file):
 {
   "query": "how do I cut a release and publish the package",
   "mode": "useful-for",
-  "visited": 5,
+  "visited": 6,
   "calls": 0,
   "results": [
     {
       "path": "eval/wikis/llm-wiki-manager/wiki/concepts/release.md",
-      "relevance": 0.7833333333333333,
-      "scent": 0.88,
+      "relevance": 0.7633333333333333,
+      "scent": 0.89,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
       "sections": [
         {
           "heading": "Release",
           "lines": [12, 26],
-          "score": 0.74
+          "score": 0.76
         }
       ],
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
-          "scent": 0.32,
+          "scent": 0.53,
           "followed": false
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md",
-          "scent": 0.19,
+          "scent": 0.44,
           "followed": false
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
-          "scent": 0.16,
+          "scent": 0.61,
           "followed": false
         }
       ]
-    }
+    },
+    … (the entry page, `repo-layout.md` and `dogfooding.md`, the rest of the list)
   ],
   "walked": [
     {
       "path": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
       "relevance": 0.5566666666666666,
-      "scent": 0.7,
+      "scent": 0.67,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
-          "scent": 0.19,
+          "scent": 0.84,
           "followed": false
-        }
+        },
+        … (four more links, elided)
       ]
-    }
+    },
+    … (`template-system.md`, elided)
   ]
 }
 ```
@@ -190,7 +193,7 @@ Both lists are elided for length: the run returns three results and reports two 
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
 | `--max-files` | 25 | Files the walk judges beyond the entry files, which are always visited and free. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over two more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.64 to 0.72 for 41% more reading, 0.7 drops it to 0.47 for 27% less ([numbers](eval/REPORT.md#the-default-threshold)) |
+| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.83 to 0.88 for half again the reading, 0.7 drops it to 0.67 for 40% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | `json` (the list above), `md` (what to read: the results, with the lines worth reading) or `tree` (the walk's link tree, `walked` files included) |
@@ -217,34 +220,40 @@ s1m --format md "how do I cut a release and publish the package" \
 ```markdown
 # Reading list: how do I cut a release and publish the package
 
-Criterion: useful-for; 5 files visited, 0 calls
+Criterion: useful-for; 6 files visited, 0 calls
 
 ## 1. `eval/wikis/llm-wiki-manager/wiki/concepts/release.md`
 
-relevance 0.78; scent 0.88; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.76; scent 0.89; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 12-26, score 0.74, Release
+- lines 12-26, score 0.76, Release
 
 ## 2. `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-relevance 0.72; entry file
+relevance 0.76; entry file
 
-- lines 22-35, score 0.62, Concepts
+- nothing above --threshold
 
-## 3. `eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md`
+## 3. `eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md`
 
-relevance 0.61; scent 0.87; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.66; scent 0.75; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 32-41, score 0.64, README vs wiki
+- lines 55-66, score 0.61, Toolchain
+
+## 4. `eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md`
+
+relevance 0.60; scent 0.80; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- lines 32-41, score 0.62, README vs wiki
 ```
 
 This is that query from the cache, so it reports no calls and its digits are the stored answers;
-`md` is the same reading list either way. It prints three files where the JSON above visits
-five: `node-version-and-types.md` and `init-command.md` earned no place, so they are not
-something to paste into a task, and the header still says how many files the walk visited. A
-result whose sections all fell below `--threshold` says so in place of a section line, and a
-section with no heading of its own — the text before a file's first heading — reads
-`(preamble)` where the heading would be.
+`md` is the same reading list either way. It prints the four files the JSON returns and none of
+the two it walked: `node-version-and-types.md` and `template-system.md` earned no place, so they
+are not something to paste into a task, and the header still says how many files the walk
+visited. A result whose sections all fell below `--threshold` says so in place of a section line
+— the entry page above — and a section with no heading of its own, the text before a file's first
+heading, reads `(preamble)` where the heading would be.
 
 `tree` is the walk as it happened: every file it visited — the `results` and the `walked` alike
 — and beneath each one every link the model judged, in the order the frontier would have taken
@@ -259,34 +268,36 @@ s1m --format tree "how do I cut a release and publish the package" \
 ```
 
 ```text
-how do I cut a release and publish the package (useful-for); 5 files visited, 0 calls
+how do I cut a release and publish the package (useful-for); 6 files visited, 0 calls
 
-eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.72
-  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.88; relevance 0.78
-    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.32
-    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.19
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.16
-  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.87; relevance 0.61
-    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.91
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.24
+eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.76
+  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.89; relevance 0.76
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.61
+    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.53
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.44
+  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.80; relevance 0.60
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.92
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.81
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.70; relevance 0.56
-    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.90
+  eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  followed; scent 0.75; relevance 0.66
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.93
+    eval/wikis/llm-wiki-manager/wiki/concepts/template-system.md  followed; scent 0.65; relevance 0.29
+      eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.85
+      ...
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md  followed; scent 0.68; relevance 0.27
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.32
+  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.67; relevance 0.56
     ...
   ...
 ```
 
 The `...` lines are links the walk passed over, elided here; the run prints every one of them.
 The tree is where the walk's own answers show. `release.md` is the best page in the list and the
-entry follows the link at 0.88; `dogfooding.md`'s stronger-looking link to it, at 0.91, is
+entry follows the link at 0.89; `dogfooding.md`'s stronger-looking link to it, at 0.92, is
 `pruned`, because the file had already been reached and a file is visited once, along the best
 path found to it. The other pruned lines are links the model scored below `--threshold`, which
-is why five files are where the walk spent its calls. A tree with more files on it than the list
-has is the cutoff at work: `node-version-and-types.md` at 0.56 and `init-command.md` at 0.27 are
-walked rather than returned, and they are here because the links under them are how the walk
+is why six files are where the walk spent its calls. A tree with more files on it than the list
+has is the cutoff at work: `node-version-and-types.md` at 0.56 and `template-system.md` at 0.29
+are walked rather than returned, and they are here because the links under them are how the walk
 reached the rest of the wiki. Roots are the files no link reached: the entry files the caller
 named, marked `entry file`. A link whose target the model never judged prints `scent unknown` —
 such a link can never be followed, and a 0.00 would read as a judgment when none was made.
@@ -344,15 +355,33 @@ is bought.
 ### What is sent about each link
 
 Every request carries, per outgoing link, its anchor, the sentence around it and its enclosing
-heading, plus a preview of the target read from disk: its title, its frontmatter and its first
-paragraph. Previews are always on for a query — the spike measured them as the signal that
-separates a page which says nothing from one whose own links point at the answer, at roughly
-250 input tokens a link, and a threshold tuned with previews is not valid without them
+heading, and a preview of the target read from disk:
+
+| Part of the preview | What it is |
+| --- | --- |
+| `title`, `first_paragraph` | The target's title and its opening paragraph, each cut at 600 characters |
+| `frontmatter` | Its frontmatter fields, whole and in the page's own order, up to 1,200 characters |
+| `headings` | Its own H2 and H3 headings, in order, up to 40 of them and each cut at 80 characters |
+| `leads_to` | The anchor text of its own in-root links, in order, deduped, up to 30 and each cut at 60 characters |
+
+`headings` and `leads_to` are one hop of lookahead past the target, and they are there because a
+link's own sentence and the target's opening line do not always say what sits under the page: a
+hub links to "Payments" whose first paragraph is about payments, while the query's answer is in
+the section called "Cutoffs". The link question is asked about what the link reaches *directly or
+through the pages it links to*, which is the same idea put to the model. Together they are worth
+0.19 of mean recall on the eval's gold set (0.64 → 0.83) for 2.3× the input tokens
+([#46](https://github.com/mikekelly/s1m/issues/46), [eval/REPORT.md](eval/REPORT.md#the-link-context-what-the-state-carries-and-what-each-part-earns));
+each part's own contribution is the ablation table there, and each has a hidden flag that leaves
+it out (`--no-preview-headings`, `--no-preview-leads`, `--one-hop-links`).
+
+Previews are always on for a query — the spike measured them as the signal that separates a page
+which says nothing from one whose own links point at the answer, at roughly 250 input tokens a
+link, and a threshold tuned with previews is not valid without them
 ([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
 caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
 is the part of a preview most likely to mislead, and the eval put a number on it: dropping the
-frontmatter costs 0.18 of mean recall (0.64 → 0.46) for 44% of the input tokens saved, and
-dropping previews altogether costs 0.26, so the frontmatter is the larger half of what a preview
+frontmatter costs 0.08 of mean recall (0.83 → 0.75) for a third of the input tokens saved, and
+dropping previews altogether costs 0.47, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
 Every part of a preview is bounded, because a preview is a hint about a target and the target is
@@ -361,7 +390,9 @@ state of every page that links to it ([#37](https://github.com/mikekelly/s1m/iss
 first paragraph is cut at 600 characters, the title at 600, and the frontmatter at 1,200
 characters of whole fields in the target's own order. The largest frontmatter block on either
 vendored wiki is 653 characters of text, which that cap counts as 562, so no measured page is
-cut by any of those bounds.
+cut by any of those bounds. A page whose state does not fit the API's budget is split across
+requests rather than trimmed further, so what the bounds buy is a hint that stays a hint, not a
+link that goes unjudged.
 
 ### Keeping paths out of it: `.s1mignore`
 
@@ -450,8 +481,10 @@ s1m score-file --no-previews "how does s1m decide which links to follow" \
 ```
 
 `--root DIR` sets the directory links resolve against (the file's own directory by default), and
-`--no-previews` leaves the target's title, frontmatter and first paragraph out of the request,
-which is the control case for whether a preview earns its tokens. The root's
+`--no-previews` leaves the whole preview out of the request, which is the control case for whether
+a preview earns its tokens. The hidden `--no-preview-headings`, `--no-preview-leads` and
+`--one-hop-links` do the same one part at a time — the ablations the eval measures
+([#46](https://github.com/mikekelly/s1m/issues/46)) — and the root's
 [`.s1mignore`](#keeping-paths-out-of-it-s1mignore) applies here too: a file it matches is an
 error naming it, and a link to one is not judged at all.
 
@@ -525,9 +558,12 @@ recall and precision against the gold set — the list holds only the files that
 precision is reported over that list and over everything the walk judged — the tokens an agent
 would read (the returned ranges, the same files whole, and the whole corpus), what the API was
 asked and what it cost, the same numbers for the keyword ranker, the calibration curve of a
-link's scent against what following it reached, a `--threshold` sweep, and the preview
-experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred — previews off, previews
-without frontmatter, previews as they ship.
+link's scent against what following it reached, a `--threshold` sweep, the preview experiment
+[#10](https://github.com/mikekelly/s1m/issues/10) deferred — previews off, previews without
+frontmatter, previews as they ship — and the link-context ablations
+[#46](https://github.com/mikekelly/s1m/issues/46): the target's headings, its lead anchors and the
+two-hop link question each taken away in turn, with the requests each one took (requests per
+answer is what a preview that costs more per link costs in posts).
 
 Nothing about a wiki or a gold set is in the harness: both are paths, so the same command
 measures a private wiki, and the gold set's paths are relative to `--wiki`. The report is
@@ -537,18 +573,20 @@ the same bytes with no key at all, and `--no-cache` with a key buys every judgme
 
 Its headline, in three lines:
 
-- **Recall and precision at `--max-files` 10**: mean recall 0.64, mean precision 0.30 — 22 of the
-  39 wanted pages, over 71 files returned. The cutoff is what moved them: the walk judged 85
-  files and the list returns the 71 that earned a place, which took precision from 0.27 to 0.30
-  and cost one wanted page (0.67 → 0.64). The budget is not what binds: the walk runs out of
-  links above `--threshold` first, and `--max-files 25` judges 87 files for the same numbers.
-- **What an agent reads**: 35,771 tokens for the returned ranges, against 62,085 for the same
+- **Recall and precision at `--max-files` 10**: mean recall 0.83, mean precision 0.26 — 32 of the
+  39 wanted pages, over 129 files returned. The cutoff is what moved them: the walk judged 181
+  files and the list returns the 129 that earned a place. The budget is not what binds: the walk
+  runs out of links above `--threshold` first, and `--max-files 25` judges 202 files for the same
+  mean recall (0.83).
+- **What an agent reads**: 68,663 tokens for the returned ranges, against 122,023 for the same
   files whole and 346,160 for every page on every query. Reading the returned files whole costs
-  18% of the corpus's text; the section scores take 42% off that, and the ranking 90% off reading
+  35% of the corpus's text; the section scores take 44% off that, and the ranking 80% off reading
   everything.
-- **What it costs**: $0.019224 for the gold set at `--max-files 10` — $0.000961 a query, at 0.19 s
-  an answer. On this wiki the keyword ranker finds more and reads far more — recall 0.94 against
-  s1m's 0.64, at 6.8× the tokens.
+- **What it costs**: $0.044431 for the gold set at `--max-files 10` — $0.002222 a query, at 0.19 s
+  an answer. That is the price of the link context below: the state that shipped before
+  [#46](https://github.com/mikekelly/s1m/issues/46) found 0.64 of the wanted pages for $0.019224.
+  On this wiki the keyword ranker still finds more and reads far more — recall 0.94 against s1m's
+  0.83, at 3.5× the tokens.
 
 ## Library
 
@@ -558,10 +596,10 @@ the CLI, so they can be driven directly from tests:
 | Item | What it does |
 | --- | --- |
 | `parse::parse(path, root)` | One file's `title`, `frontmatter`, `sections` (`heading`, `level`, `lines`) and `links` (`target` resolved against `root`, `anchor`, `sentence`, `heading`, `inRoot`) |
-| `parse::preview(path)` | Title, frontmatter and first paragraph of a link target, for link previews |
+| `parse::preview(path, root)` | A link target's `title`, `frontmatter` and `first_paragraph`, plus its own H2/H3 `headings` and the `leads` — the anchor text of its in-root links — for link previews |
 | `ignore::Ignore` | The root's `.s1mignore`: `Ignore::at(root)` reads it (a root without one matches nothing, a file that cannot be read or parsed is an error, and `Ignore::none()` is the empty set), `matched(relative_path)` answers for a path or any directory above it. One value a run is built around, asked by the CLI for its entry files, by the walk for what it may read and link to |
 | `scorer::Scorer` | The judgment every later stage takes as an injected dependency: `async fn score(query, &ParsedFile) -> FileJudgment`, where `FileJudgment` is `relevance` (0 to 1), one `SectionJudgment` (`heading`, `lines` as the parser gave them, `score` 0 to 1) per section and one `LinkJudgment` (`target`, `scent` 0 to 1) per link, each in the file's own order. `#[async_trait]`, so a caller can join a round's calls; tests use a fake |
-| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's state and questions would not fit the API's budgets in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. The split measures what it sends — the file's text, every link's entry and preview, and the questions — at two characters per token against both of the API's budgets, `state` plus the longest question (32k) and the whole request (64k): the JSON of a link table measures 2.5 to 3 characters per token on the API's counter, which is why four was too optimistic ([#37](https://github.com/mikekelly/s1m/issues/37)). `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
+| `jev::JevScorer` | That trait over the TypeSafe HTTP API: one request per file, or several when the file's state and questions would not fit the API's budgets in one — the file goes in each and the answers merge — holding the query, the file, its sections (heading, depth, lines) and, per link, its anchor, sentence, heading and target preview. `jev::Context` is what the state is built from — the preview with or without its frontmatter, the target's headings and lead anchors, and the link question asked about one hop or two — and a CLI run takes any of it away only behind the hidden ablation flags ([#46](https://github.com/mikekelly/s1m/issues/46)). The split measures what it sends — the file's text, every link's entry and preview, and the questions — at two characters per token against both of the API's budgets, `state` plus the longest question (32k) and the whole request (64k): the JSON of a link table measures 2.5 to 3 characters per token on the API's counter, which is why four was too optimistic ([#37](https://github.com/mikekelly/s1m/issues/37)). `from_env(root)` reads `TYPESAFE_API_KEY`, `with_mode(mode)` picks the criterion, `with_previews(false)` drops the previews, `with_preview_frontmatter(false)` drops just the frontmatter from them — the experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred, which [`eval/REPORT.md`](eval/REPORT.md) answers; `judge` also returns the model, token counts, request count and latency of the call |
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |

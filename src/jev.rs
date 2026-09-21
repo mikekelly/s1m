@@ -21,7 +21,7 @@
 //! changing the builder.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -117,6 +117,32 @@ const PREVIEW_LIMIT: usize = 600;
 /// [#37]: https://github.com/mikekelly/s1m/issues/37
 const FRONTMATTER_LIMIT: usize = 1_200;
 
+/// The headings a preview carries at most, from the target's own H2s and H3s
+/// in order ([`JevScorer::with_preview_headings`]).
+///
+/// This and [`LEADS`] are the richer link state
+/// [#46](https://github.com/mikekelly/s1m/issues/46) measures: a link whose
+/// target's first paragraph says nothing about what the target leads to can
+/// still be recognized from the headings under it. Both go through the same
+/// link-table cost the split measures, so a cap here is what keeps a preview a
+/// hint rather than a page.
+///
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+const HEADINGS: usize = 40;
+
+/// One heading of a preview, cut to this many characters and told so in the
+/// text, the way [`clamp`] tells every other part of a preview it was cut.
+const HEADING_LIMIT: usize = 80;
+
+/// The links a preview carries at most, by their anchor text, from the target's
+/// own in-root links in order and deduped
+/// ([`JevScorer::with_preview_leads`]).
+const LEADS: usize = 30;
+
+/// One lead anchor of a preview, cut to this many characters and told so in the
+/// text, the way [`clamp`] tells every other part of a preview it was cut.
+const LEAD_LIMIT: usize = 60;
+
 /// Room left over in a post for what holds it together — the braces, the
 /// commas between items, the `model` field, the escaping of a quote in the
 /// file's own text. A post is only split when the estimate crosses a budget
@@ -143,13 +169,14 @@ const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// [`Mode::custom`] builds one from a criterion of the caller's own. All of them
 /// leave the builder alone: what a run asks is this table, and every field of it
 /// is in the request's bytes, which is what makes one criterion's stored answers
-/// unusable for another's.
+/// unusable for another's. The link question is here twice — one hop, and the
+/// two-hop phrasing [`JevScorer::with_two_hop_links`] switches to — because the
+/// wording is the criterion's, and what a yes means changes with it.
 ///
-/// Only the name and the three questions are [`Cow`]s, because a criteria file
+/// Only the name and the questions are [`Cow`]s, because a criteria file
 /// supplies those in the caller's own words: its path names the mode and its
-/// criterion goes into all three questions. The ladder and the yes/no wording
-/// are this module's and are static, which is why the criteria file borrows
-/// them.
+/// criterion goes into all of them. The ladder and the yes/no wording are this
+/// module's and are static, which is why the criteria file borrows them.
 #[derive(Debug, Clone)]
 pub struct Mode {
     /// The mode's name, as `--mode` spells it; a criteria file's path, as
@@ -176,6 +203,16 @@ pub struct Mode {
     pub link_true: &'static str,
     /// What a no means for that link.
     pub link_false: &'static str,
+    /// The same question asked about two hops instead of one: what this link
+    /// reaches, or what the pages it leads to reach. [`JevScorer::with_two_hop_links`]
+    /// sends this in place of [`Mode::link_question`], because a link to a page
+    /// whose own title and first paragraph say nothing about its parts can still
+    /// be worth following ([#46]). `{index}` is replaced the same way.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    pub link_question_two_hop: Cow<'static, str>,
+    /// What a yes means for that link, when the question is the two-hop one.
+    pub link_true_two_hop: &'static str,
 }
 
 impl Mode {
@@ -213,6 +250,10 @@ impl Mode {
             "Is following `links[{index}]` likely to lead to content that meets this criterion: ",
         );
         link_question.push_str(criterion);
+        let mut link_question_two_hop = String::from(
+            "Is following `links[{index}]` likely to lead, directly or through the pages it links to, to content that meets this criterion: ",
+        );
+        link_question_two_hop.push_str(criterion);
         Mode {
             name: name.into(),
             file_question: Cow::Owned(file_question),
@@ -223,6 +264,8 @@ impl Mode {
             link_question: Cow::Owned(link_question),
             link_true: CRITERION_LINK_TRUE,
             link_false: CRITERION_LINK_FALSE,
+            link_question_two_hop: Cow::Owned(link_question_two_hop),
+            link_true_two_hop: CRITERION_LINK_TRUE_TWO_HOP,
         }
     }
 }
@@ -249,6 +292,10 @@ pub const ABOUT: Mode = Mode {
     ),
     link_true: "The target is about the subject, or is a page of links that lead to pages about it.",
     link_false: OFF_SUBJECT,
+    link_question_two_hop: Cow::Borrowed(
+        "Does following `links[{index}]` lead, directly or through the pages it links to, to content on the subject of `query`?",
+    ),
+    link_true_two_hop: "The target is about the subject, or the pages it links to are.",
 };
 
 /// The default, and the criterion the spike measured: would this help someone
@@ -272,6 +319,10 @@ pub const USEFUL_FOR: Mode = Mode {
     ),
     link_true: "The target is on the subject, or is a page of links that lead to it, so following this link is worth a reader's next step.",
     link_false: OFF_SUBJECT,
+    link_question_two_hop: Cow::Borrowed(
+        "Is following `links[{index}]` likely to lead, directly or through the pages it links to, to content useful for someone doing what `query` describes?",
+    ),
+    link_true_two_hop: "The target is on the subject, or the pages it links to are, so following this link is worth a reader's next step.",
 };
 
 /// Question lookup: the page that answers the query, and the pages on the way
@@ -296,6 +347,10 @@ pub const ANSWERS: Mode = Mode {
     ),
     link_true: "The target contains the answer or part of it, or is a page of links that lead to content that does.",
     link_false: "The target does not answer `query`, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.",
+    link_question_two_hop: Cow::Borrowed(
+        "Does following `links[{index}]` lead, directly or through the pages it links to, to content containing the answer to `query`?",
+    ),
+    link_true_two_hop: "The target contains the answer or part of it, or leads to a page that does.",
 };
 
 /// What a link's no is when the target is not about the subject: `about` and
@@ -320,6 +375,9 @@ const CRITERION_LEVELS: &[&str] = &[
 
 const CRITERION_LINK_TRUE: &str =
     "The target meets the criterion, or is a page of links that lead to content that does.";
+
+const CRITERION_LINK_TRUE_TWO_HOP: &str =
+    "The target meets the criterion, or leads to content that does.";
 
 const CRITERION_LINK_FALSE: &str = "The target does not meet the criterion, or following it reaches nothing to read: navigation, boilerplate, an empty stub, or an unrelated page.";
 
@@ -395,6 +453,30 @@ struct PreviewState {
     #[serde(skip_serializing_if = "Option::is_none")]
     frontmatter: Option<Vec<FrontmatterField>>,
     first_paragraph: Option<String>,
+    /// The target's H2/H3 headings, in order, at most [`HEADINGS`] of them and
+    /// each cut at [`HEADING_LIMIT`] characters. `None` when the run leaves
+    /// them out ([`JevScorer::with_preview_headings`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headings: Option<Vec<String>>,
+    /// The anchor text of the target's own in-root links, in order, deduped, at
+    /// most [`LEADS`] of them and each cut at [`LEAD_LIMIT`] characters.
+    /// `None` when the run leaves them out
+    /// ([`JevScorer::with_preview_leads`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leads_to: Option<Vec<String>>,
+}
+
+/// What every post of one file carries whatever its share of the questions:
+/// the query and the file itself. [`JevScorer::pack`] builds one and hands the
+/// same one to every post.
+///
+/// It is one value rather than two arguments because the two go in together — a
+/// post that carried the file but not the query would be a post about nothing —
+/// and because they are the same bytes in every post of a file, which is what
+/// [`Fixed::state`] measures once.
+struct Head {
+    query: String,
+    file: FileState,
 }
 
 /// One file's request: the body to post, or the bodies when the file's sections
@@ -668,6 +750,68 @@ pub struct JevScorer {
     mode: Mode,
     previews: bool,
     preview_frontmatter: bool,
+    preview_headings: bool,
+    preview_leads: bool,
+    two_hop: bool,
+}
+
+/// The link state a request carries, and the phrasing of the link question it
+/// asks.
+///
+/// What ships since [#46] is every one of these except the switches the
+/// experiment [#10] settled: a preview with the target's title, frontmatter and
+/// first paragraph, its own H2/H3 headings and the anchor text of its own
+/// in-root links, and the link question asked about two hops rather than one.
+///
+/// The whole set is what the evaluation harness's ablation rows and the CLI's
+/// hidden opt-outs are built from, so the two cannot drift.
+///
+/// [#10]: https://github.com/mikekelly/s1m/issues/10
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Context {
+    /// The target's title and first paragraph.
+    pub previews: bool,
+    /// Its frontmatter as well.
+    pub frontmatter: bool,
+    /// Its H2/H3 headings ([`JevScorer::with_preview_headings`]).
+    pub headings: bool,
+    /// The anchor text of its own in-root links
+    /// ([`JevScorer::with_preview_leads`]).
+    pub leads: bool,
+    /// The link question asked about two hops rather than one
+    /// ([`JevScorer::with_two_hop_links`]).
+    pub two_hop: bool,
+}
+
+impl Default for Context {
+    /// What ships.
+    fn default() -> Context {
+        Context::DEFAULT
+    }
+}
+
+impl Context {
+    /// What ships, as a value a `const` can hold: [`Context::default`] is the
+    /// same state, and the evaluation harness's tables are built from this one
+    /// because they are consts.
+    pub const DEFAULT: Context = Context {
+        previews: true,
+        frontmatter: true,
+        headings: true,
+        leads: true,
+        two_hop: true,
+    };
+
+    /// A scorer carrying this state.
+    pub fn apply(self, scorer: JevScorer) -> JevScorer {
+        scorer
+            .with_previews(self.previews)
+            .with_preview_frontmatter(self.frontmatter)
+            .with_preview_headings(self.headings)
+            .with_preview_leads(self.leads)
+            .with_two_hop_links(self.two_hop)
+    }
 }
 
 impl JevScorer {
@@ -685,6 +829,9 @@ impl JevScorer {
             mode: USEFUL_FOR.clone(),
             previews: true,
             preview_frontmatter: true,
+            preview_headings: true,
+            preview_leads: true,
+            two_hop: true,
         })
     }
 
@@ -728,6 +875,61 @@ impl JevScorer {
     /// [#11]: https://github.com/mikekelly/s1m/issues/11
     pub fn with_preview_frontmatter(mut self, frontmatter: bool) -> Self {
         self.preview_frontmatter = frontmatter;
+        self
+    }
+
+    /// Sends each target's own H2/H3 headings with its preview, or leaves them
+    /// out.
+    ///
+    /// Off by default. The experiment [#46] runs: a link is judged from its
+    /// anchor, its sentence and the target's title, frontmatter and first
+    /// paragraph, and a target's first paragraph does not always say what sits
+    /// under it. A hub links to a page called "Payments" whose opening line is
+    /// about payments, while the query's answer is in the section called
+    /// "Cutoffs"; the heading list says so where the paragraph does not, and it
+    /// costs no extra call. Whether it earns the state it adds is the
+    /// evaluation harness's question, so this is an experiment's knob rather
+    /// than a caller's choice until it answers.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    pub fn with_preview_headings(mut self, headings: bool) -> Self {
+        self.preview_headings = headings;
+        self
+    }
+
+    /// Sends the anchor text of each target's own in-root links with its
+    /// preview, or leaves them out.
+    ///
+    /// Off by default, and the same experiment [#46]: one hop of lookahead
+    /// past the target. The link being judged leads to a section page whose
+    /// own links name the topics under it, which is evidence about where the
+    /// walk ends up that the target's own prose may not carry. Read from the
+    /// target's links, which the preview reads anyway — nothing is followed,
+    /// and no page is read for this that no preview would read — and bounded by
+    /// [`LEADS`] and [`LEAD_LIMIT`] so that one hub cannot fill the state of
+    /// every page that links to it.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    pub fn with_preview_leads(mut self, leads: bool) -> Self {
+        self.preview_leads = leads;
+        self
+    }
+
+    /// Asks the link question about two hops rather than one: what this link
+    /// reaches, or what the pages it leads to reach.
+    ///
+    /// Off by default, and the same experiment [#46]. The question it replaces
+    /// ("is following this link likely to lead to content useful for someone
+    /// doing what `query` describes") can be answered from one hop of evidence,
+    /// and the model answers it that way: a link to a page that is only a step
+    /// on the way scores low, however well it leads. The two-hop phrasing
+    /// ([`Mode::link_question_two_hop`]) says how far the judgment reaches, and
+    /// the `headings` and `leads` knobs are what give it something to reach
+    /// with.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    pub fn with_two_hop_links(mut self, two_hop: bool) -> Self {
+        self.two_hop = two_hop;
         self
     }
 
@@ -866,6 +1068,10 @@ impl JevScorer {
         }
 
         let shares = self.shares(&sections, &links, &fixed);
+        let head = Head {
+            query: query.to_string(),
+            file,
+        };
 
         Request {
             posts: shares
@@ -875,7 +1081,7 @@ impl JevScorer {
                     // The file's Score is about the whole file, so the first
                     // post asks it and later ones do not: three posts would
                     // otherwise buy three answers to one question.
-                    self.post(query, &file, &sections, &links, share, index == 0)
+                    self.post(&head, &sections, &links, share, index == 0)
                 })
                 .collect(),
         }
@@ -974,8 +1180,7 @@ impl JevScorer {
     /// which is the first post's to ask.
     fn post(
         &self,
-        query: &str,
-        file: &FileState,
+        head: &Head,
         sections: &[SectionState],
         links: &[LinkState],
         share: &Share,
@@ -987,8 +1192,8 @@ impl JevScorer {
         }
 
         let mut state = State {
-            query: query.to_string(),
-            file: file.clone(),
+            query: head.query.clone(),
+            file: head.file.clone(),
             sections: Vec::with_capacity(share.sections.len()),
             links: Vec::with_capacity(share.links.len()),
         };
@@ -1036,15 +1241,20 @@ impl JevScorer {
     }
 
     /// The Noul question about one link, named by its position in the post that
-    /// asks it.
+    /// asks it. [`JevScorer::with_two_hop_links`] asks the mode's two-hop
+    /// phrasing of it instead, and takes that phrasing's yes with it.
     fn link_question(&self, index: usize) -> Question {
+        let (instructions, yes) = match self.two_hop {
+            true => (
+                &self.mode.link_question_two_hop,
+                self.mode.link_true_two_hop,
+            ),
+            false => (&self.mode.link_question, self.mode.link_true),
+        };
         Question::Noul {
-            instructions: self
-                .mode
-                .link_question
-                .replace("{index}", &index.to_string()),
+            instructions: instructions.replace("{index}", &index.to_string()),
             criteria: NoulCriteria {
-                yes: self.mode.link_true,
+                yes,
                 no: self.mode.link_false,
             },
         }
@@ -1210,7 +1420,7 @@ impl JevScorer {
         if !self.previews || !link.in_root {
             return None;
         }
-        let preview = parse::preview(self.root.join(&link.target)).ok()?;
+        let preview = parse::preview(self.root.join(&link.target), &self.root).ok()?;
         Some(PreviewState {
             title: clamp(&preview.title, PREVIEW_LIMIT),
             frontmatter: self
@@ -1220,6 +1430,8 @@ impl JevScorer {
             first_paragraph: preview
                 .first_paragraph
                 .map(|paragraph| clamp(&paragraph, PREVIEW_LIMIT)),
+            headings: self.preview_headings.then(|| headings(preview.headings)),
+            leads_to: self.preview_leads.then(|| leads_to(preview.leads)),
         })
     }
 }
@@ -1268,6 +1480,33 @@ fn required_key(value: Option<String>) -> Result<String, ScorerError> {
         Some(key) if !key.trim().is_empty() => Ok(key),
         _ => Err(ScorerError::MissingApiKey),
     }
+}
+
+/// The headings a preview carries: the target's own, in order, at most
+/// [`HEADINGS`] of them and each cut at [`HEADING_LIMIT`] characters.
+fn headings(headings: Vec<String>) -> Vec<String> {
+    headings
+        .into_iter()
+        .take(HEADINGS)
+        .map(|heading| clamp(&heading, HEADING_LIMIT))
+        .collect()
+}
+
+/// The lead anchors a preview carries: the target's in-root link text, in
+/// order, with an anchor that repeats an earlier one left out, at most [`LEADS`]
+/// of them and each cut at [`LEAD_LIMIT`] characters.
+///
+/// A page names the same target in its opening sentence, its overview table and
+/// its "see also"; the model reading one anchor three times learns nothing the
+/// first did not say, and the state pays for each copy.
+fn leads_to(leads: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    leads
+        .into_iter()
+        .filter(|lead| seen.insert(lead.clone()))
+        .take(LEADS)
+        .map(|lead| clamp(&lead, LEAD_LIMIT))
+        .collect()
 }
 
 /// `text` cut to at most `limit` characters, on a character boundary, and told
@@ -1667,11 +1906,12 @@ mod tests {
                 let link = &questions[&link_question(index)];
                 assert_eq!(
                     link["instructions"],
-                    mode.link_question.replace("{index}", &index.to_string()),
-                    "link {index} under {}",
+                    mode.link_question_two_hop
+                        .replace("{index}", &index.to_string()),
+                    "link {index} under {} is asked about what it reaches",
                     mode.name
                 );
-                assert_eq!(link["criteria"]["true"], mode.link_true);
+                assert_eq!(link["criteria"]["true"], mode.link_true_two_hop);
                 assert_eq!(link["criteria"]["false"], mode.link_false);
             }
         }
@@ -1903,7 +2143,7 @@ mod tests {
                     .contains(&format!("`links[{index}]`")),
                 "link {index} is named in its own question"
             );
-            assert_eq!(question["criteria"]["true"], USEFUL_FOR.link_true);
+            assert_eq!(question["criteria"]["true"], USEFUL_FOR.link_true_two_hop);
             assert_eq!(question["criteria"]["false"], USEFUL_FOR.link_false);
         }
         assert!(questions.get("link_8").is_none());
@@ -2188,6 +2428,263 @@ mod tests {
         );
     }
 
+    /// The `headings` half of the link state [#46] added, which ships: the
+    /// target's own H2s and H3s, in order, in its preview. The H1 is not among
+    /// them — the preview's title already carries it — and a link that leaves
+    /// the root has no preview, so no headings either.
+    ///
+    /// Left out ([`JevScorer::with_preview_headings`], the hidden
+    /// `--no-preview-headings`), the key is absent and everything else in the
+    /// preview is what it was.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_targets_headings_ship_in_the_preview() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let links = api.requests().remove(0)["state"]["links"].clone();
+        // The first link is payments/README.md: heading levels 2 and 3, in the
+        // file's own order.
+        assert_eq!(
+            links[0]["target_preview"]["headings"],
+            json!(["Instant payouts", "Windows", "Settlement"])
+        );
+        assert_eq!(INDEX_TARGETS[4], "../outside.md");
+        assert!(
+            links[4]["target_preview"].is_null(),
+            "a link that leaves the root has no preview, so no headings either"
+        );
+        // The whole preview, which is what a link is judged from: the headings
+        // and the lead anchors beside the title, the frontmatter and the
+        // paragraph.
+        let mut keys: Vec<&str> = links[2]["target_preview"]
+            .as_object()
+            .expect("a preview")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "first_paragraph",
+                "frontmatter",
+                "headings",
+                "leads_to",
+                "title"
+            ]
+        );
+
+        // Left out, no link carries the key and the rest of the preview is
+        // untouched.
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_preview_headings(false)
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let preview = &api.requests()[0]["state"]["links"][0]["target_preview"];
+        assert!(preview.get("headings").is_none());
+        assert!(preview["first_paragraph"].is_string());
+        assert!(
+            preview["leads_to"].is_array(),
+            "one switch does not turn the other with it"
+        );
+    }
+
+    /// The `leads_to` half of the same state: the anchor text of the target's
+    /// own in-root links, in order and deduped, which is one hop of lookahead
+    /// past the page the link being judged points at.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_targets_own_link_text_ships_in_the_preview() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let links = api.requests().remove(0)["state"]["links"].clone();
+        // payments/README.md links to payouts, then the ledger, then the
+        // cutoffs — twice, once from its prose and once as a wikilink — then to
+        // a window. The repeat is dropped; the link inside its fenced code
+        // block was never a link.
+        assert_eq!(
+            links[0]["target_preview"]["leads_to"],
+            json!(["payouts", "ledger", "cutoffs", "ten minute"])
+        );
+        // payments/cutoffs.md leads on with one wikilink, and the fixture's
+        // index page links to it second.
+        assert_eq!(
+            links[1]["target_preview"]["leads_to"],
+            json!(["settlement"])
+        );
+
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_preview_leads(false)
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+        let preview = &api.requests()[0]["state"]["links"][0]["target_preview"];
+        assert!(preview.get("leads_to").is_none());
+        assert!(
+            preview["headings"].is_array(),
+            "the headings are still there: only the leads are dropped"
+        );
+    }
+
+    /// The fourth part of [#46], which ships: the link question asked about two
+    /// hops, with the yes-criterion that matches it. One question's wording
+    /// changes — the file's and the sections' are the mode's, and the
+    /// no-criterion of a link is still what a link that leads nowhere gets.
+    ///
+    /// Asked about one hop again ([`JevScorer::with_two_hop_links`], the hidden
+    /// `--one-hop-links`), the question and its criterion are the mode's own:
+    /// the state is unchanged either way, because this is a question rather than
+    /// a field.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_link_question_is_asked_about_two_hops() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let request = api.requests().remove(0);
+        let questions = request["questions"].clone();
+        for index in 0..INDEX_TARGETS.len() {
+            assert_eq!(
+                questions[&link_question(index)]["instructions"],
+                USEFUL_FOR
+                    .link_question_two_hop
+                    .replace("{index}", &index.to_string()),
+                "link {index} is asked about what it reaches"
+            );
+            assert_eq!(
+                questions[&link_question(index)]["criteria"]["true"],
+                USEFUL_FOR.link_true_two_hop
+            );
+            assert_eq!(
+                questions[&link_question(index)]["criteria"]["false"],
+                USEFUL_FOR.link_false
+            );
+        }
+        assert_eq!(
+            questions[FILE_QUESTION]["instructions"],
+            USEFUL_FOR.file_question.as_ref(),
+            "the file is still judged by the mode"
+        );
+        assert_eq!(
+            questions["section_0"]["instructions"],
+            USEFUL_FOR.section_question.replace("{index}", "0")
+        );
+
+        // The one-hop question is the same state asked less far.
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_two_hop_links(false)
+            .judge("how are payments settled", &fixture("index.md"))
+            .await
+            .expect("a judgment");
+
+        let one_hop = api.requests().remove(0);
+        assert_eq!(
+            one_hop["questions"][&link_question(0)]["instructions"],
+            USEFUL_FOR.link_question.replace("{index}", "0")
+        );
+        assert_eq!(
+            one_hop["questions"][&link_question(0)]["criteria"]["true"],
+            USEFUL_FOR.link_true
+        );
+        assert_eq!(
+            one_hop["state"], request["state"],
+            "and the state does not move with it"
+        );
+    }
+
+    /// Each part of the richer state is bounded where [#46] says: 40 headings
+    /// at 80 characters each, 30 lead anchors at 60, and an anchor the target
+    /// repeats sent once. A preview is a hint, and a page that is all headings
+    /// or links is exactly the page whose state has to stay a hint.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_headings_and_leads_a_preview_carries_are_bounded() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 1, 2.0)));
+        let dir = TempDir::new("bounded-preview");
+        let long = "a phrase that runs on ".repeat(6);
+        let mut target =
+            String::from("# Target\n\nA page with more under it than a preview carries.\n\n");
+        for index in 0..HEADINGS + 5 {
+            target.push_str(&format!("### Heading {index} {long}\n\nText.\n\n"));
+        }
+        for index in 0..LEADS + 10 {
+            // The second link repeats the first link's anchor, word for word:
+            // the same target named twice in a page's prose and its table.
+            let anchor = match index {
+                1 => format!("Lead 0 {long}"),
+                _ => format!("Lead {index} {long}"),
+            };
+            target.push_str(&format!("- [{anchor}](lead-{index}.md)\n"));
+        }
+        let path = dir.path().join("target.md");
+        fs::write(&path, &target).expect("a target page");
+        let hub = dir.path().join("hub.md");
+        fs::write(
+            &hub,
+            "# Hub\n\nA [target](target.md) with a lot under it.\n",
+        )
+        .expect("a hub page");
+
+        let file = parse::parse(&hub, dir.path()).expect("a parse");
+        api.scorer_in(dir.path())
+            .with_preview_headings(true)
+            .with_preview_leads(true)
+            .judge("what is under the target", &file)
+            .await
+            .expect("a judgment");
+
+        let preview = api.requests().remove(0)["state"]["links"][0]["target_preview"].clone();
+        let headings = preview["headings"].as_array().expect("a heading list");
+        assert_eq!(headings.len(), HEADINGS, "the list stops at {HEADINGS}");
+        assert_eq!(
+            headings[0],
+            json!(clamp(&format!("Heading 0 {long}"), HEADING_LIMIT)),
+            "each heading is cut at {HEADING_LIMIT} characters and says so"
+        );
+        assert!(
+            headings[0]
+                .as_str()
+                .is_some_and(|heading| heading.ends_with("[truncated at 80 characters]")),
+            "the cut is visible to the model: {}",
+            headings[0]
+        );
+
+        let leads = preview["leads_to"].as_array().expect("a lead list");
+        assert_eq!(leads.len(), LEADS, "the list stops at {LEADS}");
+        assert_eq!(
+            leads[1],
+            json!(clamp(&format!("Lead 2 {long}"), LEAD_LIMIT)),
+            "the lead whose anchor repeated the one before it is not sent twice"
+        );
+        assert!(
+            leads[1]
+                .as_str()
+                .is_some_and(|lead| lead.ends_with("[truncated at 60 characters]")),
+            "each anchor is cut at {LEAD_LIMIT} characters and says so: {}",
+            leads[1]
+        );
+    }
+
     #[tokio::test]
     async fn an_answer_the_response_omits_is_an_error() {
         let api = FakeApi::new(|_, _| {
@@ -2376,6 +2873,74 @@ mod tests {
             "a post is over the request budget: {} characters, over {REQUEST_CHARS}",
             post_length(request)
         );
+    }
+
+    /// The richer state is still state ([#46]): a page whose every link carries
+    /// the target's headings and its own link text adds more per link than one
+    /// post holds, so it is split like any other over-budget page — every post
+    /// inside both of the API's budgets, the path the walk came by in each, and
+    /// every link still judged.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn a_page_whose_previews_carry_headings_and_leads_is_split_across_posts() {
+        let api = FakeApi::new(|_, request| (200, any_reply(request, 2.0)));
+        let dir = TempDir::new("richer-previews");
+        let mut hub = String::from("# Hub\n\nThe hub page for the runbook.\n\n");
+        for index in 0..160 {
+            let page = format!("target-{index:03}.md");
+            let mut target = format!("# Target {index}\n\nWhat target {index} is about.\n\n");
+            for heading in 0..10 {
+                target.push_str(&format!(
+                    "## Heading {heading} of target {index}, in the page's own words\n\nSomething under it.\n\n"
+                ));
+            }
+            for lead in 0..10 {
+                target.push_str(&format!(
+                    "- [Outbound link {lead} to another page of the wiki](other-{lead}.md)\n"
+                ));
+            }
+            fs::write(dir.path().join(&page), &target).expect("a generated target");
+            hub.push_str(&format!(
+                "- [Target {index}]({page}) — step {index} of the runbook.\n"
+            ));
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &hub).expect("the hub");
+        let file = parse::parse(&path, dir.path()).expect("a parse");
+        let outcome = api
+            .scorer_in(dir.path())
+            .with_preview_headings(true)
+            .with_preview_leads(true)
+            .judge("how does step 12 of the runbook work", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            whole_state(&requests) > STATE_CHARS,
+            "the fixture's state has to be over one post's budget for this to test the split: {} characters",
+            whole_state(&requests)
+        );
+        assert!(
+            requests.len() > 1,
+            "so it is split: {} posts",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+        }
+        assert_eq!(
+            outcome.detail.requests,
+            requests.len(),
+            "what the judgment reports is what it took"
+        );
+        assert_eq!(
+            outcome.judgment.links.len(),
+            file.links.len(),
+            "every link is judged, whichever post asked about it"
+        );
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
     }
 
     /// A hub page whose links are too many for one post is asked in several:
@@ -2909,6 +3474,8 @@ mod tests {
                     value: "release, runbook".to_string(),
                 }]),
                 first_paragraph: Some("A page about the release runbook.".to_string()),
+                headings: None,
+                leads_to: None,
             }),
         };
         let plain = LinkState {

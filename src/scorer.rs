@@ -146,5 +146,6 @@ pub trait Scorer: Send + Sync {
     /// [`ParsedFile::links`] entry, each in that order, so the caller can pair
     /// them by index. `file.links` that point outside the root are still
     /// judged: the caller decides whether to follow them.
+    ///
     async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError>;
 }

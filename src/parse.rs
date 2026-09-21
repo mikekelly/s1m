@@ -107,7 +107,9 @@ pub struct ParsedFile {
 }
 
 /// What a link preview needs from a target file: [`parse`]'s title and
-/// frontmatter, plus the first paragraph of prose.
+/// frontmatter, the first paragraph of prose, and — because a page's first
+/// paragraph does not always say what sits under it — the headings that name
+/// its parts and the link text it leads on with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preview {
@@ -120,6 +122,22 @@ pub struct Preview {
     /// has no paragraph: a file whose prose lives only in headings, list items
     /// or tables has none, and the frontmatter block does not count.
     pub first_paragraph: Option<String>,
+    /// The file's own headings at H2 and H3, in document order, as written.
+    ///
+    /// The H1 is not here because it is the title ([`Preview::title`] already
+    /// carries it), and an H4 or deeper says less about the page than about one
+    /// corner of it. Bounding the list is the caller's: a preview is a hint,
+    /// and what a request can afford to carry is the request builder's
+    /// question.
+    pub headings: Vec<String>,
+    /// The anchor text of each link the file makes that stays inside the root,
+    /// in document order, before a caller dedupes or bounds them.
+    ///
+    /// What the page leads on with, which is the one hop of lookahead a link to
+    /// it can carry. A link that leaves the root is not here — it is content
+    /// outside what the caller asked s1m to look at — and neither is a wikilink
+    /// that names no file, which [`parse`] drops the same way.
+    pub leads: Vec<String>,
 }
 
 /// Parses `path`, resolving its links against `root`.
@@ -144,9 +162,26 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
     let scan = Scan::of(&source);
     let starts = line_starts(&source);
     let last_line = line_count(&source);
-    let directory = relative_to_root(root, path.parent().unwrap_or(Path::new("")));
 
-    // The tree is walked at most once, and only if a wikilink needs it.
+    let links = links(&scan, path, root);
+    let title = scan_title(&scan, path);
+    Ok(ParsedFile {
+        path: path.to_path_buf(),
+        title,
+        frontmatter: scan.frontmatter,
+        sections: sections(&scan.headings, &source, &starts, scan.body_start, last_line),
+        links,
+    })
+}
+
+/// Every link `scan` found in the file at `path`, resolved against `root`.
+///
+/// The tree is walked at most once, and only if a wikilink needs it. A link
+/// that resolves nowhere — a wikilink naming no file — is left out; one that
+/// resolves outside `root` is kept and marked ([`Link::in_root`]), because the
+/// text names a target whether or not the walk may follow it.
+fn links(scan: &Scan, path: &Path, root: &Path) -> Vec<Link> {
+    let directory = relative_to_root(root, path.parent().unwrap_or(Path::new("")));
     let mut index = None;
     let mut links = Vec::with_capacity(scan.links.len());
     for raw in &scan.links {
@@ -166,28 +201,46 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
             in_root: resolved.in_root,
         });
     }
-
-    let title = scan_title(&scan, path);
-    Ok(ParsedFile {
-        path: path.to_path_buf(),
-        title,
-        frontmatter: scan.frontmatter,
-        sections: sections(&scan.headings, &source, &starts, scan.body_start, last_line),
-        links,
-    })
+    links
 }
 
-/// Reads the preview of one file: title, frontmatter and first paragraph.
-pub fn preview(path: impl AsRef<Path>) -> Result<Preview, ParseError> {
+/// Reads the preview of one file: title, frontmatter, first paragraph and the
+/// headings and in-root link text that say what lies under it.
+///
+/// `path` and `root` are related the way [`parse`] wants them, and `root` is
+/// what tells an in-root link from one that leaves: [`Preview::leads`] is read
+/// from the links that stay.
+pub fn preview(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Preview, ParseError> {
     let path = path.as_ref();
+    let root = root.as_ref();
+    if path.is_absolute() != root.is_absolute() {
+        return Err(ParseError::BaseMismatch {
+            path: path.to_path_buf(),
+            root: root.to_path_buf(),
+        });
+    }
+
     let source = read(path)?;
     let scan = Scan::of(&source);
+    let headings = scan
+        .headings
+        .iter()
+        .filter(|heading| matches!(heading.level, 2 | 3))
+        .map(|heading| heading.text.clone())
+        .collect();
+    let leads = links(&scan, path, root)
+        .into_iter()
+        .filter(|link| link.in_root)
+        .map(|link| link.anchor)
+        .collect();
 
     Ok(Preview {
         path: path.to_path_buf(),
         title: scan_title(&scan, path),
         frontmatter: scan.frontmatter,
         first_paragraph: scan.first_paragraph,
+        headings,
+        leads,
     })
 }
 

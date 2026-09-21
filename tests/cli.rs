@@ -268,6 +268,106 @@ fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
     );
 }
 
+/// The hidden opt-out flags of [#46] are a run's state: the run that names none
+/// of them carries the whole of it, and each flag takes exactly its own part
+/// away and leaves the rest.
+///
+/// This is the flag-to-field wiring the unit tests cannot see: the switches are
+/// [`s1m::jev::Context`]'s, and nothing but this checks that the flag a person
+/// types is the field the shipped state is built from.
+///
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+#[test]
+fn the_hidden_ablation_flags_take_the_state_away() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // What ships: the target's own headings and the anchor text of its own
+    // links. `next.md` is an H1, a sentence and one link, so it has no headings
+    // to carry and one lead, and the question reaches past the link it names.
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    assert_eq!(
+        entry["state"]["links"][0]["target_preview"]["headings"],
+        json!([])
+    );
+    assert_eq!(
+        entry["state"]["links"][0]["target_preview"]["leads_to"],
+        json!(["Deep"])
+    );
+    let two_hop = instructions(entry, "link_0");
+    assert!(
+        two_hop.contains("directly or through the pages it links to"),
+        "the two-hop question is what ships: {two_hop}"
+    );
+
+    // Each state flag takes its own field away and leaves the other one.
+    for (flag, gone) in [
+        ("--no-preview-headings", "headings"),
+        ("--no-preview-leads", "leads_to"),
+    ] {
+        let api = FakeApi::new(3.0, 0.9, 0.7);
+        let cache = Cache::new();
+        let output = run_with(&[QUERY, ENTRY, flag], &api, &cache);
+        assert_eq!(output.status.code(), Some(0), "{flag}: {}", stderr(&output));
+
+        let requests = api.requests();
+        let entry = request_for(&requests, ENTRY);
+        let preview = &entry["state"]["links"][0]["target_preview"];
+        assert!(
+            preview.get(gone).is_none(),
+            "{flag} left {gone} in: {preview}"
+        );
+        for other in ["headings", "leads_to"] {
+            if other != gone {
+                assert!(
+                    preview.get(other).is_some(),
+                    "{flag} took {other} with it: {preview}"
+                );
+            }
+        }
+        assert_eq!(
+            instructions(entry, "link_0"),
+            two_hop,
+            "{flag} changed the question"
+        );
+    }
+
+    // And the question flag is the question, not the state.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY, "--one-hop-links"], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    let one_hop = instructions(entry, "link_0");
+    assert!(
+        !one_hop.contains("directly or through") && one_hop.contains("`links[0]`"),
+        "the one-hop question is asked: {one_hop}"
+    );
+    assert!(
+        entry["state"]["links"][0]["target_preview"]
+            .get("headings")
+            .is_some(),
+        "and the state is not what it changed"
+    );
+}
+
+/// The request one file was judged in, found by the fixture path it ends with.
+fn request_for<'a>(requests: &'a [Value], page: &str) -> &'a Value {
+    requests
+        .iter()
+        .find(|request| {
+            request["state"]["file"]["path"]
+                .as_str()
+                .is_some_and(|path| path.ends_with(page))
+        })
+        .unwrap_or_else(|| panic!("{page} was never judged: {requests:?}"))
+}
+
 /// The one-shot HTTP reply the fake server sends, and the request bodies it
 /// saw, are enough to answer the questions above; these read the wording out of
 /// one.

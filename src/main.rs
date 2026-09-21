@@ -20,7 +20,7 @@ use s1m::cache::{CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::format::Format;
 use s1m::ignore::{self, Ignore};
-use s1m::jev::{self, JevDetail, JevScorer, Mode};
+use s1m::jev::{self, Context, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 
@@ -165,6 +165,22 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// Leave each link target's own H2/H3 headings out of its preview, the way
+    /// the preview was before [#46]. Hidden: the ablation the evaluation
+    /// measures.
+    #[arg(long, hide = true)]
+    no_preview_headings: bool,
+
+    /// Leave the anchor text of each link target's own in-root links out of its
+    /// preview. Hidden: the same ablation.
+    #[arg(long, hide = true)]
+    no_preview_leads: bool,
+
+    /// Ask the link question about one hop rather than two, the way it was
+    /// asked before [#46]. Hidden: the same ablation.
+    #[arg(long, hide = true)]
+    one_hop_links: bool,
+
     /// How the reading list is printed: `json` for a caller that parses it,
     /// `md` for what to read, `tree` for the walk's link tree.
     #[arg(long, value_name = "FORMAT", value_enum, default_value_t = FormatArg::Json)]
@@ -246,10 +262,34 @@ enum Command {
         /// numbers are this run's rather than the cache's.
         #[arg(long)]
         no_cache: bool,
+        /// Leave the target's H2/H3 headings out of each link's preview.
+        /// Hidden: the same ablation the query's hidden flags ask for.
+        #[arg(long, hide = true)]
+        no_preview_headings: bool,
+        /// Leave the anchor text of each target's own in-root links out of its
+        /// preview. Hidden, the same ablation.
+        #[arg(long, hide = true)]
+        no_preview_leads: bool,
+        /// Ask the link question about one hop rather than two. Hidden, the
+        /// same ablation.
+        #[arg(long, hide = true)]
+        one_hop_links: bool,
     },
 }
 
 impl Cli {
+    /// What the request carries about each link, as the hidden ablation flags
+    /// take it away ([`Context`]). A run that names none of them sends the
+    /// state that ships.
+    fn context(&self) -> Context {
+        Context {
+            headings: !self.no_preview_headings,
+            leads: !self.no_preview_leads,
+            two_hop: !self.one_hop_links,
+            ..Context::default()
+        }
+    }
+
     /// The flags as the run wants them. The mode is the scorer's to name,
     /// because the scorer is what carries the criterion; it is filled in once
     /// one has been built, from `--criteria`'s file when there is one and
@@ -279,8 +319,18 @@ async fn main() {
             root,
             no_previews,
             no_cache,
+            no_preview_headings,
+            no_preview_leads,
+            one_hop_links,
         }) => {
-            if let Err(error) = score_file(&query, &file, root, !no_previews, no_cache).await {
+            let context = Context {
+                previews: !no_previews,
+                headings: !no_preview_headings,
+                leads: !no_preview_leads,
+                two_hop: !one_hop_links,
+                ..Context::default()
+            };
+            if let Err(error) = score_file(&query, &file, root, context, no_cache).await {
                 fail(format!("{error:#}"));
             }
         }
@@ -314,7 +364,7 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     };
 
     let mode = criterion(cli.mode, cli.criteria.as_deref()).unwrap_or_else(|message| fail(message));
-    let jev = scorer(&root)?.with_mode(mode);
+    let jev = cli.context().apply(scorer(&root)?).with_mode(mode);
     options.mode = jev.mode().name.to_string();
 
     let judge: Box<dyn Judge> = if cli.no_cache {
@@ -396,7 +446,7 @@ async fn score_file(
     query: &str,
     file: &Path,
     root: Option<PathBuf>,
-    previews: bool,
+    context: Context,
     no_cache: bool,
 ) -> anyhow::Result<()> {
     let root = root.unwrap_or_else(|| {
@@ -419,7 +469,7 @@ async fn score_file(
 
     let mut parsed = parse::parse(file, &root)?;
     parsed.links.retain(|link| !ignore.matched(&link.target));
-    let jev = scorer(&root)?.with_previews(previews);
+    let jev = context.apply(scorer(&root)?);
     let mode = jev.mode().clone();
 
     let (judgment, source) = if no_cache {
@@ -436,7 +486,7 @@ async fn score_file(
 
     print!(
         "{}",
-        report(query, &parsed, &judgment, &mode, previews, &source)
+        report(query, &parsed, &judgment, &mode, context.previews, &source)
     );
     Ok(())
 }
