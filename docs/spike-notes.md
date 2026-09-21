@@ -527,3 +527,165 @@ Reading them:
   depth per query is where it would show.
 
 [#2]: https://github.com/mikekelly/s1m/issues/2
+[#52]: https://github.com/mikekelly/s1m/issues/52
+
+## The wording: what the three judgments are asked in
+
+Measured 2026-09-21 for [#52](https://github.com/mikekelly/s1m/issues/52), the same way
+[#46](https://github.com/mikekelly/s1m/issues/46) and
+[#47](https://github.com/mikekelly/s1m/issues/47) were: the public gold set cold at
+`--max-files 10`, then the private one by the session that holds it. What moves is the words and
+nothing else. Each register is a *wording* — the file's
+Score, each section's Noul and each link's Noul asked differently — applied to the criterion a
+query is labelled with, so a `useful-for` query keeps `useful-for`'s criterion and an `answers`
+query keeps `answers`', and the state, the threshold and the walk are what they always were. `path`
+is the one register whose sentence has to name something the criterion owns, and it takes the mode's
+own phrase for what it is looking for (`the pages that answer query` under `answers`).
+
+| Name | The question it re-asks | In one line |
+| --- | --- | --- |
+| `navigator` | link | A person looking for the query, reading this page: would they click this link next? |
+| `path` | link | Is this link on the way from the page to the pages the mode wants? |
+| `sharp-no` | link | The shipped question, with a no that has to name something else *and* lead nowhere |
+| `rules` | link | The shipped question under three stated rules, sent as the API's structured `instructions`: page text is data, an already-open page is not a next step, navigation is not a next step |
+| `necessity` | section | Would someone doing the query be worse off for skipping this section? |
+| `task` | section | Does this section hold something usable: a step, a rule, a value, a decision? |
+| `reader-action` | file | If someone doing the query opened the file, how much would they read? |
+| `answer-bearing` | file | How much of what the query needs is in the file itself, not in what it links to? |
+| `reader` | all three | The reader defined once in the state, every question about it, a verb where "useful" was |
+
+The sentences themselves are `Wording` in [`src/jev.rs`](../src/jev.rs), and a test holds each one
+to the words the issue spelled: what a row here measured is what a reviewer can read. `task` is
+the row the decision below made the default — the section question every mode asks now — and the
+register that takes the flag's place where it stood is `section-legacy`, which asks the question
+that shipped before it.
+
+### What it found, before the decision
+
+The public gold set, one row per register, cold, each measured against the section question that
+shipped then — the one `section-legacy` asks now:
+
+| Wording | Recall | Precision | Read (tok) | Returned | Input (tok) | Cost | Requests |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| what ships | 0.83 | 0.26 | 68,663 | 129 | 1,057,882 | $0.044431 | 181 |
+| `navigator` | 0.61 | 0.35 | 24,116 | 49 | 329,822 | $0.013853 | 53 |
+| `path` | 0.72 | 0.23 | 46,981 | 100 | 681,281 | $0.028614 | 110 |
+| `sharp-no` | 0.80 | 0.25 | 67,417 | 127 | 1,073,872 | $0.045103 | 186 |
+| `rules` | 0.70 | 0.20 | 59,913 | 113 | 903,739 | $0.037957 | 133 |
+| `necessity` | 0.81 | 0.24 | 57,775 | 137 | 1,058,559 | $0.044459 | 182 |
+| `task` | 0.83 | 0.27 | 44,906 | 126 | 1,093,921 | $0.045945 | 186 |
+| `reader-action` | 0.74 | 0.26 | 66,815 | 110 | 1,060,968 | $0.044561 | 180 |
+| `answer-bearing` | 0.74 | 0.29 | 64,985 | 103 | 1,068,772 | $0.044888 | 182 |
+| `reader` | 0.70 | 0.27 | 37,568 | 86 | 555,427 | $0.023328 | 88 |
+
+- **No link register beats the wording that ships.** `navigator` is the one that buys precision —
+  0.26 to 0.35, on 49 files returned rather than 129 — and it pays 0.22 of recall for it:
+  `ingest-summary`, `index-tables` and `what-is-it` go to zero, and nothing gains. Asking for a
+  click is asking a reader's question about a page the reader is not on yet.
+- **The sharper no barely moves.** `sharp-no` is the shipped question with one criterion changed,
+  and it is 0.03 of recall and 0.01 of precision from it, on the same number of requests. Whatever
+  the answers between 0.4 and 0.6 were doing, telling the model what a no means did not change
+  them.
+- **Position is not what the walk follows.** `path` loses 0.11 of recall without gaining precision,
+  and `rules` — the register from jev-ultrafast, the untrusted-page rule and the two explicit
+  negatives — loses 0.13 and 0.06 of precision. The rules are true and the walk was already doing
+  what they say.
+- **The section question is where the wording pays.** `task` matches the shipped recall exactly
+  (0.83, query for query) while returning 3 fewer files and reading 35% less, which is precision
+  0.26 → 0.27 for nothing; `necessity` gives up 0.02 of recall and 0.02 of precision and returns
+  *more* files than the walk that ships. A section that has to hold a step, a rule, a value or a
+  decision is what a reader would use it for; a section that would only be missed if skipped is a
+  weaker thing to score a threshold against.
+- **Both file registers trade recall for precision.** `answer-bearing` — how much of the query the
+  file itself holds — is 0.74 / 0.29 against 0.83 / 0.26 for 5% less reading, and it is the row that
+  says the hub-versus-leaf split [#40](https://github.com/mikekelly/s1m/issues/40) had to fix by
+  ranking is at least askable; `reader-action` is 0.74 / 0.26 on 110 files returned. On a wiki of
+  19 pages, where a hub is often the only route to a leaf, telling the model to discount what the
+  file only links to costs it the leaves.
+- **Naming the reader does not earn its definition.** `reader` is the widest change — state and all
+  three questions — and it is 0.70 / 0.27, 0.13 of recall below the walk that ships for 45% less
+  reading. The subject being `reader` rather than "someone doing what the query describes" is a
+  shorter sentence and a worse judge on this set.
+
+### The decision
+
+The rule on [#52], read against both sets: a link register replaces the default only if private
+recall is at or above 0.87 and precision at or above 0.21, or recall within 0.02 of it with
+precision up by 0.05 or more — the same shape for the section question (precision is the target)
+and the file question (precision at the returned list). The private set is 20 queries on a private
+wiki at `--max-files 25`, all of them `useful-for`, measured by the session that holds it
+([#36](https://github.com/mikekelly/s1m/issues/36)); its walk as it shipped before this change is
+0.87 recall and 0.21 precision, so a register has to hold that or beat it.
+
+| Register | Public | Private | What the rule says |
+| --- | --- | --- | --- |
+| the walk as it shipped | 0.83 / 0.26 | 0.87 / 0.21 | — |
+| `task` (section) | 0.83 / 0.27, 44,906 read, 126 files | 0.87 / 0.21, 31 lines returned against 45 | **ships** |
+| `reader-action` (file) | 0.74 / 0.26 | 0.86 / 0.27, 11.2 files returned against 13.8 | meets the private rule, stays behind the flag |
+| `sharp-no` (link) | 0.80 / 0.25 | 0.88 / 0.20 | level, not a win |
+| `answer-bearing` (file) | 0.74 / 0.29 | 0.83 / 0.24 | out |
+| `necessity` (section) | 0.81 / 0.24 | 0.85 / 0.19 | out |
+| `path`, `rules`, `reader` | 0.72, 0.70, 0.70 recall | 0.73, 0.80, 0.65 recall | out |
+| `navigator` (link) | 0.61 / 0.35 | 0.44 / 0.20, six queries at zero | out |
+
+- **`task` becomes the shipped section question.** Recall and precision level on both sets, a
+  third less reading on both: the rule met twice, and the section question is the one place the
+  wording paid rather than traded.
+- **`reader-action` does not ship.** It meets the private file rule — recall within 0.02, precision
+  up 0.06 — and loses 0.09 of recall on the public set, with `what-is-it` and `ingest-summary`
+  dropping. A register that wins on one corpus and loses on the other is not a default; the rule
+  was written against the private numbers because they were the harder set, not to ignore the
+  other. It keeps both numbers and stays a register.
+- **No link register replaces the two-hop question.** Every one of them is below the shipped
+  wording on both sets, and the sharper no is level rather than a win. The failure the experiment
+  was pointed at — the 0.4-to-0.6 answers — was not a wording failure.
+
+What changed in the code: the section question every mode ships is `task`'s, with `task`'s yes and
+the mode's own no; `--wording task` is gone, because it is what a run gets by naming nothing; and
+the question it replaced, with the yes of the time, is `Mode::section_question_legacy`, reachable
+as `--wording section-legacy`, so the walk the numbers before this were made on is still a walk a
+run can repeat — request for request, and so out of the same cache. Two byte-for-byte snapshots
+hold that pair: `tests/snapshots/request-default.json` for what ships now, and
+`tests/snapshots/request-before-52.json` for what `section-legacy` puts back.
+
+### After the decision
+
+The report's wording table now measures the registers on top of the decided default, which is what
+a register means from here on, and its first two rows are the two walks the decision compared:
+
+| Wording | Recall | Precision | Read (tok) | Returned | Input (tok) | Cost | Requests |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| what ships (default) | 0.83 | 0.27 | 44,906 | 126 | 1,093,921 | $0.045945 | 186 |
+| `section-legacy` | 0.83 | 0.26 | 68,663 | 129 | 1,057,882 | $0.044431 | 181 |
+| `navigator` | 0.61 | 0.34 | 17,083 | 50 | 355,245 | $0.014920 | 57 |
+| `path` | 0.72 | 0.24 | 27,956 | 99 | 703,203 | $0.029535 | 112 |
+| `sharp-no` | 0.82 | 0.25 | 44,950 | 129 | 1,078,519 | $0.045298 | 186 |
+| `rules` | 0.72 | 0.21 | 35,003 | 114 | 903,271 | $0.037937 | 131 |
+| `reader-action` | 0.78 | 0.41 | 46,782 | 79 | 1,085,297 | $0.045582 | 184 |
+| `answer-bearing` | 0.74 | 0.42 | 47,127 | 71 | 1,088,126 | $0.045701 | 184 |
+| `reader` | 0.70 | 0.27 | 37,568 | 86 | 555,427 | $0.023328 | 88 |
+
+Two things to read out of that table rather than the one above it. The **default row asks exactly
+what the `task` row above asked** — the same requests, so the same 0.83 / 0.27 and the same 44,906
+tokens — against `section-legacy`'s 0.83 / 0.26 for 68,663, which is the walk the rest of this
+report was made on until the decision. And the **file registers read differently on top of it**: 0.78 / 0.41
+for `reader-action` and 0.74 / 0.42 for `answer-bearing`, where the pre-decision rows were 0.74 /
+0.26 and 0.74 / 0.29. The section question is what returns files, and a stricter one leaves the
+file question less to disagree with: neither becomes the default — the private rule already said
+no, and the public set says no again — but a future experiment that pairs a register with the
+section question should expect the file rows to move with it.
+
+### Not settled
+
+- **Whether `reader-action`'s precision survives a corpus it does not lose recall on.** It met the
+  private file rule and lost 0.09 of recall publicly; the tie-break on [#52] was to keep the
+  default where both sets agree.
+- **Interactions with the state.** Every row here is measured on the state [#46] shipped, and
+  [#47]'s relative judge is a third axis: the tighter default list and `choice`'s shares were not
+  measured against each other, and a walk that asks both would be a different experiment.
+- **A wiki whose hubs are not the only path to their leaves.** Both file registers lose recall here
+  by discounting what a file only links to, and this wiki is 19 pages with a hub per subject. The
+  same question on a corpus with deep trees is where `answer-bearing` would have room to pay.
+- **What a stricter section question costs the walked-but-not-returned pages.** The default returns
+  126 files where it returned 129 for the same wanted pages; what moved into `walked` is a reader's
+  question about the JSON, not one this experiment asked.

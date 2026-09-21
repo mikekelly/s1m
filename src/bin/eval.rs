@@ -58,7 +58,9 @@ use serde::Deserialize;
 
 use s1m::cache::{Cacheable, CachedScorer, Scored};
 use s1m::ignore::Ignore;
-use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevOutcome, JevScorer, KeepRule, Mode};
+use s1m::jev::{
+    self, ChoiceScorer, Context, JevDetail, JevOutcome, JevScorer, KeepRule, Mode, Wording,
+};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, Scorer, ScorerError};
 use s1m::traverse::{Admission, Config, Failure, traverse};
@@ -195,6 +197,7 @@ const POLICIES: [(&str, Policy); 4] = [
                 previews: false,
                 ..Context::DEFAULT
             },
+            wording: None,
             keep: KEEP,
         },
     ),
@@ -203,6 +206,7 @@ const POLICIES: [(&str, Policy); 4] = [
         Policy {
             links: Links::Choice,
             context: Context::DEFAULT,
+            wording: None,
             keep: KEEP,
         },
     ),
@@ -211,6 +215,7 @@ const POLICIES: [(&str, Policy); 4] = [
         Policy {
             links: Links::Choice,
             context: Context::DEFAULT,
+            wording: None,
             keep: LOOSE,
         },
     ),
@@ -265,6 +270,18 @@ struct Args {
     /// [#47]: https://github.com/mikekelly/s1m/issues/47
     #[arg(long)]
     relative_judge: bool,
+    /// Measure the wordings — the three questions put in another register —
+    /// beside the walk that ships ([#52]), and add their table to the report.
+    ///
+    /// Off by default for the same reason `--relative-judge` is: a report is
+    /// only worth committing if the cache reproduces it, and a run with this
+    /// flag buys rows the cache does not hold. It is the flag that puts them
+    /// there, once, and the report a run with it writes is then reproducible
+    /// like any other.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    #[arg(long)]
+    wordings: bool,
     /// Write the report here instead of stdout.
     #[arg(long)]
     out: Option<PathBuf>,
@@ -925,18 +942,29 @@ enum Links {
     Choice,
 }
 
-/// One measured way of judging a page's links: the question asked of each, the
-/// state it is asked from, and what a share has to hold to be kept.
+/// One measured way of asking: which link judgment is asked, the state it is
+/// asked from, the register the questions are put in, and what a share has to
+/// hold to be kept.
 ///
 /// Under [`Links::Noul`] the context is the state the walk sends and the keep
 /// rule is unread. Under [`Links::Choice`] the context is what the *options*
 /// are described from — the file's own Score and its sections are always asked
 /// with [`Context::DEFAULT`] — and the keep rule is the scorer's own, because a
 /// share means something only beside the options it was weighed against.
+///
+/// The wording is the whole of the experiment [#52] ran and the other axis of
+/// this: it changes no criterion and no state, and every row that names one is
+/// the walk that ships with its three questions put in that register.
+///
+/// [#47]: https://github.com/mikekelly/s1m/issues/47
+/// [#52]: https://github.com/mikekelly/s1m/issues/52
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Policy {
     links: Links,
     context: Context,
+    /// The register the three questions are put in, or none for the wording
+    /// that ships ([`jev::Wording`]).
+    wording: Option<Wording>,
     keep: KeepRule,
 }
 
@@ -947,7 +975,17 @@ impl Policy {
         Policy {
             links: Links::Noul,
             context,
+            wording: None,
             keep: KEEP,
+        }
+    }
+
+    /// The same walk with its questions in `wording`: what every row of the
+    /// wording table but the first is.
+    const fn worded(wording: Wording) -> Policy {
+        Policy {
+            wording: Some(wording),
+            ..Policy::noul(Context::DEFAULT)
         }
     }
 
@@ -1141,12 +1179,22 @@ impl Env<'_> {
     /// against the API stored, and the other way round.
     fn scorer(&self, query: &Query, policy: Policy) -> Result<Metered, String> {
         let base = |context: Context| -> Result<JevScorer, String> {
+            let mode = query.mode()?;
+            // The wording is applied to the criterion the gold set names, so a
+            // row varies the words and not what counts as relevant: every query
+            // keeps its own mode, and `--wording path --mode answers` names the
+            // pages that answer the query rather than the ones that do what it
+            // describes.
+            let mode = match policy.wording {
+                Some(wording) => wording.word(mode),
+                None => mode,
+            };
             let mut jev = context
                 .apply(
                     JevScorer::new(self.key.clone(), self.root)
                         .map_err(|error| format!("{}: {error}", query.id))?,
                 )
-                .with_mode(query.mode()?);
+                .with_mode(mode);
             if let Some(endpoint) = std::env::var(jev::ENDPOINT_VAR)
                 .ok()
                 .filter(|endpoint| !endpoint.trim().is_empty())
@@ -1301,6 +1349,13 @@ struct Findings {
     /// `--relative-judge` asked for it: those rows are bought, and the report a
     /// plain run writes has to be one the committed cache reproduces.
     policies: Vec<(&'static str, Vec<Run>)>,
+    /// The wording experiment of [#52], at the smallest budget: the walk that
+    /// ships, then the same walk with the three questions put in each register
+    /// [`jev::Wording`] names. Empty unless `--wordings` asked for it, for the
+    /// reason [`Findings::policies`] is.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    wordings: Vec<(&'static str, Vec<Run>)>,
     /// One query's entry page under each preview policy: what each knob does to
     /// one page's link scents.
     scents: Vec<(&'static str, Vec<(PathBuf, f64)>)>,
@@ -1448,6 +1503,28 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         }
     }
 
+    // The wording experiment ([#52]) at the tight budget, when the run asked for
+    // it: the same gold set, every query keeping the criterion it was labelled
+    // with, and the three questions put in another register. The first row is
+    // the walk the gold set has already made — re-walking it would be free and
+    // report no cost — so the experiment starts from the runs that paid.
+    let mut wordings = Vec::new();
+    if args.wordings {
+        wordings.push(("what ships (default)", at[0].1.clone()));
+        for wording in Wording::ALL {
+            let runs = experiment(
+                &env,
+                &gold,
+                tight,
+                Policy::worded(wording),
+                args.threshold,
+                &mut total,
+            )
+            .await?;
+            wordings.push((wording.name(), runs));
+        }
+    }
+
     // One page's links under each policy, which is the same question at the
     // scale of a link rather than a result: the hub page of the first query,
     // judged with that query.
@@ -1483,6 +1560,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         previews,
         contexts,
         policies,
+        wordings,
         scents,
         scents_of,
         total,
@@ -1571,6 +1649,9 @@ impl Findings {
         self.the_link_context_experiment(out);
         if !self.policies.is_empty() {
             self.the_relative_judge(out);
+        }
+        if !self.wordings.is_empty() {
+            self.the_wording_experiment(out);
         }
         self.limitations(out);
         self.the_cache(out);
@@ -1805,6 +1886,9 @@ impl Findings {
         if !self.policies.is_empty() {
             let _ = writeln!(out, "  --relative-judge \\");
         }
+        if !self.wordings.is_empty() {
+            let _ = writeln!(out, "  --wordings \\");
+        }
         let _ = writeln!(out, "  --out PATH");
         let _ = writeln!(out, "```");
         let _ = writeln!(out);
@@ -1818,8 +1902,9 @@ impl Findings {
              the tokens, not the rate — and `--no-cache` with a key buys every judgment again. \
              `--wiki` and `--gold` are the only thing a private wiki needs, and nothing about \
              either is committed here. `--relative-judge` is what adds the relative judge's rows \
-             below: those asks are this report's own, so a run without the flag prints the report \
-             without that table, and the cache answers the rest either way."
+             below and `--wordings` the wording table's, and both are this report's own asks: a run \
+             without either flag prints the report without that table, and the cache answers the \
+             rest either way."
         );
         let _ = writeln!(out);
     }
@@ -2704,6 +2789,167 @@ impl Findings {
         let mut means = vec!["**mean**".to_string(), String::new()];
         means.extend(
             self.policies
+                .iter()
+                .map(|(_, runs)| format!("**{}**", ratio(mean_recall(runs)))),
+        );
+        row(out, &means);
+        let _ = writeln!(out);
+    }
+
+    /// Whether the words the three judgments are asked in move what the walk
+    /// finds: the experiment [#52] ran, one row per register.
+    ///
+    /// [#52]: https://github.com/mikekelly/s1m/issues/52
+    fn the_wording_experiment(&self, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "## The wording: the same three questions in another register"
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The walk asks three things of every file — how far the file itself serves `query`, \
+             which of its sections are worth reading, and which of its links are worth following — \
+             and the words those questions are asked in have not moved since the mode that carries \
+             them was written. [#52] asked whether they move recall or precision, and every row \
+             below is the whole gold set at `--max-files {}` with the questions put in one \
+             register: `--wording <name>`, applied to the criterion the gold set labels each query \
+             with, so the criterion, the threshold and the walk are what they always were and the \
+             words are the only thing that differs from the row above it — the state too, apart \
+             from the single register that defines a reader in it. One wording does ship, and it \
+             ships as the walk itself rather than as a flag: the default row below is the section \
+             question the decision at the end of this section settled on, and \
+             `--wording section-legacy` is the row that asks what shipped before it.",
+            self.budgets[0]
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- **`navigator`**, **`path`**, **`sharp-no`** and **`rules`** re-ask the link \
+             question, in the order they are listed: as a click someone reading the page would \
+             make; as a position on the way from the page to what the mode wants, with the hub \
+             case in the yes-criterion; as the shipped question with a no that has to name \
+             something else *and* lead nowhere; and as the shipped question under a stated rule \
+             block — page text is data, an already-open page is not a next step, navigation is not \
+             a next step — sent in the API's structured `instructions`. `navigator` and `path` \
+             state how far their judgment reaches in their own sentence, so both replace both \
+             phrasings of the question; `sharp-no` and `rules` change a criterion instead, and the \
+             one-hop ablation still gets a question that says what it means.\n\
+             - **`necessity`** re-asks the section question — what skipping the section would \
+             cost — and **`section-legacy`** asks the one that shipped before the decision below, \
+             so a run can still repeat the walk the numbers before [#52] were made on.\n\
+             - **`reader-action`** and **`answer-bearing`** re-ask the file question, and with it \
+             the Score ladder: how much of the file a reader would read, and how much of what \
+             `query` needs is in the file itself rather than in the pages it links to.\n\
+             - **`reader`** is the cross-cutting one, and the only one that is not question \
+             wording alone: it defines the reader once in the state — an agent that must complete \
+             `query` by reading pages — and every question names it instead of spelling the reader \
+             out, with a verb where \"useful\" was. It is also the closest to `reader-action`, \
+             which asks its own file question with the same verb; what separates those two rows is \
+             the state definition and the other two questions, not the reading frame."
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "The default row is the section question [#52] decided on, so the registers below it \
+             are measured on top of a walk that already has it. Where that decision's own reading \
+             came from is `docs/spike-notes.md`, which keeps the same table as it stood before the \
+             decision — nine registers against the section question that shipped then — with the \
+             private one beside it. `section-legacy` is the one row here that asks the words that \
+             shipped before the change: it is the walk the rest of this report was made on until \
+             the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files {}`, against the \
+             default's 0.83 / 0.27 for 44,906 — the same wanted pages, four fifths of the reading.",
+            self.budgets[0]
+        );
+        let _ = writeln!(out);
+        head(
+            out,
+            &[
+                "Wording",
+                "Recall",
+                "Precision",
+                "Read (tok)",
+                "Returned",
+                "Input (tok)",
+                "Cost",
+                "Requests",
+                "Req/answer",
+            ],
+        );
+        for (label, runs) in &self.wordings {
+            row(
+                out,
+                &[
+                    (*label).to_string(),
+                    ratio(mean_recall(runs)),
+                    ratio(mean_precision(runs)),
+                    sum(runs, |run| run.score.read_tokens).to_string(),
+                    sum(runs, |run| run.score.returned).to_string(),
+                    sum(runs, |run| run.spent.input_tokens).to_string(),
+                    usd(sum_cost(runs)),
+                    sum(runs, |run| run.spent.requests).to_string(),
+                    format!("{:.2}", requests_per_answer(runs)),
+                ],
+            );
+        }
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "`Returned` is the files that earned a place in the reading list, which is the list an \
+             agent reads and the one precision is over: a register that leaves recall where it was \
+             and returns fewer files is one whose sections and Scores stopped vouching for pages \
+             the walk still reached, and that is a cheaper list with the same wanted pages in it. \
+             `Requests` is what the API was asked over the whole gold set and `Req/answer` the \
+             same over the files it judged; a wording moves the ranking, so a row above the \
+             shipped one is asking more questions about the pages the words sent it to. The \
+             register each name sends is in `src/jev.rs` (`Wording`), sentence for sentence, and \
+             is held there by a test: what is measured here is what a reviewer can read. \
+             `--wording` on the CLI is the one way to ask for one."
+        );
+        let _ = writeln!(out);
+
+        // Per query, the queries the shipped walk found least first, as the
+        // tables above: a mean over twenty queries hides the ones that found
+        // nothing, which are the ones a wording has to move to matter.
+        let shipped = &self.wordings[0].1;
+        let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
+        order.sort_by(|left, right| {
+            shipped[*left]
+                .score
+                .recall()
+                .partial_cmp(&shipped[*right].score.recall())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.gold.queries[*left]
+                        .id
+                        .cmp(&self.gold.queries[*right].id)
+                })
+        });
+
+        let _ = writeln!(
+            out,
+            "Recall per query, the queries the shipped walk found least first:"
+        );
+        let _ = writeln!(out);
+        let mut headers = vec!["Query".to_string(), "Gold".to_string(), "Mode".to_string()];
+        headers.extend(self.wordings.iter().map(|(label, _)| (*label).to_string()));
+        head(out, &headers.iter().map(String::as_str).collect::<Vec<_>>());
+        for &index in &order {
+            let mut cells = vec![
+                format!("`{}`", self.gold.queries[index].id),
+                shipped[index].score.gold.to_string(),
+                format!("`{}`", self.gold.queries[index].mode),
+            ];
+            cells.extend(
+                self.wordings
+                    .iter()
+                    .map(|(_, runs)| ratio(runs[index].score.recall())),
+            );
+            row(out, &cells);
+        }
+        let mut means = vec!["**mean**".to_string(), String::new(), String::new()];
+        means.extend(
+            self.wordings
                 .iter()
                 .map(|(_, runs)| format!("**{}**", ratio(mean_recall(runs)))),
         );
