@@ -476,7 +476,7 @@ link's own sentence and the target's opening line do not always say what sits un
 hub links to "Payments" whose first paragraph is about payments, while the query's answer is in
 the section called "Cutoffs". The link question is asked about what the link reaches *directly or
 through the pages it links to*, which is the same idea put to the model. Together they are worth
-0.19 of mean recall on the eval's gold set (0.64 → 0.83) for 2.3× the input tokens
+0.24 of mean recall on the eval's gold set (0.59 → 0.83) for 2.4× the input tokens
 ([#46](https://github.com/mikekelly/s1m/issues/46), [eval/REPORT.md](eval/REPORT.md#the-link-context-what-the-state-carries-and-what-each-part-earns));
 each part's own contribution is the ablation table there, and each has a hidden flag that leaves
 it out (`--no-preview-headings`, `--no-preview-leads`, `--one-hop-links`).
@@ -487,8 +487,8 @@ link, and a threshold tuned with previews is not valid without them
 ([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
 caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
 is the part of a preview most likely to mislead, and the eval put a number on it: dropping the
-frontmatter costs 0.08 of mean recall (0.83 → 0.75) for a third of the input tokens saved, and
-dropping previews altogether costs 0.47, so the frontmatter is the larger half of what a preview
+frontmatter costs 0.07 of mean recall (0.83 → 0.77) for a third of the input tokens saved, and
+dropping previews altogether costs 0.48, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
 Every part of a preview is bounded, because a preview is a hint about a target and the target is
@@ -663,7 +663,9 @@ cargo run --release --bin eval -- \
 
 The harness walks each query at `--max-files` 10 and 25 and reports, per query and in total:
 recall and precision against the gold set — the list holds only the files that earn a place, so
-precision is reported over that list and over everything the walk judged — the tokens an agent
+precision is reported over that list and over everything the walk judged — the same question one
+level down, **section recall** (the labelled part of each wanted page the returned ranges cover,
+beside file recall) and the lines those ranges span, the tokens an agent
 would read (the returned ranges, the same files whole, and the whole corpus), what the API was
 asked and what it cost, the same numbers for the keyword ranker, the calibration curve of a
 link's scent against what following it reached, a `--threshold` sweep, the preview experiment
@@ -679,22 +681,28 @@ reproducible rather than merely repeated — a cache entry stores what its call 
 number in the report is a wall clock — so with `eval/cache` committed the command above prints
 the same bytes with no key at all, and `--no-cache` with a key buys every judgment again.
 
-Its headline, in three lines:
+Its headline:
 
-- **Recall and precision at `--max-files` 10**: mean recall 0.83, mean precision 0.26 — 32 of the
-  39 wanted pages, over 129 files returned. The cutoff is what moved them: the walk judged 181
-  files and the list returns the 129 that earned a place. The budget is not what binds: the walk
-  runs out of links above `--threshold` first, and `--max-files 25` judges 202 files for the same
+- **Recall and precision at `--max-files` 10**: mean recall 0.83, mean precision 0.27 — 32 of the
+  39 wanted pages, over 126 files returned. The cutoff is what moved them: the walk judged 186
+  files and the list returns the 126 that earned a place. The budget is not what binds: the walk
+  runs out of links above `--threshold` first, and `--max-files 25` judges 213 files for the same
   mean recall (0.83).
-- **What an agent reads**: 68,663 tokens for the returned ranges, against 122,023 for the same
+- **Section recall, beside file recall**: 0.74 — 27 of the 39 wanted *parts* the gold set labels
+  are covered by the returned ranges, for 3,054 lines returned. A label is the heading or line
+  range an entry names, and an entry that names none is wanted whole, so its part is its page. The
+  walk that shipped before [#52](https://github.com/mikekelly/s1m/issues/52) — `--wording
+  section-legacy` — returns 0.78 of those parts for 4,479 lines: four points of the wanted parts
+  for a third more reading.
+- **What an agent reads**: 44,906 tokens for the returned ranges, against 120,322 for the same
   files whole and 346,160 for every page on every query. Reading the returned files whole costs
-  35% of the corpus's text; the section scores take 44% off that, and the ranking 80% off reading
+  35% of the corpus's text; the section scores take 63% off that, and the ranking 87% off reading
   everything.
-- **What it costs**: $0.044431 for the gold set at `--max-files 10` — $0.002222 a query, at 0.19 s
+- **What it costs**: $0.045945 for the gold set at `--max-files 10` — $0.002297 a query, at 0.20 s
   an answer. That is the price of the link context below: the state that shipped before
-  [#46](https://github.com/mikekelly/s1m/issues/46) found 0.64 of the wanted pages for $0.019224.
+  [#46](https://github.com/mikekelly/s1m/issues/46) found 0.59 of the wanted pages for $0.018846.
   On this wiki the keyword ranker still finds more and reads far more — recall 0.94 against s1m's
-  0.83, at 3.5× the tokens.
+  0.83, at 5.4× the tokens.
 
 ## Library
 

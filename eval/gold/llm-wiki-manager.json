@@ -1,5 +1,5 @@
 {
-  "note": "Twenty queries over the vendored llm-wiki-manager vault, written by reading the wiki: for each, the pages a person with that task would want open. Paths are relative to --wiki, so the same harness measures any wiki against its own gold set. A page that is useful and unlisted costs precision, so precision is a lower bound and no label here says a page is useless. Each query also carries a `category`, which is how eval-agent groups its results; the older `eval` binary ignores it.",
+  "note": "Twenty queries over the vendored llm-wiki-manager vault, written by reading the wiki: for each, the pages a person with that task would want open. Paths are relative to --wiki, so the same harness measures any wiki against its own gold set. A page that is useful and unlisted costs precision, so precision is a lower bound and no label here says a page is useless. Each query also carries a `category`, which is how eval-agent groups its results; the older `eval` binary ignores it. A wanted page is a path when the page answers whole, and an object naming the part of it that answers when it does not: {\"path\": ..., \"heading\": ...} for the heading text as the parser reads it \u2014 inline code and emphasis dropped, so \"fs.ts \u2014 scaffold and config\" is written without its backticks \u2014 whose section the walk is given as the heading's line through the last line of the text under it, subsections included; or {\"path\": ..., \"lines\": [first, last]} for 1-based inclusive lines as the file is written, where the answer is a paragraph or a table inside a section. Every label is checked against the wiki when the set is loaded, and `eval` counts section recall over them: a labelled part the returned ranges overlap is a hit, and a page named on its own is wanted whole, so its part is its page.",
   "queries": [
     {
       "id": "release-and-publish",
@@ -8,8 +8,8 @@
       "mode": "useful-for",
       "entry": "index.md",
       "expected": [
-        "concepts/release.md",
-        "concepts/node-version-and-types.md"
+        { "path": "concepts/release.md", "lines": [14, 20] },
+        { "path": "concepts/node-version-and-types.md", "heading": "Current policy" }
       ],
       "note": "release.md is the wiki's page on releasing (it points at RELEASING.md for the runbook); node-version-and-types.md covers the release workflow's Node pin and the gate chain a release runs."
     },
@@ -20,9 +20,9 @@
       "mode": "useful-for",
       "entry": "index.md",
       "expected": [
-        "concepts/init-command.md",
-        "entities/commands.md",
-        "concepts/template-system.md"
+        { "path": "concepts/init-command.md", "heading": "Scaffold steps" },
+        { "path": "entities/commands.md", "lines": [13, 20] },
+        { "path": "concepts/template-system.md", "heading": "Directory layout" }
       ],
       "note": "init-command.md is the flow, commands.md the module it lives in, template-system.md what it copies."
     },
@@ -33,8 +33,8 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "concepts/template-system.md",
-        "entities/templates.md"
+        { "path": "concepts/template-system.md", "heading": "Directory layout" },
+        { "path": "entities/templates.md", "heading": "Directory layout" }
       ],
       "note": "templates/ is the scaffold source of truth; template-system.md is why and how it is copied."
     },
@@ -44,9 +44,7 @@
       "query": "what node version must consumers run the CLI on",
       "mode": "answers",
       "entry": "index.md",
-      "expected": [
-        "concepts/node-version-and-types.md"
-      ],
+      "expected": [{ "path": "concepts/node-version-and-types.md", "heading": "Current policy" }],
       "note": "The runtime floor (engines.node) against the development pin (.nvmrc) is one page."
     },
     {
@@ -55,9 +53,7 @@
       "query": "why must @types/node match the .nvmrc major",
       "mode": "answers",
       "entry": "index.md",
-      "expected": [
-        "concepts/node-version-and-types.md"
-      ],
+      "expected": [{ "path": "concepts/node-version-and-types.md", "heading": "@types/node alignment" }],
       "note": "Same page as the floor, asked for the rule rather than the number."
     },
     {
@@ -67,8 +63,8 @@
       "mode": "useful-for",
       "entry": "index.md",
       "expected": [
-        "concepts/wiki-scripts.md",
-        "concepts/dogfooding.md"
+        { "path": "concepts/wiki-scripts.md", "heading": "Commands" },
+        { "path": "concepts/dogfooding.md", "heading": "Validation" }
       ],
       "note": "wiki-scripts.md is the lint/build/check subcommands; dogfooding.md is the pre-commit and pre-push hooks that run them."
     },
@@ -78,9 +74,7 @@
       "query": "how does the wiki stay in sync with code changes",
       "mode": "useful-for",
       "entry": "index.md",
-      "expected": [
-        "concepts/dogfooding.md"
-      ],
+      "expected": ["concepts/dogfooding.md"],
       "note": "The maintenance-trigger workflow and code_refs are the answer, and dogfooding.md is where it is described."
     },
     {
@@ -90,8 +84,8 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "concepts/e2e-tests.md",
-        "concepts/unit-tests.md"
+        { "path": "concepts/e2e-tests.md", "heading": "Test files" },
+        { "path": "concepts/unit-tests.md", "heading": "Script test coverage" }
       ],
       "note": "e2e-tests.md runs the built binary; unit-tests.md says which of its script tests invoke dist/bin/cli.js."
     },
@@ -101,9 +95,7 @@
       "query": "how do I run the unit test suite",
       "mode": "answers",
       "entry": "index.md",
-      "expected": [
-        "concepts/unit-tests.md"
-      ],
+      "expected": [{ "path": "concepts/unit-tests.md", "lines": [30, 36] }],
       "note": "One command and the config it reads."
     },
     {
@@ -113,9 +105,9 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "concepts/dogfooding.md",
-        "concepts/template-system.md",
-        "entities/commands.md"
+        { "path": "concepts/dogfooding.md", "heading": "Refreshing after template changes" },
+        { "path": "concepts/template-system.md", "heading": "Templates vs consumer output" },
+        { "path": "entities/commands.md", "lines": [13, 20] }
       ],
       "note": "The refreshed/preserved table is in dogfooding.md, the meta-path list that decides it in template-system.md, and the pipeline in commands.md."
     },
@@ -125,9 +117,7 @@
       "query": "what is the layout of the package source",
       "mode": "about",
       "entry": "index.md",
-      "expected": [
-        "concepts/repo-layout.md"
-      ],
+      "expected": [{ "path": "concepts/repo-layout.md", "heading": "Package source" }],
       "note": "The table of bin/, src/, templates/, test/ and the dogfooded wiki."
     },
     {
@@ -137,8 +127,8 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "AGENTS.md",
-        "schema.md"
+        { "path": "AGENTS.md", "heading": "\u00a73a Scope-tag convention" },
+        { "path": "schema.md", "heading": "Flat entities/ namespace" }
       ],
       "note": "The scope-tag convention is stated in AGENTS.md \u00a73a and specified in schema.md's flat namespace section."
     },
@@ -149,8 +139,8 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "AGENTS.md",
-        "concepts/wiki-scripts.md"
+        { "path": "AGENTS.md", "heading": "Gotchas" },
+        { "path": "concepts/wiki-scripts.md", "heading": "Commands" }
       ],
       "note": "AGENTS.md says never to hand-edit them and names build; wiki-scripts.md documents the subcommand."
     },
@@ -161,8 +151,8 @@
       "mode": "useful-for",
       "entry": "index.md",
       "expected": [
-        "AGENTS.md",
-        "schema.md",
+        { "path": "AGENTS.md", "heading": "Ingest (a new artifact lands in raw/)" },
+        { "path": "schema.md", "heading": "Ingest" },
         "raw/raw.md"
       ],
       "note": "The ingest workflow is in AGENTS.md \u00a77 and schema.md, with the raw tree's hub page as where the artifact goes."
@@ -175,7 +165,7 @@
       "entry": "index.md",
       "expected": [
         "raw/raw.md",
-        "schema.md"
+        { "path": "schema.md", "heading": "Directory Layout" }
       ],
       "note": "raw/raw.md is the hub of the immutable tree; schema.md gives the directory layout and the never-edit rule."
     },
@@ -198,9 +188,7 @@
       "query": "which module dispatches CLI subcommands",
       "mode": "answers",
       "entry": "index.md",
-      "expected": [
-        "entities/cli.md"
-      ],
+      "expected": [{ "path": "entities/cli.md", "heading": "Command dispatch" }],
       "note": "The dispatch table names the handler module for each subcommand."
     },
     {
@@ -210,9 +198,9 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "concepts/template-system.md",
-        "entities/templates.md",
-        "concepts/init-command.md"
+        { "path": "concepts/template-system.md", "heading": "Interpolation" },
+        { "path": "entities/templates.md", "heading": "Directory layout" },
+        { "path": "concepts/init-command.md", "heading": "Prompts and variables" }
       ],
       "note": "template-system.md has interpolate() and the variable list, init-command.md gathers the values, templates.md has the file set."
     },
@@ -223,8 +211,8 @@
       "mode": "answers",
       "entry": "index.md",
       "expected": [
-        "entities/utils.md",
-        "concepts/template-system.md"
+        { "path": "entities/utils.md", "heading": "fs.ts \u2014 scaffold and config" },
+        { "path": "concepts/template-system.md", "heading": "Interpolation" }
       ],
       "note": "utils.md is the scope overview with the exports; template-system.md is the part of it that copies and interpolates."
     },
@@ -236,7 +224,7 @@
       "entry": "index.md",
       "expected": [
         "log.md",
-        "AGENTS.md"
+        { "path": "AGENTS.md", "heading": "\u00a77 The three workflows" }
       ],
       "note": "log.md is the append-only record itself; AGENTS.md documents the entries it takes (ingest, query, lint, maintenance)."
     }

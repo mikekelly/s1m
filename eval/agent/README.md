@@ -160,8 +160,15 @@ The format the existing `eval` binary reads, plus a `category`:
   names and labels — never a path, never the question.
 - `wanted` may also be spelled `expected`, and `why` may be spelled `note`:
   both binaries read one file, because each ignores the fields it does not
-  know. `eval/gold/llm-wiki-manager.json` carries categories and still
-  reproduces the older `eval` report byte for byte.
+  know. `eval/gold/llm-wiki-manager.json` carries categories and section
+  labels, and neither binary reads the other's field.
+- A wanted page is a path, or an object naming the part of it that answers —
+  `{"path": "concepts/release.md", "heading": "Current policy"}` or
+  `{"path": "concepts/release.md", "lines": [14, 20]}`. `eval` resolves the
+  label against the wiki and counts its section recall over it; **the agent
+  conditions read the page and score at file level**, because which files a run
+  should have returned is the question they ask. A private gold set labelled
+  the same way measures both harnesses.
 - `entry` is per query and is the page the walk starts from. It may be one
   path or an array of them — a wiki need not have one way in — and a query
   without it falls back to `--entry`, which defaults to `index.md` and may be
