@@ -1,0 +1,1 @@
+{"format":3,"judgment":{"relevance":1.0,"sections":[{"heading":"Raw Sources","lines":[11,24],"score":0.92}],"links":[]},"detail":{"model":"jev-1.13.0","questions":2,"requests":1,"relevance_level":3.0,"relevance_confidence":1.0,"choice_confidence":[],"input_tokens":830,"output_tokens":38,"latency":{"secs":0,"nanos":102232582}}}

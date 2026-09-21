@@ -30,9 +30,10 @@ const REPORT: &str = "eval/REPORT.md";
 
 #[test]
 fn the_committed_cache_reproduces_the_committed_report() {
-    // `--relative-judge` is part of the command the report documents: the
-    // committed report carries the relative judge's rows, and the answers they
-    // were bought with are in the committed cache like any other.
+    // `--relative-judge` and `--wordings` are part of the command the report
+    // documents: the committed report carries the relative judge's rows and the
+    // wording table, and the answers both were bought with are in the committed
+    // cache like any other.
     let output = Command::new(EVAL)
         .args([
             "--wiki",
@@ -42,6 +43,7 @@ fn the_committed_cache_reproduces_the_committed_report() {
             "--cache",
             CACHE,
             "--relative-judge",
+            "--wordings",
         ])
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("S1M_ENDPOINT")
