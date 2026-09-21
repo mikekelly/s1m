@@ -132,7 +132,8 @@ impl Trace {
     }
 
     /// One request made for a file, once per post: a page whose sections and
-    /// links did not fit the API's state budget in one is asked about in
+    /// links did not fit the API's state budget in one, and a page over the
+    /// content cap that was split by its heading tree, are asked about in
     /// several, and each is its own record, in the order they were sent.
     ///
     /// A file whose answer was on disk is reported the same way, and its

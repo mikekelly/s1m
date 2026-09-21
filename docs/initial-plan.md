@@ -60,7 +60,7 @@ Each round expands the top-k frontier files concurrently, so latency is one roun
 
 ### One request per file
 
-Jev answers independent questions over the same state in parallel, so each visited file is a single request — unless its sections and links do not fit the API's 32k state budget in one, when it is split and the answers merged (see `docs/spike-notes.md`). The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph, its H2/H3 headings and the anchors of its own in-root links, since [#46](https://github.com/mikekelly/s1m/issues/46)) read from disk.
+Jev answers independent questions over the same state in parallel, so each visited file is a single request — unless its sections and links do not fit the API's 32k state budget in one, when it is split across posts and the answers merged, or its text is longer than the 40k characters a post carries, when it is split by its own heading tree into chunks that each fit, one post per chunk, and the file's relevance is the best of its chunks (see `docs/spike-notes.md`). The state holds the query, the file's path, title and content, and for every outgoing link its anchor text, surrounding sentence, enclosing heading, and a preview of the target (title, frontmatter, first paragraph, its H2/H3 headings and the anchors of its own in-root links, since [#46](https://github.com/mikekelly/s1m/issues/46)) read from disk.
 
 | Judgment | Primitive | Question | Used for |
 | --- | --- | --- | --- |

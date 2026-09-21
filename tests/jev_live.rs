@@ -285,6 +285,54 @@ async fn a_hub_page_too_big_for_one_request_is_split_and_answered() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A page over the content cap is judged in full ([#53]): the whole page goes
+/// to the API — the tail in a post of its own — and the section written past
+/// the cap is read for what it says instead of being judged from its heading.
+///
+/// The page is this repository's own README, which is public and committed and
+/// over the cap on its own; its last section is "Development", so a query about
+/// running the tests is a query about the tail the cap used to cut.
+///
+/// [#53]: https://github.com/mikekelly/s1m/issues/53
+#[tokio::test]
+async fn a_page_over_the_content_cap_is_judged_in_full() {
+    let root = repo();
+    let Some(scorer) = live_scorer(&root) else {
+        return;
+    };
+    let file = page(&root, "README.md");
+    let source = fs::read_to_string(root.join("README.md")).expect("the README");
+    assert!(
+        source.chars().count() > 40_000,
+        "the page has to be over the cap the split works to for this to test it: {} characters",
+        source.chars().count()
+    );
+
+    let outcome = scorer
+        .judge(
+            "how do I run the tests, the lints and CI before opening a pull request",
+            &file,
+        )
+        .await
+        .expect("the API answers every post");
+    assert_judged(&file, &outcome.judgment);
+
+    assert!(
+        outcome.detail.requests > 1,
+        "{} characters should not fit one post: {} questions in {} requests",
+        source.chars().count(),
+        outcome.detail.questions,
+        outcome.detail.requests
+    );
+    // The tail is judged as text: the last section of the README opens past the
+    // cap, and it is the one this query is about.
+    let development = section(&outcome.judgment, "Development");
+    assert!(
+        development > 0.5,
+        "the README's last section is what the query asks for, and it scored {development}"
+    );
+}
+
 /// A directory for a live test to cache in: under the target directory, so a
 /// test never writes an entry into a home directory, and emptied on the way in
 /// so a run does not read an earlier one's answers.

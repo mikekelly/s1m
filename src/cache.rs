@@ -79,8 +79,10 @@ pub trait Cacheable: Scorer {
         file: &ParsedFile,
     ) -> Result<(FileJudgment, Self::Detail), ScorerError>;
 
-    /// How many requests one built request is: one, unless the file's sections
-    /// and links did not fit the API's state budget in one and it was split
+    /// How many requests one built request is: one, unless the file did not fit
+    /// one post — its sections and links over the API's state budget, or a page
+    /// over the content cap split by its heading tree
+    /// ([#53](https://github.com/mikekelly/s1m/issues/53)) — and it was split
     /// across posts.
     ///
     /// What a trace reports as one `requested` event per post

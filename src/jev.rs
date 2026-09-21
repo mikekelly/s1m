@@ -9,11 +9,15 @@
 //! written up in `docs/spike-notes.md`.
 //!
 //! A file whose sections and links would not fit the API's state budget in one
-//! request is split across posts instead: every post carries the same file and
-//! its own share of the questions, and the answers merge into one judgment. The
-//! split measures what it sends — the file, each link's entry and preview, and
-//! the questions — and keeps every post under both of the API's budgets; see
+//! request is split across posts instead, and so is a page whose own text does
+//! not fit one: that one is split by its heading tree, so each post carries a
+//! chunk of the page, the sections written in it and the links that appear in
+//! it ([#53]). Either way the answers merge into one judgment. The split
+//! measures what it sends — the file, each link's entry and preview, and the
+//! questions — and keeps every post under both of the API's budgets; see
 //! [`JevScorer::pack`] and [`CHARS_PER_TOKEN`].
+//!
+//! [#53]: https://github.com/mikekelly/s1m/issues/53
 //!
 //! There is no Rust SDK, so this calls the HTTP API directly:
 //! <https://docs.typesafe.ai/api.md>. The wording of every question lives in
@@ -32,7 +36,7 @@ use futures_util::future::join_all;
 use serde::{Deserialize, Serialize};
 
 use crate::cache::Cacheable;
-use crate::parse::{self, FrontmatterField, Link, ParsedFile};
+use crate::parse::{self, FrontmatterField, Link, ParsedFile, Section};
 use crate::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgment};
 
 /// The evaluation endpoint. One call, one shape; the SDKs wrap this.
@@ -95,11 +99,17 @@ pub const KEEP_CEILING: f64 = 0.5;
 /// before a set of shares is treated as something other than a distribution.
 const SHARE_EPSILON: f64 = 1e-6;
 
-/// How much of the file's text is sent. The API allows 32k tokens for the state
-/// plus the longest question and 64k for the whole request; at the two
-/// characters per token the split measures with ([`CHARS_PER_TOKEN`]), this
+/// How much of a page's text one post carries. The API allows 32k tokens for
+/// the state plus the longest question and 64k for the whole request; at the
+/// two characters per token the split measures with ([`CHARS_PER_TOKEN`]), this
 /// spends about five eighths of the state budget and leaves the link table the
 /// rest.
+///
+/// A page longer than this is not cut: it is split by its own heading tree into
+/// chunks that each fit, and judged chunk by chunk ([`chunks`]). The one place
+/// this still cuts is a run of text no heading divides — a single section, or a
+/// page with no heading in it — longer than this on its own, which the tree has
+/// no answer for: that chunk is [`clamp`]ed and says so.
 const CONTENT_LIMIT: usize = 40_000;
 
 /// The tokens the API allows for `state` plus the longest question, from
@@ -1037,17 +1047,31 @@ struct PreviewState {
     leads_to: Option<Vec<String>>,
 }
 
-/// What every post of one file carries whatever its share of the questions:
-/// the query and the file itself. [`JevScorer::pack`] builds one and hands the
-/// same one to every post.
+/// One file's request material: the chunks of its text — one, unless the page is
+/// over [`CONTENT_LIMIT`] and its heading tree splits it ([`chunks`]) — the
+/// file's sections, and its links.
 ///
-/// It is one value rather than two arguments because the two go in together — a
-/// post that carried the file but not the query would be a post about nothing —
-/// and because they are the same bytes in every post of a file, which is what
-/// [`Fixed::state`] measures once.
-struct Head {
-    query: String,
+/// A chunk names its own share of them by index, so the answers of the posts
+/// that carry it are read back onto the file's own entries whatever the order
+/// the posts were made in ([`outcome`]).
+#[derive(Debug)]
+struct Parts {
+    chunks: Vec<Chunk>,
+    sections: Vec<SectionState>,
+    links: Vec<LinkState>,
+}
+
+/// One chunk of a file's text: what `state.file` is for the posts that carry it,
+/// and which of the file's sections and links are written in it.
+///
+/// A page inside the cap is one chunk covering the whole file, so what such a
+/// page sends does not change; a page over it is several, and the file's `path`
+/// and `title` are the page's in every one of them.
+#[derive(Debug)]
+struct Chunk {
     file: FileState,
+    sections: Vec<usize>,
+    links: Vec<usize>,
 }
 
 /// One file's request: the body to post, or the bodies when the file's sections
@@ -1102,8 +1126,11 @@ struct Body {
 /// carries.
 #[derive(Debug, Clone, Copy)]
 struct Asking {
-    /// Whether this post asks the file's own Score, which is the first post's to
-    /// ask: three posts would otherwise buy three answers to one question.
+    /// Whether this post asks the file's own Score, which is the first post of
+    /// each chunk's to ask: a later post of the same chunk would buy a second
+    /// answer to a question about the same text, and a chunk asks about text no
+    /// other chunk carries, so the file is ranked by the best of them
+    /// ([`outcome`]).
     score: bool,
     /// What it asks about the links it carries.
     links: LinkQuestions,
@@ -1398,9 +1425,10 @@ pub struct JevDetail {
     /// How many questions the request carried, over all its posts: the file,
     /// its sections and its links.
     pub questions: usize,
-    /// How many requests the judgment took. One, unless the file's sections and
-    /// links did not fit the API's state budget in one: this module splits a
-    /// file into posts, and a post is a request.
+    /// How many requests the judgment took. One, unless the file did not fit
+    /// one post — its sections and links over the API's state budget, or a page
+    /// over [`CONTENT_LIMIT`] split by its heading tree — when this module
+    /// splits it into posts, and a post is a request.
     pub requests: usize,
     /// The raw Score answer, 0 to the top level, before it became a relevance.
     pub relevance_level: f64,
@@ -1683,28 +1711,27 @@ impl JevScorer {
     /// One request for one file: its content, its sections, and a question per
     /// section and per link.
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
-        let (file, sections, links) = self.parts(file)?;
-        Ok(self.pack(query, file, sections, links, LinkQuestions::Asked))
+        let mut parts = self.parts(file)?;
+        Ok(self.pack(query, &mut parts, LinkQuestions::Asked))
     }
 
     /// What one file's request is made of: the file as the model sees it, its
     /// sections, and its links. Both scorers ask with these, and they differ in
     /// what they ask about the links ([`LinkQuestions`]).
-    fn parts(
-        &self,
-        file: &ParsedFile,
-    ) -> Result<(FileState, Vec<SectionState>, Vec<LinkState>), ScorerError> {
-        let content = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
+    ///
+    /// "The file as the model sees it" is one chunk per run of its text: the
+    /// whole page when it fits [`CONTENT_LIMIT`], and otherwise the pieces its
+    /// own heading tree gives it, each carrying the sections and links written
+    /// in it, so that no part of a long page goes unjudged ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    fn parts(&self, file: &ParsedFile) -> Result<Parts, ScorerError> {
+        let text = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
             path: file.path.clone(),
             source,
         })?;
 
-        let state = FileState {
-            path: file.path.display().to_string(),
-            title: file.title.clone(),
-            content: clamp(&content, CONTENT_LIMIT),
-        };
-        let sections = file
+        let sections: Vec<SectionState> = file
             .sections
             .iter()
             .map(|section| SectionState {
@@ -1713,7 +1740,7 @@ impl JevScorer {
                 lines: section.lines,
             })
             .collect();
-        let links = file
+        let links: Vec<LinkState> = file
             .links
             .iter()
             .map(|link| LinkState {
@@ -1725,22 +1752,51 @@ impl JevScorer {
             })
             .collect();
 
-        Ok((state, sections, links))
+        let chunks = chunks(&text, &file.sections, CONTENT_LIMIT)
+            .into_iter()
+            .map(|range| Chunk {
+                // The page's own path and title in every chunk, and the chunk's
+                // text as its content. A chunk the heading tree could not split
+                // further is clamped, and says so, the way every other bounded
+                // part of the state does.
+                file: FileState {
+                    path: file.path.display().to_string(),
+                    title: file.title.clone(),
+                    content: clamp(&line_text(&text, range), CONTENT_LIMIT),
+                },
+                // A section is carried by the chunk its heading is in, and a
+                // link by the chunk its anchor starts in, so every one of them
+                // is judged once, in the chunk whose text holds it.
+                sections: (0..sections.len())
+                    .filter(|&index| holds(range, file.sections[index].lines[0]))
+                    .collect(),
+                links: (0..links.len())
+                    .filter(|&index| holds(range, file.links[index].line))
+                    .collect(),
+            })
+            .collect();
+
+        Ok(Parts {
+            chunks,
+            sections,
+            links,
+        })
     }
 
     /// The file's questions, split across as many posts as the API's state
-    /// budget needs.
+    /// budget needs, and across the chunks its own heading tree gives it when
+    /// the page is over [`CONTENT_LIMIT`] ([#53]).
     ///
-    /// One post is the normal case: every question of a request sees the same
-    /// state and is evaluated in parallel, so splitting gains latency nothing.
-    /// This is a size question, and the size that binds is the state: the docs
-    /// allow 32k tokens for `state` plus the longest question, and the state
-    /// grows with a link table at roughly 250 tokens a link with previews
-    /// (`docs/spike-notes.md`) — a page of 17k characters and 92 previewed
-    /// links is one request the API refuses and two it answers ([#37]). The
-    /// file's own text is capped at [`CONTENT_LIMIT`], so the sections and
-    /// links are dealt out into shares that fit beside it, the file goes in
-    /// every post, and its answers merge into one judgment.
+    /// One post per chunk is the normal case: every question of a request sees
+    /// the same state and is evaluated in parallel, so splitting gains latency
+    /// nothing. This is a size question, and the size that binds is the state:
+    /// the docs allow 32k tokens for `state` plus the longest question, and the
+    /// state grows with a link table at roughly 250 tokens a link with previews
+    /// (`docs/spike-notes.md`) — a page of 17k characters and 92 previewed links
+    /// is one request the API refuses and two it answers ([#37]). A chunk's own
+    /// sections and links are dealt out into shares that fit beside it, the
+    /// chunk goes in every one of its posts, and the answers of all of them
+    /// merge into one judgment ([`outcome`]).
     ///
     /// The questions are dealt out in the file's own order, sections first, so
     /// the answers of the posts in order are the file's sections and links in
@@ -1750,69 +1806,70 @@ impl JevScorer {
     /// deliberately a conservative one.
     ///
     /// [#37]: https://github.com/mikekelly/s1m/issues/37
-    fn pack(
-        &self,
-        query: &str,
-        file: FileState,
-        sections: Vec<SectionState>,
-        mut links: Vec<LinkState>,
-        asked: LinkQuestions,
-    ) -> Request {
-        let fixed = Fixed {
-            // The file's own state: what every post carries whatever its share.
-            state: json_len(&query) + json_len(&file),
-            // The API's state budget is the state plus the longest question,
-            // and every post asks at least one question about what it carries.
-            longest: self.longest_question(),
-            // The file's Score is about the whole file, so it is asked once, in
-            // the first post, and only that post pays for it.
-            score: json_len(&self.score_question()),
-        };
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    fn pack(&self, query: &str, parts: &mut Parts, asked: LinkQuestions) -> Request {
+        let Parts {
+            chunks,
+            sections,
+            links,
+        } = parts;
+        // The API's state budget is the state plus the longest question, and
+        // every post asks at least one question about what it carries. Neither
+        // depends on the chunk.
+        let longest = self.longest_question();
+        let score = json_len(&self.score_question());
 
-        // A file whose own state and longest question leave no room for a
-        // previewed link drops its previews before it drops links: a link
-        // judged from its anchor is worth more than a link never judged at all,
-        // and a preview is a hint (`JevScorer::preview`). What this bounds is a
-        // file whose text fills the budget on its own — content of
-        // [`CONTENT_LIMIT`] characters is sent as more than that once its
-        // quotes and newlines are escaped.
-        let cheapest = links
-            .iter()
-            .filter(|link| link.target_preview.is_some())
-            .map(json_len)
-            .min();
-        if cheapest.is_some_and(|entry| fixed.state + fixed.longest + entry > STATE_CHARS) {
-            for link in &mut links {
-                link.target_preview = None;
+        let mut posts = Vec::new();
+        for chunk in chunks.iter() {
+            let fixed = Fixed {
+                // The chunk's own state: what every post of this chunk carries
+                // whatever its share of the questions.
+                state: json_len(&query) + json_len(&chunk.file),
+                longest,
+                // The file's Score is about the whole file, so it is asked once
+                // per chunk, in its first post, and only that post pays for it.
+                score,
+            };
+
+            // A chunk whose own state and longest question leave no room for a
+            // previewed link drops its previews before it drops links: a link
+            // judged from its anchor is worth more than a link never judged at
+            // all, and a preview is a hint (`JevScorer::preview`). What this
+            // bounds is a chunk whose text fills the budget on its own — content
+            // of [`CONTENT_LIMIT`] characters is sent as more than that once its
+            // quotes and newlines are escaped.
+            let cheapest = chunk
+                .links
+                .iter()
+                .filter(|&&index| links[index].target_preview.is_some())
+                .map(|&index| json_len(&links[index]))
+                .min();
+            if cheapest.is_some_and(|entry| fixed.state + fixed.longest + entry > STATE_CHARS) {
+                for &index in &chunk.links {
+                    links[index].target_preview = None;
+                }
+            }
+
+            let shares = self.shares(chunk, sections, links, &fixed, asked);
+            for (index, share) in shares.iter().enumerate() {
+                posts.push(self.post(
+                    query,
+                    &chunk.file,
+                    sections,
+                    links,
+                    share,
+                    Asking {
+                        // The first post of the chunk asks the file's Score, and
+                        // later ones do not; the best of the answers the chunks
+                        // give is the file's ([`outcome`]).
+                        score: index == 0,
+                        links: asked,
+                    },
+                ));
             }
         }
 
-        let shares = self.shares(&sections, &links, &fixed, asked);
-        let head = Head {
-            query: query.to_string(),
-            file,
-        };
-
-        Request {
-            posts: shares
-                .iter()
-                .enumerate()
-                .map(|(index, share)| {
-                    // The file's Score is about the whole file, so the first
-                    // post asks it and later ones do not.
-                    self.post(
-                        &head,
-                        &sections,
-                        &links,
-                        share,
-                        Asking {
-                            score: index == 0,
-                            links: asked,
-                        },
-                    )
-                })
-                .collect(),
-        }
+        Request { posts }
     }
 
     /// The characters of the longest question this file asks: what the state
@@ -1835,12 +1892,17 @@ impl JevScorer {
     }
 
     /// Deals the file's sections and links out into shares that each fit the
-    /// API's budgets beside the file.
+    /// API's budgets beside it.
     ///
-    /// Always at least one share, even for a file with no sections and no
-    /// links: the file still has a Score to ask.
+    /// Always at least one share, even for a chunk with no sections and no
+    /// links: the chunk still has a Score to ask.
+    ///
+    /// `chunk` names the file's own sections and links it carries by index, and
+    /// they are what the shares hold: the file positions the answers are read
+    /// back onto are the parser's, not the post's.
     fn shares(
         &self,
+        chunk: &Chunk,
         sections: &[SectionState],
         links: &[LinkState],
         fixed: &Fixed,
@@ -1851,33 +1913,37 @@ impl JevScorer {
         // and colon around the id each question is filed under. The question is
         // built with the item's position in the file, which is at least its
         // position in the post that asks it, so the estimate never runs short
-        // of the text sent.
-        let costs = sections
+        // of the text sent; the id is built with the position the post gives it,
+        // which is what the body will hold.
+        let costs = chunk
+            .sections
             .iter()
             .enumerate()
-            .map(|(index, section)| {
+            .map(|(position, &index)| {
                 (
                     Item::Section(index),
                     Cost::of(
-                        section,
+                        &sections[index],
                         &self.section_question(index),
-                        &section_question(index),
+                        &section_question(position),
                     ),
                 )
             })
-            .chain(links.iter().enumerate().map(|(index, link)| {
+            .chain(chunk.links.iter().enumerate().map(|(position, &index)| {
                 (
                     Item::Link(index),
                     match asked {
-                        LinkQuestions::Asked => {
-                            Cost::of(link, &self.link_question(index), &link_question(index))
-                        }
+                        LinkQuestions::Asked => Cost::of(
+                            &links[index],
+                            &self.link_question(index),
+                            &link_question(position),
+                        ),
                         // The state carries the link, the file's own judgment
                         // is made beside it, and nothing is asked about it: the
                         // links of a file judged this way are the Choice
                         // question's, which is a post of its own.
                         LinkQuestions::Omitted => Cost {
-                            state: json_len(link) + 1,
+                            state: json_len(&links[index]) + 1,
                             question: 0,
                         },
                     },
@@ -1946,11 +2012,12 @@ impl JevScorer {
         shares.len() - 1
     }
 
-    /// One post: the file, its share of the sections and links, what it asks
-    /// about them, and where each answer goes.
+    /// One post: the chunk of the file it carries, its share of that chunk's
+    /// sections and links, what it asks about them, and where each answer goes.
     fn post(
         &self,
-        head: &Head,
+        query: &str,
+        file: &FileState,
         sections: &[SectionState],
         links: &[LinkState],
         share: &Share,
@@ -1962,9 +2029,9 @@ impl JevScorer {
         }
 
         let mut state = State {
-            query: head.query.clone(),
+            query: query.to_string(),
             reader: (!self.mode.reader.is_empty()).then_some(self.mode.reader),
-            file: head.file.clone(),
+            file: file.clone(),
             sections: Vec::with_capacity(share.sections.len()),
             links: Vec::with_capacity(share.links.len()),
         };
@@ -2138,8 +2205,14 @@ struct Judging {
 ///
 /// `responses` are the answers to `request.posts`, in that order, which is the
 /// order the questions were dealt out in: the file's sections in document
-/// order, then its links in the order they appear. So the answers of the posts
-/// in order are the file's sections and links in order.
+/// order, then its links in the order they appear.
+///
+/// The answers are written back onto the file's own entries by the index each
+/// post carries rather than appended in the order they arrive, so the two lists
+/// this returns are the file's lists: a page sent in several chunks is dealt by
+/// its links' *lines*, which is not the parser's own order for a link whose text
+/// run begins on a later line than its anchor ([`crate::parse`]), and a caller
+/// that pairs the two by index must get the answer that named the entry.
 fn outcome(
     file: &ParsedFile,
     request: &Request,
@@ -2154,12 +2227,17 @@ fn outcome(
         .map(|response| response.model.clone())
         .unwrap_or_default();
 
-    let mut level = None;
+    let mut best: Option<(f64, f64)> = None;
     let mut questions = 0;
     let mut input_tokens = 0;
     let mut output_tokens = 0;
-    let mut sections = Vec::with_capacity(file.sections.len());
-    let mut links = Vec::with_capacity(file.links.len());
+    // One slot per entry of the file, filled where its answer arrives. A link
+    // the scorer did not judge — one it left out of the state because it fitted
+    // nowhere, or one the Choice question asks instead — stays empty and is
+    // dropped below, which is what "one per link it judged" means
+    // ([`crate::scorer::FileJudgment::links`]).
+    let mut sections: Vec<Option<SectionJudgment>> = vec![None; file.sections.len()];
+    let mut links: Vec<Option<LinkJudgment>> = vec![None; file.links.len()];
     let mut choices = Vec::new();
 
     for (post, response) in request.posts.iter().zip(responses) {
@@ -2168,10 +2246,17 @@ fn outcome(
         input_tokens += response.usage.input_tokens;
         output_tokens += response.usage.output_tokens;
 
-        // Only the first post of the file's own questions carries the Score; a
-        // later post's answers are all sections and links.
+        // Every chunk's first post carries the Score, and a later post of a
+        // chunk carries sections and links only. A page sent in several chunks
+        // is ranked by the part of it that is worth reading, so the file's
+        // relevance is the best of the answers its chunks gave ([#53]).
+        //
+        // [#53]: https://github.com/mikekelly/s1m/issues/53
         if let Some(answer) = answers.remove(FILE_QUESTION) {
-            level = Some(answer.score(FILE_QUESTION)?);
+            let (level, confidence) = answer.score(FILE_QUESTION)?;
+            if best.is_none_or(|(highest, _)| level > highest) {
+                best = Some((level, confidence));
+            }
         }
 
         for (position, &index) in post.sections.iter().enumerate() {
@@ -2181,7 +2266,7 @@ fn outcome(
                 .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
                 .noul(&id)?;
             let section = &file.sections[index];
-            sections.push(SectionJudgment {
+            sections[index] = Some(SectionJudgment {
                 heading: section.heading.clone(),
                 // The parser's own range, never a derived one: what the
                 // caller reads is the section that was judged.
@@ -2206,7 +2291,7 @@ fn outcome(
                 .keeps(&shares, none);
             choices.push(confidence);
             for (position, &index) in post.links.iter().enumerate() {
-                links.push(LinkJudgment {
+                links[index] = Some(LinkJudgment {
                     target: file.links[index].target.clone(),
                     scent: shares[position],
                     keep: keep[position],
@@ -2228,7 +2313,7 @@ fn outcome(
                 .remove(&id)
                 .ok_or_else(|| ScorerError::MissingAnswer { id: id.clone() })?
                 .noul(&id)?;
-            links.push(LinkJudgment {
+            links[index] = Some(LinkJudgment {
                 target: file.links[index].target.clone(),
                 scent,
                 keep: true,
@@ -2236,9 +2321,16 @@ fn outcome(
         }
     }
 
-    let (level, confidence) = level.ok_or_else(|| ScorerError::MissingAnswer {
+    let (level, confidence) = best.ok_or_else(|| ScorerError::MissingAnswer {
         id: FILE_QUESTION.to_string(),
     })?;
+    // Every section is asked about in exactly one post, so a slot left empty is
+    // this module's own arithmetic rather than anything the API can do.
+    let sections: Vec<SectionJudgment> = sections
+        .into_iter()
+        .map(|section| section.expect("every section is asked in exactly one post"))
+        .collect();
+    let links: Vec<LinkJudgment> = links.into_iter().flatten().collect();
 
     Ok(JevOutcome {
         judgment: FileJudgment {
@@ -2335,7 +2427,16 @@ impl Scorer for JevScorer {
 /// beside the file, is asked in as many posts as it needs; the answers merge
 /// into one file's links, in the page's own order.
 ///
+/// A page over [`CONTENT_LIMIT`] is asked that way chunk by chunk as well: each
+/// of its chunks asks one Choice over the links written in it ([#53]), so the
+/// [`NONE_OPTION`] a link is weighed against is its own chunk's — a share is
+/// relative to the options it was offered beside, and a chunk is what one post
+/// can put in front of the model. What that does to this scorer's numbers has
+/// not been measured: [#47]'s rows, and the [`KeepRule`] they set, are all
+/// one-post pages.
+///
 /// [#47]: https://github.com/mikekelly/s1m/issues/47
+/// [#53]: https://github.com/mikekelly/s1m/issues/53
 pub struct ChoiceScorer {
     /// The absolute judge whose plumbing this shares: one client, one endpoint,
     /// one key, one file's own Score and its sections.
@@ -2421,34 +2522,34 @@ impl ChoiceScorer {
     ///
     /// The base posts come first, so the file's Score is asked in the first post
     /// of the request the way it is asked today; all of them go out together,
-    /// so the file costs one round trip and not two.
+    /// so the file costs one round trip and not two. A page over
+    /// [`CONTENT_LIMIT`] is chunked the same way here, and each of its chunks
+    /// asks its own Choice question over the links that chunk carries ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
     fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
-        let (state, sections, links) = self.base.parts(file)?;
+        let mut parts = self.base.parts(file)?;
         let mut posts = self
             .base
-            .pack(
-                query,
-                state.clone(),
-                sections,
-                links,
-                LinkQuestions::Omitted,
-            )
+            .pack(query, &mut parts, LinkQuestions::Omitted)
             .posts;
-        posts.extend(self.choice_posts(query, &state, &file.links));
+        for chunk in &parts.chunks {
+            posts.extend(self.choice_posts(query, &chunk.file, &chunk.links, &file.links));
+        }
         Ok(Request { posts })
     }
 
-    /// One file's Choice posts: its in-root links dealt out into questions the
+    /// One chunk's Choice posts: its in-root links dealt out into questions the
     /// API takes.
     ///
     /// Two ceilings decide a chunk, and either can bind first: the API's 255
     /// options, [`NONE_OPTION`] being one of them, and the state budget — the
-    /// query, the file, and the question itself, which grows by an option at a
+    /// query, the chunk, and the question itself, which grows by an option at a
     /// time. A link the state budget cannot take even alone is still asked
     /// about, in a post of its own: a page whose own text fills the budget must
     /// not lose its links to arithmetic.
     ///
-    /// A page with no in-root link asks nothing: there is no option to choose
+    /// A chunk with no in-root link asks nothing: there is no option to choose
     /// between, and the page is judged by its own Score and sections as it
     /// always is.
     ///
@@ -2456,12 +2557,17 @@ impl ChoiceScorer {
     /// state entries the file's judgment carries: an option's preview is this
     /// scorer's own switch ([`ChoiceScorer::with_previews`]), and the file's own
     /// judgment is made with the previews that always ship.
-    fn choice_posts(&self, query: &str, file: &FileState, links: &[Link]) -> Vec<Post> {
-        let options: Vec<(usize, String)> = links
+    fn choice_posts(
+        &self,
+        query: &str,
+        file: &FileState,
+        indices: &[usize],
+        links: &[Link],
+    ) -> Vec<Post> {
+        let options: Vec<(usize, String)> = indices
             .iter()
-            .enumerate()
-            .filter(|(_, link)| link.in_root)
-            .map(|(index, link)| (index, self.option(link)))
+            .filter(|&&index| links[index].in_root)
+            .map(|&index| (index, self.option(&links[index])))
             .collect();
         if options.is_empty() {
             return Vec::new();
@@ -2602,7 +2708,10 @@ impl Cacheable for ChoiceScorer {
     /// One post per request, and a page split across posts is that many
     /// requests: what a trace reports as one `requested` event per post. The
     /// Choice questions ride in posts of their own, so a page whose links are
-    /// asked in chunks is several.
+    /// asked in chunks is several, and so is a page over [`CONTENT_LIMIT`],
+    /// whose chunks each ask their own ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
     fn posts(&self, request: &Request) -> usize {
         request.posts.len()
     }
@@ -2650,8 +2759,12 @@ impl Cacheable for JevScorer {
         JevScorer::request(self, query, file)
     }
 
-    /// One request per file unless the sections and links did not fit one
-    /// post's budget: what a trace reports as one `requested` event per post.
+    /// One request per file unless the file did not fit one post — its sections
+    /// and links over the state budget, or a page over [`CONTENT_LIMIT`] split
+    /// by its heading tree ([#53]) — which is what a trace reports as one
+    /// `requested` event per post.
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
     fn posts(&self, request: &Request) -> usize {
         request.posts.len()
     }
@@ -2762,6 +2875,186 @@ fn clamp(text: &str, limit: usize) -> String {
     }
     let head: String = text.chars().take(limit).collect();
     format!("{head}\n[truncated at {limit} characters]")
+}
+
+// -------------------------------------------------------------- the chunks
+
+/// The chunks one page's text is sent in: one covering the whole page when it
+/// fits `limit` characters, and otherwise the pieces its own heading tree gives
+/// it, merged again while they fit ([#53]).
+///
+/// A page over the limit used to be cut at the limit: the tail was replaced by a
+/// marker, no judgment ever saw it, and a section written past the cut was asked
+/// about from its heading alone. Cutting where the page already has a boundary
+/// costs nothing the model has to be told about — a chunk is a run of lines
+/// under a heading, and the section entries inside it say what it is — and it is
+/// what lets every section be judged from its own text.
+///
+/// The ranges are 1-based and inclusive, counted in the file as written the way
+/// [`Section::lines`] counts, they are in document order, and they tile the page
+/// with no gap and no overlap: every line is in exactly one of them, so every
+/// section and every link belongs to exactly one chunk ([`Parts`]).
+///
+/// [#53]: https://github.com/mikekelly/s1m/issues/53
+fn chunks(text: &str, sections: &[Section], limit: usize) -> Vec<[usize; 2]> {
+    let whole = [1, text.lines().count().max(1)];
+    // A page inside the limit is one chunk, whole: the split is for the page the
+    // limit used to cut, and a page inside it sends exactly what it always did.
+    if line_chars(text, whole) <= limit {
+        return vec![whole];
+    }
+
+    let cut = Cut::of(text, sections, limit);
+    let mut pieces = Vec::new();
+    // The sections nothing contains tile the page from the first of them to the
+    // end of the file; what stands before the first one — a preamble too blank
+    // for the parser to call a section, whitespace only — is a piece of its own,
+    // as is the whole page when the parser found no section at all.
+    let mut at = whole[0];
+    for &root in &cut.roots {
+        let range = cut.sections[root].lines;
+        if at < range[0] {
+            cut.push([at, range[0] - 1], &mut pieces);
+        }
+        cut.pieces(range, &cut.children[root], &mut pieces);
+        at = range[1] + 1;
+    }
+    if at <= whole[1] {
+        cut.push([at, whole[1]], &mut pieces);
+    }
+
+    merge(pieces, limit)
+}
+
+/// A page over the limit, and the heading tree that cuts it up.
+struct Cut<'a> {
+    text: &'a str,
+    /// The page's sections, as the parser gave them.
+    sections: &'a [Section],
+    /// For every section, the sections directly inside it, in document order.
+    children: Vec<Vec<usize>>,
+    /// The sections no other section contains, in document order.
+    roots: Vec<usize>,
+    /// The characters one chunk may hold.
+    limit: usize,
+}
+
+impl<'a> Cut<'a> {
+    /// The tree of `sections`: which of them sit directly inside which.
+    ///
+    /// The parser's ranges are contiguous and properly nested — a section ends
+    /// where the next heading it does not contain begins — so a section is
+    /// inside the last one that started before it and has not ended yet.
+    fn of(text: &'a str, sections: &'a [Section], limit: usize) -> Cut<'a> {
+        let mut children = vec![Vec::new(); sections.len()];
+        let mut roots = Vec::new();
+        let mut open: Vec<usize> = Vec::new();
+        for index in 0..sections.len() {
+            let start = sections[index].lines[0];
+            while open
+                .last()
+                .is_some_and(|&above| sections[above].lines[1] < start)
+            {
+                open.pop();
+            }
+            match open.last() {
+                Some(&parent) => children[parent].push(index),
+                None => roots.push(index),
+            }
+            open.push(index);
+        }
+        Cut {
+            text,
+            sections,
+            children,
+            roots,
+            limit,
+        }
+    }
+
+    /// The pieces `range` is cut into: itself, when it fits or holds no heading
+    /// to cut at; and otherwise its own text — the lines between its heading and
+    /// its first subsection — and then each of the headings inside it in turn,
+    /// cut the same way.
+    ///
+    /// A piece nothing more can be cut out of stays over the limit and is the
+    /// one thing the limit still cuts: the heading tree has no answer for a
+    /// single section longer than a chunk ([`clamp`]).
+    fn pieces(&self, range: [usize; 2], inside: &[usize], out: &mut Vec<([usize; 2], usize)>) {
+        let chars = line_chars(self.text, range);
+        if inside.is_empty() || chars <= self.limit {
+            out.push((range, chars));
+            return;
+        }
+        let mut at = range[0];
+        for &index in inside {
+            let child = self.sections[index].lines;
+            if at < child[0] {
+                self.push([at, child[0] - 1], out);
+            }
+            self.pieces(child, &self.children[index], out);
+            at = child[1] + 1;
+        }
+        if at <= range[1] {
+            self.push([at, range[1]], out);
+        }
+    }
+
+    /// One piece, with the characters it holds: what [`merge`] weighs pieces by
+    /// rather than counting them again.
+    fn push(&self, range: [usize; 2], out: &mut Vec<([usize; 2], usize)>) {
+        out.push((range, line_chars(self.text, range)));
+    }
+}
+
+/// The pieces merged back together while they fit the limit: a cut is where the
+/// page has a heading, and a page of many small sections is a few chunks rather
+/// than one per heading.
+///
+/// `pieces` are contiguous and in order, so a piece joins the one before it
+/// exactly when the two together are within `limit` — which leaves an
+/// unsplittable piece over the limit on its own, with no neighbour dragged over
+/// it.
+fn merge(pieces: Vec<([usize; 2], usize)>, limit: usize) -> Vec<[usize; 2]> {
+    let mut merged: Vec<([usize; 2], usize)> = Vec::with_capacity(pieces.len());
+    for (piece, chars) in pieces {
+        match merged.last_mut() {
+            Some((last, used)) if *used + chars <= limit => {
+                let first = last[0];
+                *last = [first, piece[1]];
+                *used += chars;
+            }
+            _ => merged.push((piece, chars)),
+        }
+    }
+    merged.into_iter().map(|(range, _)| range).collect()
+}
+
+/// The characters of `text` the 1-based lines `range` hold, inclusive: what
+/// [`CONTENT_LIMIT`] is measured in, and the same count [`clamp`] cuts on.
+fn line_chars(text: &str, range: [usize; 2]) -> usize {
+    text.split_inclusive('\n')
+        .skip(range[0] - 1)
+        .take(range[1] - range[0] + 1)
+        .map(|line| line.chars().count())
+        .sum()
+}
+
+/// The text of the 1-based lines `range` of `text`, inclusive, byte for byte as
+/// the file spells them: what one chunk of a page carries.
+///
+/// The whole page's range is the file itself, trailing newline and all, so a
+/// page inside the limit is sent as the file it is.
+fn line_text(text: &str, range: [usize; 2]) -> String {
+    text.split_inclusive('\n')
+        .skip(range[0] - 1)
+        .take(range[1] - range[0] + 1)
+        .collect()
+}
+
+/// Whether the 1-based line range `range` holds `line`.
+fn holds(range: [usize; 2], line: usize) -> bool {
+    range[0] <= line && line <= range[1]
 }
 
 /// 250 ms, then 500 ms: short enough that a retry is invisible next to the call
@@ -5639,6 +5932,55 @@ mod tests {
         );
     }
 
+    /// A page split by the content cap is that many requests too: a trace
+    /// records one `requested` event per post of every chunk, in the order they
+    /// were sent, and the one answer they all merged into ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn a_chunked_page_is_one_requested_record_per_post() {
+        let dir = TempDir::new("trace-chunks");
+        let file = long_page(&dir, 12, 8_000, 0);
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+        let store = TempDir::new("trace-chunks-store");
+        let path = store.path().join("trace.jsonl");
+        let trace = Trace::create(&path, dir.path(), 0.6).expect("a trace");
+        let cached = CachedScorer::new(api.scorer_in(dir.path()), store.path())
+            .expect("a cache")
+            .with_trace(Some(Arc::new(trace)));
+
+        cached
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let posts = api.requests().len();
+        assert!(
+            posts > 1,
+            "the fixture has to be split into chunks for this to be about them: {posts} requests"
+        );
+        let records = records(&path);
+        let requested: Vec<u64> = records
+            .iter()
+            .filter(|record| record["event"] == "requested")
+            .map(|record| record["post_index"].as_u64().expect("a post index"))
+            .collect();
+        assert_eq!(
+            requested,
+            (0..posts as u64).collect::<Vec<_>>(),
+            "one record per post of every chunk, in the order they were sent"
+        );
+        let answered = records
+            .iter()
+            .find(|record| record["event"] == "answered")
+            .unwrap_or_else(|| panic!("the answer should be in the trace: {records:?}"));
+        assert_eq!(
+            answered["sections"].as_array().expect("sections").len(),
+            file.sections.len(),
+            "the chunks' answers merged into one judgment"
+        );
+    }
+
     /// The records of a trace file, each line parsed on its own.
     fn records(path: &Path) -> Vec<Value> {
         fs::read_to_string(path)
@@ -6108,6 +6450,20 @@ mod tests {
         );
     }
 
+    /// The request material of a page that fits one post: one chunk covering
+    /// the whole file, holding every section and link.
+    fn whole(file: FileState, sections: Vec<SectionState>, links: Vec<LinkState>) -> Parts {
+        Parts {
+            chunks: vec![Chunk {
+                file,
+                sections: (0..sections.len()).collect(),
+                links: (0..links.len()).collect(),
+            }],
+            sections,
+            links,
+        }
+    }
+
     /// A file whose own text fills the state budget drops its links' previews
     /// rather than its links: a link judged from its anchor is worth more than
     /// a link never judged, and the preview is the hint that goes first
@@ -6153,12 +6509,14 @@ mod tests {
 
         let request = scorer.pack(
             query,
-            FileState {
-                content: content.clone(),
-                ..empty.clone()
-            },
-            Vec::new(),
-            vec![link.clone()],
+            &mut whole(
+                FileState {
+                    content: content.clone(),
+                    ..empty.clone()
+                },
+                Vec::new(),
+                vec![link.clone()],
+            ),
             LinkQuestions::Asked,
         );
 
@@ -6183,12 +6541,14 @@ mod tests {
         // and the split are for.
         let request = scorer.pack(
             query,
-            FileState {
-                content: "ordinary page text".to_string(),
-                ..empty
-            },
-            Vec::new(),
-            vec![link],
+            &mut whole(
+                FileState {
+                    content: "ordinary page text".to_string(),
+                    ..empty
+                },
+                Vec::new(),
+                vec![link],
+            ),
             LinkQuestions::Asked,
         );
         assert!(
@@ -6197,6 +6557,652 @@ mod tests {
                 .is_some(),
             "a page that is not over the budget keeps its previews"
         );
+    }
+
+    // -------------------------------------- the chunks of an oversized page
+
+    /// One parser section, as [`chunks`] is given them.
+    fn sec(heading: &str, level: u8, lines: [usize; 2]) -> Section {
+        Section {
+            heading: Some(heading.to_string()),
+            level,
+            lines,
+        }
+    }
+
+    /// The line a generated section's body opens with: in that section's body
+    /// and nowhere else, so a reply can tell whether the post that asks about
+    /// the section carries it ([`long_page`]).
+    fn marker(index: usize) -> String {
+        format!("Section {index} body starts here.")
+    }
+
+    /// The index in a heading [`long_page`] wrote, or `None` for the page's own
+    /// H1: what a reply reads a section's marker off.
+    fn generated_heading(heading: &str) -> Option<usize> {
+        heading.strip_prefix("Heading ")?.parse().ok()
+    }
+
+    /// A page over [`CONTENT_LIMIT`]: an H1, `headings` H2 sections of `body`
+    /// characters each, and one link to a page of its own under the first
+    /// `pages` of them.
+    fn long_page(dir: &TempDir, headings: usize, body: usize, pages: usize) -> ParsedFile {
+        let mut source = String::from("# Hub\n\nThe generated hub page.\n\n");
+        for index in 0..headings {
+            let mut section = format!("## Heading {index}\n\n{}", marker(index));
+            let filler = " Filler prose that a wiki author would have written here.";
+            while section.chars().count() < body {
+                section.push_str(filler);
+            }
+            source.push_str(&section);
+            source.push_str("\n\n");
+            if index < pages {
+                let page = format!("page-{index:03}.md");
+                fs::write(
+                    dir.path().join(&page),
+                    format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
+                )
+                .expect("a generated page");
+                source.push_str(&format!(
+                    "- [Page {index}]({page}) — step {index} of the runbook.\n\n"
+                ));
+            }
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &source).expect("the hub");
+        parse::parse(&path, dir.path()).expect("a parse")
+    }
+
+    /// A reply that answers a section by whether the post asking about it can
+    /// see that section's body: 0.9 when the marker that opens the body is in
+    /// this post's own file content, 0.1 when it is not. The file's own Score
+    /// and every link are answered plainly.
+    ///
+    /// A model that can only answer about what it is shown is what this stands
+    /// in for: the answer follows the state the section is asked in, not the
+    /// question's number.
+    fn visibility_reply() -> impl Fn(usize, &Value) -> (u16, String) {
+        |_, request: &Value| {
+            let state = &request["state"];
+            let content = state["file"]["content"].as_str().unwrap_or_default();
+            let answers = request["questions"]
+                .as_object()
+                .expect("a question map")
+                .keys()
+                .map(|id| {
+                    let answer = if id == FILE_QUESTION {
+                        json!({"type": "score", "score": 2.0, "confidence": 0.87})
+                    } else if let Some(position) = id
+                        .strip_prefix("section_")
+                        .and_then(|position| position.parse::<usize>().ok())
+                    {
+                        let heading = state["sections"][position]["heading"]
+                            .as_str()
+                            .unwrap_or_default();
+                        let visible = generated_heading(heading)
+                            .is_some_and(|index| content.contains(&marker(index)));
+                        json!({"type": "noul", "noul": if visible { 0.9 } else { 0.1 }})
+                    } else {
+                        json!({"type": "noul", "noul": 0.6})
+                    };
+                    (id.clone(), answer)
+                })
+                .collect::<Map<String, Value>>();
+            (200, reply(answers))
+        }
+    }
+
+    /// A page over the cap is cut at the headings inside it, recursively, and
+    /// the pieces are merged again while they fit: a cut lands on a heading the
+    /// page already has, never inside a section, and a page of small sections is
+    /// a few chunks rather than one per heading ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[test]
+    fn chunks_are_cut_at_the_headings_inside_them() {
+        // Eight lines of twenty characters each, so a limit below is a number of
+        // lines: 20 characters a line, counting the newline.
+        let source: String = (1..=8).map(|line| format!("{line:0>19}\n")).collect();
+        assert_eq!(source.chars().count(), 160);
+        let sections = [
+            sec("A", 1, [1, 8]),
+            sec("B", 2, [3, 6]),
+            sec("C", 3, [5, 6]),
+            sec("D", 2, [7, 8]),
+        ];
+
+        // A page inside the limit is one chunk, whole.
+        assert_eq!(chunks(&source, &sections, 160), vec![[1, 8]]);
+        // Cut at the headings under A, which is over the limit: A's own text,
+        // then B — which fits whole, its own subsection included — and then D.
+        // Two pieces are merged wherever the two of them fit together.
+        assert_eq!(chunks(&source, &sections, 120), vec![[1, 6], [7, 8]]);
+        // B no longer fits at 45, so it is cut at C the same way A was. Nothing
+        // merges: every piece is a section or a section's own text, and a cut
+        // never lands inside one.
+        assert_eq!(
+            chunks(&source, &sections, 45),
+            vec![[1, 2], [3, 4], [5, 6], [7, 8]]
+        );
+        // A piece nothing can cut further stays over the limit: the heading tree
+        // has no answer for it, and it is the one place the limit still cuts.
+        assert_eq!(
+            chunks(&source, &sections, 30),
+            vec![[1, 2], [3, 4], [5, 6], [7, 8]]
+        );
+
+        // The chunks tile the page: every line is in exactly one, in order, and
+        // the page's own range is the file byte for byte, trailing newline and
+        // all.
+        for limit in [30, 45, 120, 160, 400] {
+            let ranges = chunks(&source, &sections, limit);
+            assert_eq!(ranges[0][0], 1, "at {limit}");
+            assert_eq!(
+                ranges.last().unwrap()[1],
+                source.lines().count(),
+                "at {limit}"
+            );
+            for pair in ranges.windows(2) {
+                assert_eq!(pair[0][1] + 1, pair[1][0], "a gap or an overlap at {limit}");
+            }
+            assert_eq!(line_text(&source, [1, source.lines().count()]), source);
+        }
+
+        // A page with no heading at all is one chunk, however long it is: there
+        // is nowhere to cut it.
+        let body = "x".repeat(CONTENT_LIMIT + 100);
+        assert_eq!(chunks(&body, &[], CONTENT_LIMIT), vec![[1, 1]]);
+        // A white line before the first heading is a piece of its own rather
+        // than a line nothing carries.
+        assert_eq!(
+            chunks("\n\n# A\nbody\n", &[sec("A", 1, [3, 4])], 4),
+            vec![[1, 2], [3, 4]]
+        );
+    }
+
+    /// A page over the cap is judged in full: the tail the cap used to cut is
+    /// carried by a post of its own, and the section written past the cap is
+    /// judged from its own text ([#53]).
+    ///
+    /// The reply stands in for a model that can answer only about what it is
+    /// shown, so a section answered 0.9 is one whose body was in the state of
+    /// the post that asked about it.
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn a_page_over_the_content_limit_is_judged_in_full() {
+        let dir = TempDir::new("chunked-page");
+        let file = long_page(&dir, 16, 4_000, 0);
+        let source = fs::read_to_string(dir.path().join("hub.md")).expect("the hub");
+        assert!(
+            source.chars().count() > CONTENT_LIMIT,
+            "the fixture has to be over the cap for this to test the split: {} characters",
+            source.chars().count()
+        );
+        let api = FakeApi::new(visibility_reply());
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 1,
+            "a page over the cap is sent in more than one post, got {}",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+            let content = request["state"]["file"]["content"]
+                .as_str()
+                .expect("the file");
+            assert!(
+                !content.contains("[truncated at"),
+                "a page with headings is never cut: {}",
+                &content[..content.len().min(80)]
+            );
+        }
+
+        // One answer per section, in the parser's own order, on the section it
+        // names — and every one of them but the page's own H1 was answered from
+        // the section's text, because the post that asked about it carried that
+        // text.
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        for (judged, section) in outcome.judgment.sections.iter().zip(&file.sections) {
+            assert_eq!(judged.heading, section.heading);
+            assert_eq!(judged.lines, section.lines);
+            match section.heading.as_deref() {
+                // The H1 covers every section under it, so its range is longer
+                // than the cap: the chunk that carries its heading carries its
+                // own prose, and no one chunk holds the whole of it.
+                Some("Hub") => continue,
+                heading => assert_eq!(
+                    judged.score,
+                    0.9,
+                    "{} was judged from a post that could not see it",
+                    heading.unwrap_or("the headingless section")
+                ),
+            }
+        }
+
+        // The section written past the cap is the last one, it is in the
+        // judgment, and it starts past the cap: what the walk used to truncate.
+        let last = outcome.judgment.sections.last().expect("a last section");
+        assert_eq!(last.heading.as_deref(), Some("Heading 15"));
+        assert_eq!(
+            last.lines[1],
+            source.lines().count(),
+            "the last section runs to the end of the file"
+        );
+        let before: usize = source
+            .lines()
+            .take(last.lines[0] - 1)
+            .map(|line| line.chars().count() + 1)
+            .sum();
+        assert!(
+            before > CONTENT_LIMIT,
+            "the section has to start past the cap for this to be the page the cap cut: {before} characters"
+        );
+    }
+
+    /// A page over the cap is still judged within the API's budgets, by the same
+    /// estimate every other post is held to, and nothing of it is lost: every
+    /// line, every section and every link is in a post, and each section and
+    /// link is asked about exactly once ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn a_page_over_the_content_limit_is_split_within_the_budgets() {
+        let dir = TempDir::new("chunked-budget");
+        let file = long_page(&dir, 12, 6_000, 6);
+        let source = fs::read_to_string(dir.path().join("hub.md")).expect("the hub");
+        assert!(
+            source.chars().count() > CONTENT_LIMIT,
+            "the fixture has to be over the cap for this to test the split: {} characters",
+            source.chars().count()
+        );
+        assert_eq!(file.links.len(), 6);
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 1,
+            "the page is split: {} posts",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+        }
+        // Every line of the page is carried by some post, so nothing fell
+        // between two chunks.
+        let contents: Vec<&str> = requests
+            .iter()
+            .map(|request| {
+                request["state"]["file"]["content"]
+                    .as_str()
+                    .expect("the file")
+            })
+            .collect();
+        for index in 0..12 {
+            let marker = marker(index);
+            assert!(
+                contents.iter().any(|content| content.contains(&marker)),
+                "the body of section {index} is in no post"
+            );
+        }
+        for index in 0..6 {
+            let step = format!("step {index} of the runbook");
+            assert!(
+                contents.iter().any(|content| content.contains(&step)),
+                "the line linking page {index} is in no post"
+            );
+        }
+        // Every section and link is judged once, in the parser's own order, and
+        // the answer landed on the entry that named it: both are numbered by the
+        // line or the target they are about rather than by their place in a post.
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        for (judged, section) in outcome.judgment.sections.iter().zip(&file.sections) {
+            assert_eq!(judged.lines, section.lines);
+            assert_eq!(judged.heading, section.heading);
+            if section.heading.as_deref() != Some("Hub") {
+                let expected = 0.3 + section.lines[0] as f64 / 1000.0;
+                assert!(
+                    (judged.score - expected).abs() < 1e-9,
+                    "{} got {}",
+                    section.heading.as_deref().unwrap_or("no heading"),
+                    judged.score
+                );
+            }
+        }
+        assert_eq!(outcome.judgment.links.len(), file.links.len());
+        for (judged, link) in outcome.judgment.links.iter().zip(&file.links) {
+            assert_eq!(judged.target, link.target);
+            let target = link.target.to_str().expect("a target path");
+            let expected = 0.4 + page_number(target) as f64 / 1000.0;
+            assert!(
+                (judged.scent - expected).abs() < 1e-9,
+                "{} got {}",
+                target,
+                judged.scent
+            );
+        }
+    }
+
+    /// The answers come back on the file's own entries, whatever order the
+    /// chunks were dealt in ([#53]).
+    ///
+    /// A link's line is not monotonic in the parser's own link order: a fenced
+    /// block's body is one text run, so the wikilinks in two fences are found in
+    /// one block and sort ahead of an ordinary link written between them. A page
+    /// over the cap is chunked by those lines, so the posts are not in the
+    /// file's order either, and an answer appended as it arrives would land on
+    /// the wrong entry for every caller that pairs the two lists by index.
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn the_answers_land_on_the_links_that_named_them_when_a_page_is_chunked() {
+        let dir = TempDir::new("chunk-order");
+        for index in 0..3 {
+            fs::write(
+                dir.path().join(format!("page-{index:03}.md")),
+                format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
+            )
+            .expect("a generated page");
+        }
+        let filler = "Filler prose that a wiki author would have written here. ".repeat(450);
+        let source = format!(
+            "# Hub\n\nThe page under test.\n\n```md\n[[page-000]]\n```\n\n\
+             [First](page-001.md) — a step.\n\n## Long A\n\n{filler}\n\n## Long B\n\n{filler}\n\n\
+             ```md\n[[page-002]]\n```\n\n## Tail\n\nThe end.\n"
+        );
+        assert!(
+            source.chars().count() > CONTENT_LIMIT,
+            "the fixture has to be over the cap: {} characters",
+            source.chars().count()
+        );
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &source).expect("the hub");
+        let file = parse::parse(&path, dir.path()).expect("a parse");
+        assert_eq!(
+            file.links
+                .iter()
+                .map(|link| link.target.display().to_string())
+                .collect::<Vec<_>>(),
+            ["page-000.md", "page-002.md", "page-001.md"],
+            "the fixture's links are not in the parser's document order, which is what this is about"
+        );
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        assert!(
+            api.requests().len() > 1,
+            "the page has to be chunked for this to be about the chunks"
+        );
+        assert_eq!(outcome.judgment.links.len(), file.links.len());
+        for (index, (judged, link)) in outcome.judgment.links.iter().zip(&file.links).enumerate() {
+            assert_eq!(
+                judged.target, link.target,
+                "answer {index} is not on the link that named it"
+            );
+            let target = link.target.to_str().expect("a target path");
+            let expected = 0.4 + page_number(target) as f64 / 1000.0;
+            assert!(
+                (judged.scent - expected).abs() < 1e-9,
+                "{} got {}",
+                target,
+                judged.scent
+            );
+        }
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        for (judged, section) in outcome.judgment.sections.iter().zip(&file.sections) {
+            assert_eq!(judged.heading, section.heading);
+            assert_eq!(judged.lines, section.lines);
+        }
+    }
+
+    /// The file's Score is the best of its chunks': a page too long for one post
+    /// is ranked by the part of it that is worth reading, and a chunk that
+    /// answered first or last does not decide it ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn the_file_score_is_the_best_of_its_chunks() {
+        let dir = TempDir::new("chunk-score");
+        let file = long_page(&dir, 12, 8_000, 0);
+        // The first chunk scores 1.0, the middle one 3.0 and any later one 2.0:
+        // the file's relevance is the middle one's, so an answer taken from the
+        // first post or the last is not the answer that ships.
+        let api = FakeApi::new(|attempt, request: &Value| {
+            let level = match attempt {
+                0 => 1.0,
+                1 => 3.0,
+                _ => 2.0,
+            };
+            (200, any_reply(request, level))
+        });
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        assert!(
+            api.requests().len() >= 3,
+            "the fixture has to be split into at least three chunks, got {}",
+            api.requests().len()
+        );
+        assert_eq!(
+            outcome.detail.relevance_level, 3.0,
+            "the best chunk's answer"
+        );
+        assert_eq!(
+            outcome.judgment.relevance,
+            3.0 / USEFUL_FOR.top_level(),
+            "and it is what the file is ranked by"
+        );
+    }
+
+    /// The cap is a boundary, not a rule change: a page of exactly the cap's
+    /// characters is one post carrying the whole page, and a page over it is
+    /// sent in pieces that are each whole ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn a_page_at_the_cap_is_sent_whole_and_a_page_over_it_is_not_cut() {
+        let dir = TempDir::new("cap-boundary");
+        // A page of exactly the cap's characters, with nowhere to cut.
+        let mut source = String::from("# Hub\n\n");
+        while source.chars().count() < CONTENT_LIMIT {
+            source.push('x');
+        }
+        assert_eq!(source.chars().count(), CONTENT_LIMIT);
+        fs::write(dir.path().join("hub.md"), &source).expect("the hub");
+        let file = parse::parse(dir.path().join("hub.md"), dir.path()).expect("a parse");
+        let api = FakeApi::new(|_, request| (200, any_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert_eq!(requests.len(), 1, "a page at the cap is one post");
+        assert_eq!(
+            requests[0]["state"]["file"]["content"]
+                .as_str()
+                .expect("the file"),
+            source,
+            "and it carries the page byte for byte"
+        );
+        assert_eq!(outcome.detail.requests, 1);
+
+        // One character more, and the page is split by its headings instead: two
+        // sections of their own, each carried whole.
+        let dir = TempDir::new("cap-over");
+        let file = long_page(&dir, 4, 15_000, 0);
+        let source = fs::read_to_string(dir.path().join("hub.md")).expect("the hub");
+        assert!(source.chars().count() > CONTENT_LIMIT);
+        let api = FakeApi::new(|_, request| (200, any_reply(request, 2.0)));
+        api.scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 1,
+            "the page is split: {} posts",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+            let content = request["state"]["file"]["content"]
+                .as_str()
+                .expect("the file");
+            assert!(
+                !content.contains("[truncated at"),
+                "a page with headings is split, not cut"
+            );
+        }
+    }
+
+    /// A section nothing can cut is the one thing the cap still cuts, and it
+    /// says so: the heading tree has no answer for a single section longer than
+    /// a chunk ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn a_section_longer_than_the_cap_is_still_cut_and_says_so() {
+        let dir = TempDir::new("cap-unsplittable");
+        let file = long_page(&dir, 1, CONTENT_LIMIT + 1_000, 0);
+        let source = fs::read_to_string(dir.path().join("hub.md")).expect("the hub");
+        assert!(source.chars().count() > CONTENT_LIMIT);
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        for request in &requests {
+            assert_within_budget(request);
+        }
+        let contents: Vec<&str> = requests
+            .iter()
+            .map(|request| {
+                request["state"]["file"]["content"]
+                    .as_str()
+                    .expect("the file")
+            })
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .any(|content| content
+                    .contains(&format!("[truncated at {CONTENT_LIMIT} characters]"))),
+            "the section over the cap says it was cut: {:?}",
+            contents
+                .iter()
+                .map(|content| content.len())
+                .collect::<Vec<_>>()
+        );
+        // Its section is still judged, from the text the post could carry.
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        assert_eq!(
+            outcome
+                .judgment
+                .sections
+                .last()
+                .expect("a last section")
+                .heading
+                .as_deref(),
+            Some("Heading 0")
+        );
+    }
+
+    /// The relative judge chunks a page over the cap the same way, and asks its
+    /// Choice questions over the links of the chunk that carries them: a page
+    /// whose links are written past the cap is still walked through ([#53]).
+    ///
+    /// [#53]: https://github.com/mikekelly/s1m/issues/53
+    #[tokio::test]
+    async fn the_relative_judge_chunks_a_page_over_the_content_limit() {
+        let dir = TempDir::new("chunked-choice");
+        let file = long_page(&dir, 8, 8_000, 8);
+        assert_eq!(file.links.len(), 8);
+        let api = FakeApi::new(choice_reply(vec![0.2; 8], 0.1, 0.7));
+
+        let outcome = api
+            .choice_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            requests.len() > 3,
+            "the page is split: {} posts",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+        }
+        // One question per link, on the link it was asked about, and a link
+        // written past the cap is judged like any other: the chunks tile the
+        // page, so no link falls between two of them.
+        assert_eq!(outcome.judgment.links.len(), file.links.len());
+        for (judged, link) in outcome.judgment.links.iter().zip(&file.links) {
+            assert_eq!(judged.target, link.target);
+        }
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+        // Every Choice question is over one chunk's links: each option's anchor
+        // is in the content of the post that asks about it, so a question never
+        // mixes two chunks.
+        let mut asked = 0;
+        for request in &requests {
+            let Some(question) = request["questions"].get(CHOICE_QUESTION) else {
+                continue;
+            };
+            asked += 1;
+            let content = request["state"]["file"]["content"]
+                .as_str()
+                .expect("the file");
+            for (key, option) in question["criteria"].as_object().expect("a criteria map") {
+                // The option that says none of them is the mode's own words for
+                // what a no means, not a link's.
+                if key == NONE_OPTION {
+                    continue;
+                }
+                let option = option.as_str().expect("an option");
+                let anchor = option
+                    .trim_start_matches('"')
+                    .split('"')
+                    .next()
+                    .unwrap_or("");
+                assert!(
+                    content.contains(anchor),
+                    "the option {option} is not about the chunk it was asked in"
+                );
+            }
+        }
+        assert_eq!(asked, 2, "one Choice question per chunk");
     }
 
     #[test]
