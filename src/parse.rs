@@ -69,6 +69,18 @@ pub struct Section {
     pub lines: [usize; 2],
 }
 
+/// The syntax one link was written in. A wiki's link style is a fact about the
+/// wiki rather than about the target, and only the parser knows which form a
+/// resolved target came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkKind {
+    /// `[text](target.md)`, resolved against the linking file's directory.
+    Markdown,
+    /// `[[target]]` or `[[target|alias]]`, resolved by path or by file name.
+    Wikilink,
+}
+
 /// One outgoing link to a markdown or text file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,6 +100,8 @@ pub struct Link {
     pub heading: Option<String>,
     /// `false` when the target escapes `root`. These must never be followed.
     pub in_root: bool,
+    /// The syntax the link was written in.
+    pub kind: LinkKind,
 }
 
 /// One parsed file.
@@ -185,6 +199,10 @@ fn links(scan: &Scan, path: &Path, root: &Path) -> Vec<Link> {
     let mut index = None;
     let mut links = Vec::with_capacity(scan.links.len());
     for raw in &scan.links {
+        let kind = match &raw.dest {
+            RawDest::Markdown(_) => LinkKind::Markdown,
+            RawDest::Wiki(_) => LinkKind::Wikilink,
+        };
         let resolved = match &raw.dest {
             RawDest::Markdown(dest) => resolve_markdown(dest, &directory),
             RawDest::Wiki(dest) => {
@@ -199,6 +217,7 @@ fn links(scan: &Scan, path: &Path, root: &Path) -> Vec<Link> {
             sentence: raw.sentence.clone(),
             heading: raw.heading.clone(),
             in_root: resolved.in_root,
+            kind,
         });
     }
     links
