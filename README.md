@@ -692,8 +692,8 @@ Its headline:
   are covered by the returned ranges, for 3,054 lines returned. A label is the heading or line
   range an entry names, and an entry that names none is wanted whole, so its part is its page. The
   walk that shipped before [#52](https://github.com/mikekelly/s1m/issues/52) — `--wording
-  section-legacy` — returns 0.78 of those parts for 4,479 lines: four points of the wanted parts
-  for a third more reading.
+  section-legacy` — returns 0.78 of those parts for 4,479 lines: four points more of the wanted
+  parts, for half again the reading.
 - **What an agent reads**: 44,906 tokens for the returned ranges, against 120,322 for the same
   files whole and 346,160 for every page on every query. Reading the returned files whole costs
   35% of the corpus's text; the section scores take 63% off that, and the ranking 87% off reading

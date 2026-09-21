@@ -3148,7 +3148,7 @@ impl Findings {
              private one beside it. `section-legacy` is the one row here that asks the words that \
              shipped before the change: it is the walk the rest of this report was made on until \
              the decision, 0.83 / 0.26 for 68,663 tokens at `--max-files {}`, against the \
-             default's 0.83 / 0.27 for 44,906 — the same wanted pages, four fifths of the \
+             default's 0.83 / 0.27 for 44,906 — the same wanted pages, two thirds of the \
              reading. Whether the reading it cut was the right reading is what the columns added \
              for [#58] answer: `section-legacy` returns {} of the wanted parts for {} lines, and \
              the default {} for {}.",
