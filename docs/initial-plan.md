@@ -112,12 +112,12 @@ s1m --mode about --max-files 40 --format tree "chargebacks" wiki/index.md wiki/p
 | `--criteria` | none | Path to a file whose whole content is the criterion, in place of `--mode`'s |
 | `--max-files` | 25 | Files visited before stopping |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Minimum link scent to queue a target, and minimum section score to keep in the output |
+| `--threshold` | 0.6 | Minimum link scent to queue a target, and minimum relevance or section score that earns a file a place in the output |
 | ~~`--section-threshold`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — sections rank at `--threshold`. |
 | ~~`--fanout`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — the CLI flag is hidden, and the round size stays in the library. |
 | `--no-cache` | off | Ignore stored answers and call the model again |
 | ~~`--seed-grep`~~ | — | Struck: [#33](https://github.com/mikekelly/s1m/issues/33) — orphan handling belongs in a wiki linter. |
-| `--format` | `json` | `json`, `md` (reading list) or `tree` (annotated link tree for humans) |
+| `--format` | `json` | `json`, `md` (the files that earned a place) or `tree` (annotated link tree for humans, the walk's other files included) |
 | `--root` | entry file's directory | Links resolving outside it are not followed |
 
 ### Defaults from the evaluation
@@ -144,7 +144,7 @@ the README's table rather than a diff.
 
 ### Output
 
-Results are sorted by file relevance. `via` is the link path that reached the file, and `links` lists the outgoing links that were judged, so the caller can see what was followed and what was passed over.
+Results are sorted by file relevance, and only the files that earn a place on their own are in them: relevance at or above `--threshold`, or at least one section at or above it. A hub is worth walking through and not worth reading, so every other file the walk visited is reported under `walked` instead — `path`, `relevance`, `scent`, `via` and `links`, and no `sections` — which is what keeps `tree` and the explainability goal intact; `visited` counts both lists. `via` is the link path that reached the file, and `links` lists the outgoing links that were judged, so the caller can see what was followed and what was passed over. `md` prints `results`; `tree` prints `results` and `walked`, because a page the walk passed through is the line its links hang from ([#40](https://github.com/mikekelly/s1m/issues/40)).
 
 ```json
 {
@@ -166,11 +166,23 @@ Results are sorted by file relevance. `via` is the link path that reached the fi
         {"target": "wiki/company/history.md", "scent": 0.04, "followed": false}
       ]
     }
+  ],
+  "walked": [
+    {
+      "path": "wiki/payments/README.md",
+      "relevance": 0.44,
+      "scent": 0.84,
+      "via": ["wiki/index.md"],
+      "links": [
+        {"target": "wiki/payments/settlement.md", "scent": 0.82, "followed": true},
+        {"target": "wiki/payments/cutoffs.md", "scent": 0.31, "followed": false}
+      ]
+    }
   ]
 }
 ```
 
-The tool description agents see should state plainly that s1m reads local files and ranks them for a query. Exit code 0 means results found, 1 means nothing cleared the threshold, 2 means an error.
+The tool description agents see should state plainly that s1m reads local files and ranks them for a query. Exit code 0 means a file beyond the entry files earned a place, 1 means none did, 2 means an error.
 
 ## Risks and open questions
 

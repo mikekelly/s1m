@@ -1190,6 +1190,67 @@ tests/fixtures/cli/entry.md  entry file; relevance 1.00
     );
 }
 
+/// A file has to earn its place: relevance at or above the threshold, or a
+/// section at or above it. Here nothing does — every page comes back at 0.5 —
+/// so `results` is empty, the walk is reported under `walked`, and the exit
+/// code says the list holds nothing the caller did not already have.
+///
+/// The two reading views disagree on purpose: `md` is what to read, so it has
+/// nothing to print, and `tree` is the walk, so it prints all of it.
+#[test]
+fn nothing_earns_a_place_so_the_walk_is_reported_and_results_is_empty() {
+    let api = FakeApi::new(1.5, 0.9, 0.5);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("nothing beyond the entry files earned a place"),
+        "{}",
+        stderr(&output)
+    );
+    let list = json(&output);
+    assert_eq!(list["visited"], 3, "the walk visits all three pages");
+    assert!(paths(&list).is_empty(), "nothing earned a place: {list}");
+    assert_eq!(
+        list["walked"]
+            .as_array()
+            .expect("walked should be an array")
+            .iter()
+            .map(|file| file["path"].as_str().expect("a path"))
+            .collect::<Vec<_>>(),
+        [DEEP, ENTRY, NEXT],
+        "the walk's own files, ranked the way a result would be"
+    );
+    assert_eq!(list["walked"][0]["relevance"], 0.5);
+    assert!(
+        list["walked"][0].get("sections").is_none(),
+        "a file that earned no place has no ranges to return: {list}"
+    );
+
+    let markdown = run_with(&[QUERY, ENTRY, "--format", "md"], &api, &cache);
+    assert_eq!(
+        stdout(&markdown),
+        "\
+# Reading list: what is there to read
+
+Criterion: useful-for; 3 files visited, 0 calls
+"
+    );
+    let tree = run_with(&[QUERY, ENTRY, "--format", "tree"], &api, &cache);
+    assert_eq!(
+        stdout(&tree),
+        "\
+what is there to read (useful-for); 3 files visited, 0 calls
+
+tests/fixtures/cli/entry.md  entry file; relevance 0.50
+  tests/fixtures/cli/next.md  followed; scent 0.90; relevance 0.50
+    tests/fixtures/cli/deep.md  followed; scent 0.90; relevance 0.50
+"
+    );
+}
+
 /// A format that is not one of the three is the flag's vocabulary, not a run:
 /// clap names the value it did not recognise and exits 2, the way it does for a
 /// flag that does not exist.

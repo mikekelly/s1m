@@ -1,12 +1,19 @@
 //! The shapes the reading list is printed in: the plan's `--format` flag.
 //!
 //! One reading list, three views of it. `json` is the plan's `Output` section
-//! and the one a caller parses. `md` is the same list as something to read or
-//! paste — the files, the lines worth reading and the scores that say why each
-//! one is there. `tree` is the walk's link tree: every file it visited with
-//! every link it judged under it, each with the scent the model gave it and
-//! whether the walk followed it, so a person can see what was passed over and
-//! how narrowly.
+//! and the one a caller parses. `md` is what to read as something to paste —
+//! the files that earned a place, the lines worth reading and the scores that
+//! say why each one is there. `tree` is the walk's link tree: every file it
+//! visited with every link it judged under it, each with the scent the model
+//! gave it and whether the walk followed it, so a person can see what was
+//! passed over and how narrowly.
+//!
+//! The two reading views differ in what they are for, and so in what they
+//! print. `md` is the reading list — [`ReadingList::results`] — because a
+//! caller pastes it to read from, and a hub the walk only passed through is not
+//! something to read. `tree` is the walk, so it prints [`ReadingList::walked`]
+//! as well: a page that earned no place is where the links under it hang from,
+//! and losing it would lose the paths to everything it led to.
 //!
 //! Both reading views are rendered from [`ReadingList`] alone. They ask nothing
 //! of the walk and nothing of the model, which is what makes them a view rather
@@ -50,7 +57,7 @@ use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use crate::cli::{RankedFile, RankedLink, RankedSection, ReadingList};
+use crate::cli::{RankedFile, RankedLink, RankedSection, ReadingList, WalkedFile};
 
 /// Spaces of indentation per hop in the link tree.
 const INDENT: usize = 2;
@@ -78,6 +85,46 @@ impl Format {
     }
 }
 
+/// One file as the reading views carry it, from either list in the reading
+/// list: [`ReadingList::results`] for the files that earned a place,
+/// [`ReadingList::walked`] for the rest.
+///
+/// The two views read the same fields of a file, and a file is a file whatever
+/// list it came back in, so both go through this rather than one of the two
+/// structs. `sections` is not on it: the lines worth reading are what `md`
+/// prints, and it prints only results.
+struct File<'a> {
+    path: &'a str,
+    relevance: f64,
+    scent: Option<f64>,
+    via: &'a [String],
+    links: &'a [RankedLink],
+}
+
+impl<'a> From<&'a RankedFile> for File<'a> {
+    fn from(file: &'a RankedFile) -> Self {
+        File {
+            path: &file.path,
+            relevance: file.relevance,
+            scent: file.scent,
+            via: &file.via,
+            links: &file.links,
+        }
+    }
+}
+
+impl<'a> From<&'a WalkedFile> for File<'a> {
+    fn from(file: &'a WalkedFile) -> Self {
+        File {
+            path: &file.path,
+            relevance: file.relevance,
+            scent: file.scent,
+            via: &file.via,
+            links: &file.links,
+        }
+    }
+}
+
 /// The reading list as markdown: the files to read, most relevant first, each
 /// with the lines worth reading inside it.
 ///
@@ -88,6 +135,10 @@ impl Format {
 ///
 /// A file with nothing above the threshold says so rather than printing
 /// no sections at all, which would read as a file with no sections in it.
+///
+/// The files the walk visited without earning a place are [`tree`]'s too, not
+/// this view's: a hub belongs in the walk's story, not in a list of what to
+/// read.
 fn md(list: &ReadingList) -> String {
     let mut out = String::new();
     let _ = writeln!(out, "# Reading list: {}", list.query);
@@ -104,7 +155,7 @@ fn md(list: &ReadingList) -> String {
         let _ = writeln!(out);
         let _ = writeln!(out, "## {}. `{}`", rank + 1, file.path);
         let _ = writeln!(out);
-        let _ = writeln!(out, "{}", reached(file));
+        let _ = writeln!(out, "{}", reached(&File::from(file)));
         let _ = writeln!(out);
         if file.sections.is_empty() {
             let _ = writeln!(out, "- nothing above --threshold");
@@ -125,12 +176,18 @@ fn md(list: &ReadingList) -> String {
 /// indented by hop, so a reader can see at a glance which links a page offered
 /// and which of them the walk took — and, where a link refused the walk, what
 /// it thought of the link anyway.
+///
+/// Every file the walk visited is here, the ones that earned a place and the
+/// ones [`ReadingList::walked`] reports: a hub is the line its links hang from,
+/// so a tree without it would not be the walk.
 fn tree(list: &ReadingList) -> String {
-    let index: HashMap<&str, &RankedFile> = list
+    let files: Vec<File<'_>> = list
         .results
         .iter()
-        .map(|file| (file.path.as_str(), file))
+        .map(File::from)
+        .chain(list.walked.iter().map(File::from))
         .collect();
+    let index: HashMap<&str, &File<'_>> = files.iter().map(|file| (file.path, file)).collect();
 
     let mut out = String::new();
     let _ = writeln!(
@@ -142,12 +199,11 @@ fn tree(list: &ReadingList) -> String {
         count(list.calls as usize, "call"),
     );
 
-    let mut roots: Vec<&RankedFile> = list
-        .results
+    let mut roots: Vec<&File<'_>> = files
         .iter()
         .filter(|file| parent(file, &index).is_none())
         .collect();
-    roots.sort_by(|a, b| a.path.cmp(&b.path));
+    roots.sort_by(|a, b| a.path.cmp(b.path));
 
     for root in roots {
         node(&mut out, root, 0, &root_line(root), &index);
@@ -164,7 +220,7 @@ fn tree(list: &ReadingList) -> String {
 /// be a provenance it does not have. It gets the line [`md`] prints for the
 /// same file instead: the relevance, the scent of the link that reached it and
 /// the path it came along.
-fn root_line(root: &RankedFile) -> String {
+fn root_line(root: &File<'_>) -> String {
     if !root.via.is_empty() {
         return reached(root);
     }
@@ -181,10 +237,10 @@ fn root_line(root: &RankedFile) -> String {
 /// one per visited file, as the plan asks.
 fn node(
     out: &mut String,
-    file: &RankedFile,
+    file: &File<'_>,
     depth: usize,
     annotation: &str,
-    index: &HashMap<&str, &RankedFile>,
+    index: &HashMap<&str, &File<'_>>,
 ) {
     let _ = writeln!(
         out,
@@ -230,9 +286,9 @@ fn node(
 /// the same test is what stops a file being printed twice.
 fn child<'a>(
     link: &RankedLink,
-    file: &RankedFile,
-    index: &HashMap<&str, &'a RankedFile>,
-) -> Option<&'a RankedFile> {
+    file: &File<'_>,
+    index: &HashMap<&str, &'a File<'a>>,
+) -> Option<&'a File<'a>> {
     if !link.followed {
         return None;
     }
@@ -247,7 +303,7 @@ fn child<'a>(
 /// link reached, and — for a reading list a caller built itself, or one
 /// whose walk reported a path it did not visit — a result that would otherwise
 /// be dropped from the tree rather than printed as a line of its own.
-fn parent<'a>(file: &RankedFile, index: &HashMap<&str, &'a RankedFile>) -> Option<&'a RankedFile> {
+fn parent<'a>(file: &File<'_>, index: &HashMap<&str, &'a File<'a>>) -> Option<&'a File<'a>> {
     let parent = *index.get(file.via.last()?.as_str())?;
     parent
         .links
@@ -262,7 +318,7 @@ fn parent<'a>(file: &RankedFile, index: &HashMap<&str, &'a RankedFile>) -> Optio
 /// Every link of one file multiplies into the same path score, so ordering by
 /// scent is the frontier's own order. A link the model named no scent for cannot
 /// be queued at all and sorts last.
-fn queued(file: &RankedFile) -> Vec<&RankedLink> {
+fn queued<'data>(file: &File<'data>) -> Vec<&'data RankedLink> {
     let mut links: Vec<&RankedLink> = file.links.iter().collect();
     links.sort_by(|left, right| match (left.scent, right.scent) {
         (Some(left_scent), Some(right_scent)) => right_scent
@@ -278,7 +334,7 @@ fn queued(file: &RankedFile) -> Vec<&RankedLink> {
 /// What put a file in the reading list: the relevance the model gave it, and
 /// the link path that reached it — or, for a file no link reached, that it was
 /// an entry file the caller named.
-fn reached(file: &RankedFile) -> String {
+fn reached(file: &File<'_>) -> String {
     let mut line = format!("relevance {:.2}", file.relevance);
     if file.via.is_empty() {
         let _ = write!(line, "; entry file");
@@ -337,12 +393,33 @@ mod tests {
     /// A reading list of one query and the results a test built, with `calls`
     /// equal to what a cold run of one call per file would cost.
     fn list(results: Vec<RankedFile>) -> ReadingList {
+        listing(results, Vec::new())
+    }
+
+    /// The same, with the files the walk visited without earning a place: what
+    /// `tree` prints and `md` leaves out.
+    fn listing(results: Vec<RankedFile>, walked: Vec<WalkedFile>) -> ReadingList {
+        let visited = results.len() + walked.len();
         ReadingList {
             query: "settlement timing".to_string(),
             mode: "useful-for".to_string(),
-            visited: results.len(),
-            calls: results.len() as u64,
+            visited,
+            calls: visited as u64,
             results,
+            walked,
+        }
+    }
+
+    /// A file the walk visited that earned no place: a result's fields without
+    /// its sections, which is what `walked` carries.
+    fn walked(mut file: RankedFile) -> WalkedFile {
+        file.sections = Vec::new();
+        WalkedFile {
+            path: file.path,
+            relevance: file.relevance,
+            scent: file.scent,
+            via: file.via,
+            links: file.links,
         }
     }
 
@@ -443,11 +520,11 @@ relevance 0.62; entry file
 
     /// The list is what an agent reads and acts on, so it is titled with the
     /// query and says which criterion judged it and what the run cost — and a
-    /// file with nothing above the threshold says that, rather than
-    /// printing as a file with no sections in it.
+    /// file that earned its place on relevance alone says it has nothing above
+    /// the threshold, rather than printing as a file with no sections in it.
     #[test]
     fn md_says_when_no_section_cleared_the_threshold() {
-        let list = list(vec![entry("wiki/index.md", 0.42)]);
+        let list = list(vec![entry("wiki/index.md", 0.62)]);
 
         assert_eq!(
             Format::Md.render(&list),
@@ -458,7 +535,7 @@ Criterion: useful-for; 1 file visited, 1 call
 
 ## 1. `wiki/index.md`
 
-relevance 0.42; entry file
+relevance 0.62; entry file
 
 - nothing above --threshold
 "
@@ -495,6 +572,70 @@ Criterion: useful-for; 0 files visited, 0 calls
         assert_eq!(
             Format::Tree.render(&empty),
             "settlement timing (useful-for); 0 files visited, 0 calls\n\n"
+        );
+    }
+
+    /// `md` is what to read, so a file the walk visited without earning a place
+    /// is not in it: a hub is worth walking through and not worth reading. It
+    /// is still counted as visited, because visiting it is what the run did.
+    #[test]
+    fn md_leaves_out_a_file_that_earned_no_place() {
+        let list = listing(
+            vec![reached(
+                "wiki/payments/settlement.md",
+                0.94,
+                0.88,
+                &["wiki/index.md"],
+            )],
+            vec![walked(entry("wiki/index.md", 0.42))],
+        );
+
+        assert_eq!(
+            Format::Md.render(&list),
+            "\
+# Reading list: settlement timing
+
+Criterion: useful-for; 2 files visited, 2 calls
+
+## 1. `wiki/payments/settlement.md`
+
+relevance 0.94; scent 0.88; via `wiki/index.md`
+
+- nothing above --threshold
+"
+        );
+    }
+
+    /// `tree` is the walk, so the files that earned no place are in it too: the
+    /// hub they hang from is a line of its own, and the page it led to is
+    /// nested under the link that reached it.
+    #[test]
+    fn tree_prints_a_file_that_earned_no_place() {
+        let list = listing(
+            vec![reached(
+                "wiki/payments/settlement.md",
+                0.94,
+                0.88,
+                &["wiki/index.md"],
+            )],
+            vec![walked(linking(
+                entry("wiki/index.md", 0.42),
+                &[
+                    ("wiki/payments/settlement.md", Some(0.88), true),
+                    ("wiki/notes/ledger.md", Some(0.24), false),
+                ],
+            ))],
+        );
+
+        assert_eq!(
+            Format::Tree.render(&list),
+            "\
+settlement timing (useful-for); 2 files visited, 2 calls
+
+wiki/index.md  entry file; relevance 0.42
+  wiki/payments/settlement.md  followed; scent 0.88; relevance 0.94
+  wiki/notes/ledger.md  pruned; scent 0.24
+"
         );
     }
 

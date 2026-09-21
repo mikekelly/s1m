@@ -57,8 +57,8 @@ right for a first run:
 | `--criteria FILE` | none | The judgment you need is not one of the three modes; the file's content is the criterion |
 | `--max-files N` | 25 | You want a shorter list, or a wider net |
 | `--max-depth N` | 6 | The useful pages are further from the entry than six hops |
-| `--threshold F` | 0.6 | Fewer links followed, or more (`--max-files` binds first on most wikis); it is also the least section score the list keeps |
-| `--format json\|md\|tree` | `json` | `md` to paste the list into your own context; `tree` to see why a link was not followed |
+| `--threshold F` | 0.6 | Fewer links followed, or more (`--max-files` binds first on most wikis); it is also the least relevance or section score that earns a file a place in the list |
+| `--format json\|md\|tree` | `json` | `md` to paste the list into your own context — the files that earned a place, with the lines to read; `tree` to see the whole walk, including the hubs it passed through, and why a link was not followed |
 | `--root DIR` | entry file's directory | The walk should be bounded somewhere else |
 
 A typical run: `s1m "how do I cut a release and publish the package" docs/index.md`.
@@ -77,13 +77,24 @@ A typical run: `s1m "how do I cut a release and publish the package" docs/index.
     {
       "path": "docs/concepts/release.md",
       "relevance": 0.78,
-      "scent": 0.89,
+      "scent": 0.88,
       "via": ["docs/index.md"],
       "sections": [
-        {"heading": "Release", "lines": [12, 26], "score": 0.72}
+        {"heading": "Release", "lines": [12, 26], "score": 0.74}
       ],
       "links": [
-        {"target": "docs/concepts/dogfooding.md", "scent": 0.21, "followed": false}
+        {"target": "docs/concepts/dogfooding.md", "scent": 0.19, "followed": false}
+      ]
+    }
+  ],
+  "walked": [
+    {
+      "path": "docs/concepts/init-command.md",
+      "relevance": 0.27,
+      "scent": 0.68,
+      "via": ["docs/index.md"],
+      "links": [
+        {"target": "docs/concepts/repo-layout.md", "scent": 0.32, "followed": false}
       ]
     }
   ]
@@ -92,20 +103,26 @@ A typical run: `s1m "how do I cut a release and publish the package" docs/index.
 
 How to act on it:
 
-- `results` is sorted by `relevance`: the first entry is where to start.
+- `results` is sorted by `relevance`: the first entry is where to start. It holds only the files
+  that earn a place: relevance at or above `--threshold`, or a section at or above it.
 - `sections[].lines` is `[first, last]`, inclusive, and is the whole point: read those lines of
   that file, not the file. A section's range contains its subsections', so reading a returned
   range reads everything returned inside it.
+- `walked` is the rest of the walk: the entry pages, hubs and section indexes that got you to the
+  list, and any page whose relevance and every section fell short. They carry no `sections` —
+  they are not something to read — so when a page you expected is missing, look there before
+  assuming the walk never saw it. `visited` counts both lists.
 - `scent` is the link that reached the file and `via` is the path it came along, so you can see
   why it is in the list.
 - `links` is what the walk judged and whether it followed each one — useful when a page you
   expected is missing: it may have been passed over below `--threshold`.
-- A file with no `sections` cleared `--threshold`: it is in the ranking but has nothing
-  worth quoting.
+- A result with no `sections` cleared `--threshold` on its relevance alone: it is in the list but
+  has nothing worth quoting.
 
-Exit codes: `0` the walk went beyond the entry files, `1` nothing cleared the threshold (the
-list is the entry files, and stderr says so), `2` an error — the reason is one line on stderr,
-and on a mistake the message names the path or the flag.
+Exit codes: `0` the walk reached a page beyond the entry files that earned a place, `1` nothing
+beyond them did (the list is the entry files alone, or empty with the walk under `walked`, and
+stderr says so), `2` an error — the reason is one line on stderr, and on a mistake the message
+names the path or the flag.
 
 ## Rules of the road
 
