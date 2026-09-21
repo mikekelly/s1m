@@ -29,10 +29,10 @@
 //!
 //! - 0 when the walk reached a file beyond the entry files, which is a reading
 //!   list the caller could not have written itself.
-//! - 1 when nothing cleared the threshold: the model judged the entry files'
-//!   links and none passed, so the list is the entry files and nothing more.
-//!   The list is still printed — a caller that wants it gets it — with one line
-//!   on stderr saying why the code is not 0.
+//! - 1 when the walk reached nothing beyond the entry files: the model judged
+//!   the entry files' links and none passed, or the page one of them reached
+//!   could not be judged. The list is still printed — a caller that wants it
+//!   gets it — with one line on stderr saying why the code is not 0.
 //! - 2 for anything that stops a list being an answer: bad flags, no query, an
 //!   entry file that cannot be read, an entry file the root's `.s1mignore`
 //!   covers ([`Error::Ignored`]), a `.s1mignore` that cannot be read or parsed,
@@ -40,6 +40,7 @@
 //!   *reached* file that cannot be read, and a reached file whose judgment
 //!   failed, are not in this list; see [`run`].
 
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -391,9 +392,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         match failure {
             // One broken link does not cost the reading list, but the gap it
             // leaves must not be silent either.
-            Failure::Parse(source) => {
-                eprintln!("s1m: skipped {}: {source}", display(&root, &path));
-            }
+            Failure::Parse(source) => skipped(&root, &path, &source),
             Failure::Score(source) => unjudged.push((path, source)),
         }
     }
@@ -407,10 +406,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         });
     }
     for (path, source) in unjudged {
-        eprintln!(
-            "s1m: skipped {}: could not be judged: {source}",
-            display(&root, &path)
-        );
+        skipped(&root, &path, format_args!("could not be judged: {source}"));
     }
 
     let results = results
@@ -440,6 +436,21 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         calls: judge.calls(),
         results,
     })
+}
+
+/// One line on stderr for a page the walk reached and dropped, and why.
+///
+/// One line because a caller reading stderr is parsing it, and the reason can
+/// come from outside: a judgment that failed carries the API's own response
+/// body, which a proxy is free to send with newlines in it
+/// ([`crate::scorer::ScorerError::Status`]). `main.rs` flattens the same kind
+/// of message on its way out of a run.
+fn skipped(root: &Path, path: &Path, reason: impl Display) {
+    eprintln!(
+        "s1m: skipped {}: {}",
+        display(root, path),
+        reason.to_string().replace(['\n', '\r'], " ")
+    );
 }
 
 /// A walk's path as the reading list spells it: the root joined back on, so the

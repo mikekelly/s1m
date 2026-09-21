@@ -58,8 +58,10 @@ pub const PRICE_PER_MTOK: f64 = 0.042;
 const FILE_QUESTION: &str = "file_relevance";
 
 /// How much of the file's text is sent. The API allows 32k tokens for the state
-/// plus the longest question and 64k for the whole request, so this is about a
-/// fifth of the state budget and leaves the link table most of the rest.
+/// plus the longest question and 64k for the whole request; at the two
+/// characters per token the split measures with ([`CHARS_PER_TOKEN`]), this
+/// spends about five eighths of the state budget and leaves the link table the
+/// rest.
 const CONTENT_LIMIT: usize = 40_000;
 
 /// The tokens the API allows for `state` plus the longest question, from
@@ -105,11 +107,12 @@ const PREVIEW_LIMIT: usize = 600;
 /// until this many characters are spent and no further field after that.
 ///
 /// The frontmatter is the larger half of what a preview buys (`eval/REPORT.md`,
-/// the preview experiment) and the largest on either vendored wiki is 653
-/// characters, so no measured page is cut here. What the cap bounds is a page
-/// whose frontmatter is an essay: without it one target adds its whole
-/// frontmatter to the state of every page that links to it, which is the other
-/// half of what [#37] found over the state budget.
+/// the preview experiment), and the largest block on either vendored wiki is
+/// 653 characters of text — which this counts as 562 — so no measured page is
+/// cut here. What the cap bounds is a page whose frontmatter is an essay:
+/// without it one target adds its whole frontmatter to the state of every page
+/// that links to it, which is the other half of what [#37] found over the state
+/// budget.
 ///
 /// [#37]: https://github.com/mikekelly/s1m/issues/37
 const FRONTMATTER_LIMIT: usize = 1_200;
@@ -2315,12 +2318,6 @@ mod tests {
     /// each named in its own anchor, so a scent can be traced back to the link
     /// it belongs to.
     fn generated(dir: &TempDir, headings: usize, pages: usize) -> ParsedFile {
-        hub(dir, headings, pages, "")
-    }
-
-    /// [`generated`], with a frontmatter block of `frontmatter` on every page
-    /// the hub links to, so every link in it carries a preview.
-    fn hub(dir: &TempDir, headings: usize, pages: usize, frontmatter: &str) -> ParsedFile {
         let mut source = String::from("# Hub\n\nThe generated hub page.\n\n");
         for index in 0..headings {
             source.push_str(&format!(
@@ -2331,9 +2328,7 @@ mod tests {
             let page = format!("page-{index:03}.md");
             fs::write(
                 dir.path().join(&page),
-                format!(
-                    "{frontmatter}# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"
-                ),
+                format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
             )
             .expect("a generated page");
             source.push_str(&format!(
@@ -2886,14 +2881,9 @@ mod tests {
             title.chars().count()
         );
         assert!(
-            preview_length(preview) < PREVIEW_LIMIT + FRONTMATTER_LIMIT + 200,
+            json_len(preview) < PREVIEW_LIMIT + FRONTMATTER_LIMIT + 200,
             "a preview costs a bounded number of characters"
         );
-    }
-
-    /// What one preview costs the state, in characters.
-    fn preview_length(preview: &Value) -> usize {
-        json_len(preview)
     }
 
     /// A file whose own text fills the state budget drops its links' previews

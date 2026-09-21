@@ -199,7 +199,8 @@ docs state:
 
 Every part of a preview is bounded as well, because the target is a page the walk did not
 choose: the first paragraph and the title at 600 characters each, the frontmatter at 1,200
-characters of whole fields (the largest frontmatter on either vendored wiki is 653). A page
+characters of whole fields (the largest on either vendored wiki is 653 characters of text, 562 as
+that counts them). A page
 whose own state leaves no room for a previewed link drops its previews rather than its links: a
 link judged from its anchor is worth more than a link never judged.
 

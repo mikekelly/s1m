@@ -65,8 +65,13 @@ const BROKEN_ENTRY: &str = "tests/fixtures/ignore-broken/entry.md";
 /// What the API answers when a state is over its budget: the 400 a page of 17k
 /// characters with 92 previewed links met ([#37]).
 ///
+/// The body is written the way a gateway in front of the API may write one —
+/// with newlines in it — because the notice the CLI prints about it goes to a
+/// caller who reads stderr by line.
+///
 /// [#37]: https://github.com/mikekelly/s1m/issues/37
-const OVER_BUDGET: &str = r#"{"detail":{"error_type":"max_tokens_exceeded"}}"#;
+const OVER_BUDGET: &str =
+    "{\"detail\":\n  {\"error_type\": \"max_tokens_exceeded\",\n   \"state\": \"too long\"}\n}";
 
 /// The id the scorer asks the file's own question under; every other question
 /// in a request is a link, `link_0`, `link_1`, and so on.
@@ -743,9 +748,11 @@ fn a_page_that_cannot_be_judged_is_skipped_and_the_walk_carries_on() {
         "the page and the reason are on stderr: {error}"
     );
     assert_eq!(
-        error.lines().filter(|line| line.contains(DEEP)).count(),
-        1,
-        "one line for the page that was dropped: {error}"
+        error.lines().count(),
+        2,
+        "one line for each page the walk dropped — the link that is not there, \
+         and the judgment whose reason carries newlines of its own — and nothing \
+         else: {error}"
     );
 }
 

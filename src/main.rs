@@ -83,7 +83,8 @@ matches is an error rather than a silent read.
 
 Exit codes:
   0  the walk reached files beyond the entry files
-  1  nothing cleared the threshold: only the entry files were reached
+  1  nothing beyond the entry files is in the list: no link cleared the
+     threshold, or the page a link reached could not be judged
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
 
@@ -274,8 +275,9 @@ async fn main() {
             Ok(code) => {
                 if code != 0 {
                     eprintln!(
-                        "s1m: no file beyond the entry files was reached: \
-                         nothing cleared the threshold"
+                        "s1m: nothing beyond the entry files is in the reading list: \
+                         nothing cleared the threshold, or the page a link reached \
+                         could not be judged"
                     );
                 }
                 std::process::exit(code);

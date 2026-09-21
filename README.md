@@ -329,8 +329,9 @@ Every part of a preview is bounded, because a preview is a hint about a target a
 a page this walk did not choose — one page's frontmatter would otherwise be added whole to the
 state of every page that links to it ([#37](https://github.com/mikekelly/s1m/issues/37)): the
 first paragraph is cut at 600 characters, the title at 600, and the frontmatter at 1,200
-characters of whole fields in the target's own order. The largest frontmatter on either vendored
-wiki is 653 characters, so no measured page is cut by any of those bounds.
+characters of whole fields in the target's own order. The largest frontmatter block on either
+vendored wiki is 653 characters of text, which that cap counts as 562, so no measured page is
+cut by any of those bounds.
 
 ### Keeping paths out of it: `.s1mignore`
 
@@ -383,7 +384,7 @@ Exit codes:
 | Code | Meaning |
 | --- | --- |
 | 0 | The walk reached files beyond the entry files |
-| 1 | Nothing cleared the threshold: the model judged the entry files' links and none passed, so the list is the entry files and nothing more. The JSON is still on stdout, and one line on stderr says so |
+| 1 | Nothing beyond the entry files is in the list: either the model judged the entry files' links and none passed the threshold, or the page a link did reach could not be judged. The JSON is still on stdout, and one line on stderr says so |
 | 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, an entry file the root's `.s1mignore` covers, a `.s1mignore` that cannot be read or parsed, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a run that judged nothing at all. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
 
 A file the walk *reached* but could not read is neither an error nor a silent omission: a link
