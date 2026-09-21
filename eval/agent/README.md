@@ -170,7 +170,13 @@ The format the existing `eval` binary reads, plus a `category`:
   label against the wiki and counts its section recall over it; **the agent
   conditions read the page and score at file level**, because which files a run
   should have returned is the question they ask. A private gold set labelled
-  the same way measures both harnesses.
+  the same way measures both harnesses. Three cases the two spellings decide:
+  answering text under the page's H1 before any `##` is labelled by `lines`,
+  since the H1's own section is the whole body it opens; a `###` subsection is
+  a heading target the same as a `##`, the parser matching a heading at any
+  level and the section running through its subsections; and a page wanted for
+  orientation that carries none of the query's facts is left whole, because a
+  page that is itself the answer is its whole body.
 - `entry` is per query and is the page the walk starts from. It may be one
   path or an array of them — a wiki need not have one way in — and a query
   without it falls back to `--entry`, which defaults to `index.md` and may be
