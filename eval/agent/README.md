@@ -151,23 +151,51 @@ subagent's, so the run is recorded as failed rather than averaged in as though
 the parent had done the work. A parent that spawned some other kind of
 subagent is failed for the same reason.
 
-The agent runs with `--safe-mode` — no `CLAUDE.md`, plugins, hooks, MCP
-servers or custom agents from wherever the wiki happens to live — and
+The agent runs with `--setting-sources ""`, `--settings <the file above>` and
 `--permission-prompts none`, so anything that would prompt is denied rather
-than hanging. A parent that hands work to a backgrounded subagent answers
+than hanging. **Not `--safe-mode`**: it disables hooks, and the hook is the
+mechanism. `--setting-sources ""` is what keeps the wiki's own configuration
+out, and on 2.1.278 that includes its `CLAUDE.md` — verified three ways on a
+throwaway wiki holding a `CLAUDE.md` with a distinctive instruction: with the
+default flags the agent quoted the instruction and obeyed it; with
+`--setting-sources ""` it answered `NONE` and the debug log mentions no memory
+file at all. A parent that hands work to a backgrounded subagent answers
 twice, so the **last** result in the stream is the answer, not the first.
 
-**The parent's only tool is `Task`.** Given the read-only tools as well it
-does not delegate: it explores, about twenty reads and greps a run, and what
-gets measured is a parent wearing a subagent's name. With `--tools Task
---allowedTools Task` the only way it can answer is to hand the whole task
-over, and it is asked to reply with the subagent's answer and JSON array
-exactly as written. `parent_tool_uses` is recorded as a metric on every agent
-run and printed in the report as *Parent tools*: on this condition it should
-be 1 — the one `Task` call — and anything more says the parent did work of its
-own that is being counted as the Explore agent's. The per-name breakdown is in
-the raw row under `detail.parent_tools`. `s1m-agent` keeps `--tools Read`: it
-was handed the list, and there is nothing to delegate.
+**A hook makes the parent delegate.** Given the read-only tools, the parent
+does not hand the task over: it explores — around twenty reads and greps a run
+— and what gets measured is a parent wearing a subagent's name. Taking the
+tools away does not work either: `--tools` bounds the **whole session**, so a
+parent given only `Task` spawns an Explore agent that has no tools and reports
+nothing (verified: 0 tool uses, empty answer).
+
+What works is a `PreToolUse` hook. Claude Code 2.1.278 puts `agent_type` and
+`agent_id` in the hook's input for a **subagent's** tool call and leaves them
+out for the **parent's**. `run` writes two files into `--out`:
+`delegate-only.sh`, a POSIX-shell hook that exits 2 with the reason *"the
+parent must delegate to the Explore agent"* when the input carries no
+`agent_type`, and `explore-settings.json`, which installs it on the matcher
+`Read|Glob|Grep`. Exit 2 blocks the call and hands the reason back to the
+model, which then delegates. `Task` is not matched, so delegating is always
+allowed.
+
+`parent_tool_uses` and `parent_tool_denials` are metrics on every agent run,
+printed as *Parent tools* and *Parent blocked*, with the per-name breakdown in
+`detail.parent_tools`. On the Explore condition a parent that read anything
+the hook let through is work counted as the Explore agent's.
+
+`s1m-agent` keeps `--tools Read` and gets a hookless `agent-settings.json`: it
+was handed the list, and reading it is the whole job.
+
+**What model the Explore agent runs on.** 2.1.278 states no declared model for
+its built-in agents anywhere reachable: `claude agents --json` lists *running
+background sessions*, not agent definitions, and the stream's `init` event
+lists agent names only (`["claude", "Explore", "general-purpose", "Plan"]`).
+What is observable is the model Claude Code resolved for the subagent, which
+the `Task` tool's own result carries as `resolvedModel`; it is recorded per run
+as `detail.tasks[].resolved_model`, beside the model of every turn in the
+subagent's transcript. With `--model` passed, the observed behaviour is
+inheritance — the subagent resolves to the model the parent was given.
 
 **No `--model` unless you name one.** A model named on the command line is
 inherited by every agent in the run, so `--model sonnet` measures Sonnet

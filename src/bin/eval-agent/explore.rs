@@ -139,6 +139,10 @@ pub struct StreamSummary {
     pub parent_files_read: Vec<PathBuf>,
     /// Tools the parent used itself, the subagent's not counted.
     pub parent_tool_uses: usize,
+    /// The parent's own tool calls that came back as errors. A hook that
+    /// refuses the parent's reads shows up here, and so does anything else
+    /// that failed: what matters is that the parent was stopped.
+    pub parent_tool_denials: usize,
     /// The same, by tool name: which tools the parent reached for, and how
     /// often. A parent that is meant to hand the work to a subagent and goes
     /// looking itself says so here.
@@ -157,6 +161,10 @@ pub struct Task {
     pub duration_ms: Option<u64>,
     /// How many tools it used, as Claude Code counted them.
     pub tool_uses: Option<u64>,
+    /// The model Claude Code resolved for it. This is the only place a
+    /// subagent's model is stated before it answers, and with no `--model` on
+    /// the command line it is the one the subagent chose for itself.
+    pub resolved_model: Option<String>,
 }
 
 /// Reads the stream: one JSON object a line, in the order they were printed.
@@ -193,6 +201,23 @@ pub fn summarise_stream(stream: &str, wiki: &Path) -> Result<StreamSummary, Stri
                 {
                     files.insert(relative(path, wiki));
                 }
+            }
+        }
+        // A tool result belongs to whoever called the tool: the parent's have
+        // no `parent_tool_use_id`, the same as its calls.
+        if row["type"].as_str() == Some("user") && row["parent_tool_use_id"].is_null() {
+            for block in row["message"]["content"].as_array().into_iter().flatten() {
+                if block["type"].as_str() == Some("tool_result")
+                    && block["is_error"].as_bool().unwrap_or(false)
+                {
+                    summary.parent_tool_denials += 1;
+                }
+            }
+            // The Agent tool's own result says which model its subagent got.
+            if let Some(id) = row["tool_use_result"]["agentId"].as_str()
+                && let Some(task) = tasks.iter_mut().find(|task| task.agent_id == id)
+            {
+                task.resolved_model = string(&row["tool_use_result"]["resolvedModel"]);
             }
         }
         match (row["type"].as_str(), row["subtype"].as_str()) {
@@ -402,6 +427,8 @@ mod tests {
 {"type":"system","subtype":"task_started","session_id":"S1","task_id":"agent7","tool_use_id":"toolu_1","subagent_type":"Explore","is_backgrounded":true}
 {"type":"assistant","session_id":"S1","message":{"id":"m2","model":"claude-sonnet-5","usage":{"input_tokens":2,"output_tokens":9,"cache_read_input_tokens":0,"cache_creation_input_tokens":10},"content":[{"type":"tool_use","id":"toolu_2","name":"Read","input":{"file_path":"/wiki/notes/parent.md"}}]}}
 {"type":"assistant","session_id":"S1","parent_tool_use_id":"toolu_1","subagent_type":"Explore","message":{"id":"s1","model":"claude-sonnet-5","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":0,"cache_creation_input_tokens":4990},"content":[{"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"/wiki/index.md"}}]}}
+{"type":"user","session_id":"S1","tool_use_result":{"isAsync":true,"agentId":"agent7","resolvedModel":"claude-sonnet-5"},"message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"launched"}]}}
+{"type":"user","session_id":"S1","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_2","is_error":true,"content":"the parent must delegate to the Explore agent"}]}}
 {"type":"system","subtype":"task_notification","session_id":"S1","task_id":"agent7","status":"completed","usage":{"total_tokens":8897,"tool_uses":2,"duration_ms":6334}}
 {"type":"result","subtype":"success","session_id":"S1","is_error":false,"total_cost_usd":0.0963594,"duration_ms":4188,"usage":{"input_tokens":4,"output_tokens":350,"cache_read_input_tokens":12610,"cache_creation_input_tokens":13340},"modelUsage":{"claude-sonnet-5":{"inputTokens":12,"outputTokens":1058,"cacheReadInputTokens":37082,"cacheCreationInputTokens":22812,"costUSD":0.0963594}},"result":"I have launched the Explore agent."}
 {"type":"result","subtype":"success","session_id":"S1","is_error":false,"total_cost_usd":0.0963594,"duration_ms":1633,"usage":{"input_tokens":2,"output_tokens":123,"cache_read_input_tokens":13340,"cache_creation_input_tokens":866},"modelUsage":{"claude-sonnet-5":{"inputTokens":12,"outputTokens":1058,"cacheReadInputTokens":37082,"cacheCreationInputTokens":22812,"costUSD":0.0963594}},"result":"Node >= 20.12.0\n\n[\"index.md\", \"concepts/node.md\"]"}
@@ -454,6 +481,9 @@ mod tests {
             summary.parent_tools,
             BTreeMap::from([("Agent".to_string(), 1), ("Read".to_string(), 1)])
         );
+        // The parent's read came back an error, which is what the hook that
+        // makes it delegate looks like from here.
+        assert_eq!(summary.parent_tool_denials, 1);
         assert_eq!(summary.model.as_deref(), Some("claude-sonnet-5"));
 
         assert_eq!(
@@ -464,6 +494,7 @@ mod tests {
                 status: Some("completed".to_string()),
                 duration_ms: Some(6334),
                 tool_uses: Some(2),
+                resolved_model: Some("claude-sonnet-5".to_string()),
             }]
         );
     }

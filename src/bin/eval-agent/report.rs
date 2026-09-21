@@ -35,13 +35,14 @@ const LABEL_LIMIT: usize = 64;
 
 /// The metrics the results table shows, in order, with the heading each one
 /// prints under. A metric no condition measured is left out of the table.
-const COLUMNS: [(&str, &str); 9] = [
+const COLUMNS: [(&str, &str); 10] = [
     ("recall", "Recall"),
     ("precision", "Precision"),
     ("agent_read_tokens", "Agent tokens"),
     ("agent_total_tokens", "Billed tokens"),
     ("files_opened", "Files opened"),
     ("parent_tool_uses", "Parent tools"),
+    ("parent_tool_denials", "Parent blocked"),
     ("cost_usd", "Cost (USD)"),
     ("wall_ms", "Wall (ms)"),
     ("jev_cost_usd", "Jev cost (USD)"),
@@ -238,6 +239,11 @@ fn caveats_section(out: &mut String) {
         "Recall and precision are against one gold set, written by reading the \
          wiki. A page that is useful and unlisted costs precision, so precision \
          is a lower bound.",
+        "The Explore condition's parent is stopped from exploring by a hook \
+         that refuses its own reads, so that what is measured is the subagent. \
+         *Parent tools* counts the parent's tool calls and *Parent blocked* the \
+         ones the hook refused; a parent that read anything the hook let \
+         through would be work counted as the Explore agent's.",
         "The Explore condition is scored on the files the agent said it relied \
          on. The files it actually opened are counted separately, and the two \
          are not the same set: an agent reads more than it cites.",

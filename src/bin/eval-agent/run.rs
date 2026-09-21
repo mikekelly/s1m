@@ -32,7 +32,9 @@ pub const COLD_CACHE: &str = "cold-cache";
 /// what it is asked for is the subagent's answer unchanged. Anything it added
 /// of its own would be a second agent's work counted as the first's.
 pub const EXPLORE_PROMPT: &str = "\
-Hand this whole task to the Explore agent and do no searching yourself.
+Hand this whole task to the Explore agent. You may not read, glob or grep \
+yourself: those tools are blocked for you and only the Explore agent may use \
+them.
 Its task: answer this query from the wiki in the current directory, starting \
 at these pages: <entry>
 The query: <query>
@@ -49,15 +51,15 @@ Answer this query, opening only the files you need: <query>
 Reply with the answer, and then a JSON array of the relative paths of the files \
 you relied on.";
 
-/// The tools the Explore condition's parent runs under: the one that spawns a
-/// subagent, and nothing else.
+/// The tools the Explore condition runs under: read-only, plus the one that
+/// spawns the subagent.
 ///
-/// A parent that can read is a parent that explores. Given the read-only tools
-/// as well, it did the work itself — about twenty reads and greps a run — and
-/// what got measured was a parent with a subagent's name on it. With only
-/// `Task`, delegation is the only way it can answer, and the tokens counted
-/// against the Explore agent are the Explore agent's.
-pub const EXPLORE_TOOLS: &str = "Task";
+/// This list bounds the whole session, subagents included, so it cannot be
+/// used to stop the parent exploring: a parent given only `Task` spawns an
+/// Explore agent that has no tools either and reports nothing. What stops the
+/// parent is the hook in [`crate::hook`], which refuses the parent's own reads
+/// and lets the subagent's through.
+pub const EXPLORE_TOOLS: &str = "Read,Glob,Grep,Task";
 /// The tools an agent handed a reading list runs under: it was given the files,
 /// so it has no need to search for them.
 pub const S1M_AGENT_TOOLS: &str = "Read";
@@ -256,7 +258,8 @@ pub fn method_flags() -> Vec<String> {
         "-p".to_string(),
         "--output-format stream-json".to_string(),
         "--verbose".to_string(),
-        "--safe-mode".to_string(),
+        "--setting-sources \"\"".to_string(),
+        "--settings HOOK".to_string(),
         format!("--tools {EXPLORE_TOOLS}"),
         format!("--allowedTools {EXPLORE_TOOLS}"),
         "--permission-prompts none".to_string(),
@@ -335,7 +338,10 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
     let prompt = EXPLORE_PROMPT
         .replace("<entry>", &entries.join(", "))
         .replace("<query>", &query.query);
-    let agent = agent_run(options, query, job, &prompt, EXPLORE_TOOLS)?;
+    // The hook that refuses the parent's own reads, so that what is measured
+    // is the subagent and not the parent wearing its name.
+    let settings = crate::hook::install(&options.out)?;
+    let agent = agent_run(options, query, job, &prompt, EXPLORE_TOOLS, &settings)?;
 
     let wanted = query.wanted();
     let relied: BTreeSet<PathBuf> = agent.files_relied.iter().cloned().collect();
@@ -355,6 +361,13 @@ fn explore_condition(options: &Options, query: &Query, job: &Job) -> Result<Meas
     metrics.insert(
         "parent_tool_uses".to_string(),
         agent.parent_tool_uses as f64,
+    );
+    // The hook's work, counted: on this condition every read the parent tried
+    // for itself was refused, and the ones it did not try are the ones it
+    // delegated instead.
+    metrics.insert(
+        "parent_tool_denials".to_string(),
+        agent.parent_tool_denials as f64,
     );
     metrics.insert("wall_ms".to_string(), agent.wall_ms as f64);
     metrics.insert("cost_usd".to_string(), agent.cost_usd);
@@ -531,7 +544,11 @@ fn s1m_agent_condition(
     let prompt = S1M_AGENT_PROMPT
         .replace("<files>", &list)
         .replace("<query>", &query.query);
-    let agent = agent_run(options, query, job, &prompt, S1M_AGENT_TOOLS)?;
+    // No hook here: this agent was handed the list, and reading it is the
+    // whole job. The settings file is there so that both agent conditions run
+    // under the same configuration.
+    let settings = crate::hook::install_plain(&options.out)?;
+    let agent = agent_run(options, query, job, &prompt, S1M_AGENT_TOOLS, &settings)?;
 
     let wanted = query.wanted();
     let relied: BTreeSet<PathBuf> = agent.files_relied.iter().cloned().collect();
@@ -568,6 +585,8 @@ struct AgentRun {
     /// went looking itself is a measurement of the wrong thing, and this is
     /// the number that says so.
     parent_tool_uses: usize,
+    /// The parent's own tool calls that were refused.
+    parent_tool_denials: usize,
     files_relied: Vec<PathBuf>,
     /// Whether the answer carried a list of files at all.
     relied_parsed: bool,
@@ -595,10 +614,11 @@ fn agent_run(
     job: &Job,
     prompt: &str,
     tools: &str,
+    settings: &Path,
 ) -> Result<AgentRun, String> {
     let stdout = raw_path(options, query, job, "stream.jsonl");
     let stderr = raw_path(options, query, job, "stderr");
-    let arguments = claude_arguments(prompt, tools, options.model.as_deref());
+    let arguments = claude_arguments(prompt, tools, options.model.as_deref(), settings);
 
     let started = Instant::now();
     let status = spawn(
@@ -691,6 +711,7 @@ fn agent_run(
 
     Ok(AgentRun {
         parent_tool_uses: summary.parent_tool_uses,
+        parent_tool_denials: summary.parent_tool_denials,
         files_relied: files_relied.clone(),
         relied_parsed,
         files_read: files_read.clone(),
@@ -725,6 +746,8 @@ fn agent_run(
             "parent_model": summary.model,
             "agent_model": agent_model,
             "parent_tools": summary.parent_tools,
+            "parent_tool_denials": summary.parent_tool_denials,
+            "settings": settings.display().to_string(),
             "session_id": summary.session_id,
             "tasks": summary.tasks,
             "subagent_usage_source": if transcripts.is_empty() { "stream" } else { "transcript" },
@@ -763,7 +786,12 @@ fn transcript_path(options: &Options, session: &str, agent: &str) -> Option<Path
 }
 
 /// The flags one `claude -p` run is made with.
-pub fn claude_arguments(prompt: &str, tools: &str, model: Option<&str>) -> Vec<String> {
+pub fn claude_arguments(
+    prompt: &str,
+    tools: &str,
+    model: Option<&str>,
+    settings: &Path,
+) -> Vec<String> {
     let mut arguments = vec!["-p".to_string(), prompt.to_string()];
     // A model named here is inherited by every agent in the run, the subagent
     // included, so naming one measures that model rather than the one Claude
@@ -777,7 +805,14 @@ pub fn claude_arguments(prompt: &str, tools: &str, model: Option<&str>) -> Vec<S
         "--output-format".to_string(),
         "stream-json".to_string(),
         "--verbose".to_string(),
-        "--safe-mode".to_string(),
+        // Not `--safe-mode`: that disables hooks, and the hook is what makes
+        // the parent delegate. `--setting-sources ""` is what keeps the wiki's
+        // own configuration out — including its `CLAUDE.md`, which the default
+        // flags do load — and `--settings` is the one file that is let in.
+        "--setting-sources".to_string(),
+        String::new(),
+        "--settings".to_string(),
+        settings.display().to_string(),
         "--tools".to_string(),
         tools.to_string(),
         "--allowedTools".to_string(),
@@ -1382,14 +1417,15 @@ mod tests {
     /// and the resolved models are read back from the run.
     #[test]
     fn a_model_is_only_asked_for_when_one_was_named() {
-        let named = claude_arguments("ask", "Task", Some("sonnet"));
+        let settings = Path::new("/run/explore-settings.json");
+        let named = claude_arguments("ask", "Task", Some("sonnet"), settings);
         let at = named
             .iter()
             .position(|flag| flag == "--model")
             .expect("the flag");
         assert_eq!(named[at + 1], "sonnet");
 
-        let default = claude_arguments("ask", "Task", None);
+        let default = claude_arguments("ask", "Task", None, settings);
         assert!(!default.contains(&"--model".to_string()), "{default:?}");
 
         // Whatever else changes, the run is non-interactive, streamed, and
@@ -1399,6 +1435,23 @@ mod tests {
             assert_eq!(arguments[1], "ask");
             assert!(arguments.contains(&"--verbose".to_string()));
             assert!(arguments.contains(&"stream-json".to_string()));
+            // The hook is what makes the parent delegate, and `--safe-mode`
+            // would turn it off; `--setting-sources ""` is what keeps the
+            // wiki's own configuration — its CLAUDE.md included — out.
+            assert!(
+                !arguments.contains(&"--safe-mode".to_string()),
+                "{arguments:?}"
+            );
+            let at = arguments
+                .iter()
+                .position(|flag| flag == "--setting-sources")
+                .expect("the sources flag");
+            assert_eq!(arguments[at + 1], "");
+            let at = arguments
+                .iter()
+                .position(|flag| flag == "--settings")
+                .expect("the settings flag");
+            assert_eq!(arguments[at + 1], settings.display().to_string());
             assert_eq!(
                 arguments.iter().filter(|flag| *flag == "Task").count(),
                 2,

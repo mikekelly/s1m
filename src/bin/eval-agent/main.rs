@@ -24,6 +24,7 @@ mod aggregate;
 mod explore;
 mod gold;
 mod graph;
+mod hook;
 mod reading;
 mod report;
 mod row;
