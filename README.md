@@ -222,6 +222,7 @@ above describe.
 | `--share-floor` | `0.02` | Under `--scorer choice`, least share of a page's Choice that keeps a link |
 | `--share-k` | `3` | And the cut's numerator: a link has to hold `k / options` of the page's probability |
 | `--beam` | `8` under `--scorer choice`, none otherwise | Files the walk visits at one depth |
+| `--wording` | the wording that ships | Ask the three questions in another register, leaving the criterion alone: `navigator`, `path`, `sharp-no`, `rules`, `necessity`, `task`, `reader-action`, `answer-bearing` or `reader`. It composes with `--mode` rather than replacing it — one picks what counts as relevant, the other how the questions about it are put — and the reading list still reports the criterion's name ([#52](https://github.com/mikekelly/s1m/issues/52)) |
 
 A Choice over a page keeps a link when its share clears
 `max(--share-floor, min(--share-k / options, 0.5))`, where `options` counts the `none` option
@@ -237,6 +238,17 @@ and the table is in [eval/REPORT.md](eval/REPORT.md#the-relative-judge-one-choic
 Its rows are bought rather than free, so `eval` measures them when it is asked to —
 `cargo run --release --bin eval -- --relative-judge` beside its usual arguments — and the
 committed cache answers them for a rerun like any other.
+
+`--wording` is the same kind of thing for the questions themselves: it puts the file's Score,
+each section's Noul and each link's Noul into one of nine registers without touching the
+criterion they are asked under, so a row of the wording table is the walk that ships with
+different words in it. The sentences each name sends are in `Wording` in
+[`src/jev.rs`](src/jev.rs), sentence for sentence, held there by a test. On the eval's gold set
+no register beats the shipped wording on recall, and the eval measures them when asked —
+`cargo run --release --bin eval -- --wordings` — with the table in
+[eval/REPORT.md](eval/REPORT.md#the-wording-the-same-three-questions-in-another-register) and
+what it decided in
+[docs/spike-notes.md](docs/spike-notes.md#the-wording-what-the-three-judgments-are-asked-in).
 
 ### Output formats
 
@@ -520,7 +532,8 @@ s1m score-file --no-previews "how does s1m decide which links to follow" \
 `--no-previews` leaves the whole preview out of the request, which is the control case for whether
 a preview earns its tokens. The hidden `--no-preview-headings`, `--no-preview-leads` and
 `--one-hop-links` do the same one part at a time — the ablations the eval measures
-([#46](https://github.com/mikekelly/s1m/issues/46)) — and the root's
+([#46](https://github.com/mikekelly/s1m/issues/46)) — the hidden `--wording NAME` asks the three
+questions in another register ([#52](https://github.com/mikekelly/s1m/issues/52)), and the root's
 [`.s1mignore`](#keeping-paths-out-of-it-s1mignore) applies here too: a file it matches is an
 error naming it, and a link to one is not judged at all.
 
