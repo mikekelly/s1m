@@ -10,8 +10,10 @@
 //!
 //! A file whose sections and links would not fit the API's state budget in one
 //! request is split across posts instead: every post carries the same file and
-//! its own share of the questions, and the answers merge into one judgment. See
-//! [`JevScorer::pack`].
+//! its own share of the questions, and the answers merge into one judgment. The
+//! split measures what it sends — the file, each link's entry and preview, and
+//! the questions — and keeps every post under both of the API's budgets; see
+//! [`JevScorer::pack`] and [`CHARS_PER_TOKEN`].
 //!
 //! There is no Rust SDK, so this calls the HTTP API directly:
 //! <https://docs.typesafe.ai/api.md>. The wording of every question lives in
@@ -56,31 +58,67 @@ pub const PRICE_PER_MTOK: f64 = 0.042;
 const FILE_QUESTION: &str = "file_relevance";
 
 /// How much of the file's text is sent. The API allows 32k tokens for the state
-/// plus the longest question and 64k for the whole request; four characters per
-/// token is the rough rule for English, so this is about a fifth of the state
-/// budget and leaves the link table most of the rest.
+/// plus the longest question and 64k for the whole request, so this is about a
+/// fifth of the state budget and leaves the link table most of the rest.
 const CONTENT_LIMIT: usize = 40_000;
 
 /// The tokens the API allows for `state` plus the longest question, from
-/// <https://docs.typesafe.ai/models> as read for `docs/spike-notes.md`. Past
-/// this the request is rejected, so a file whose sections and links do not fit
-/// alongside its content is split across posts ([`JevScorer::pack`]).
+/// <https://docs.typesafe.ai/models>. Past this the request is rejected with
+/// `max_tokens_exceeded`, which is what [#37] found the state of a link-heavy
+/// page to be: the file's own text is not what fills the budget, its link table
+/// is, and a link table that is split is what keeps every post under it.
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
 const STATE_TOKENS: usize = 32_000;
 
-/// Four characters per token: the rule of thumb the caps in this file are set
-/// with, because nothing here tokenises. [`JevScorer::pack`] measures the same
-/// way and rounds the same way, up.
-const CHARS_PER_TOKEN: usize = 4;
+/// The tokens the API allows for one request in total, same source. A state
+/// that fits can still be over this when a file has many questions, so the
+/// split keeps both budgets: `state` plus the longest question against
+/// [`STATE_TOKENS`], and everything against this.
+const REQUEST_TOKENS: usize = 64_000;
+
+/// The characters one token is worth in this module's estimate: two, where what
+/// it sends really measures two and a half to three.
+///
+/// Nothing here tokenises, so the split decides on a character count and this
+/// is the only conversion in it. Measured for [#37] against the API's own
+/// `usage`, over generated hubs and the vendored wiki: the JSON of a state —
+/// the file's text, its section entries, and a link table with a preview per
+/// link — came back at 2.9 to 3.1 characters per input token, the spike's
+/// hundred-link hub at 2.5, and prose on its own better than four. The estimate
+/// takes the worst of those, because the link table is the part that grows.
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
+const CHARS_PER_TOKEN: usize = 2;
+
+/// The characters [`STATE_TOKENS`] is spent in, at [`CHARS_PER_TOKEN`].
+const STATE_CHARS: usize = STATE_TOKENS * CHARS_PER_TOKEN;
+
+/// The characters [`REQUEST_TOKENS`] is spent in, at [`CHARS_PER_TOKEN`].
+const REQUEST_CHARS: usize = REQUEST_TOKENS * CHARS_PER_TOKEN;
+
+/// A title or a first paragraph cut to this many characters: a preview is a
+/// hint for the scent judgment, not the page.
+const PREVIEW_LIMIT: usize = 600;
+
+/// The frontmatter a preview carries, whole fields in the target's own order
+/// until this many characters are spent and no further field after that.
+///
+/// The frontmatter is the larger half of what a preview buys (`eval/REPORT.md`,
+/// the preview experiment) and the largest on either vendored wiki is 653
+/// characters, so no measured page is cut here. What the cap bounds is a page
+/// whose frontmatter is an essay: without it one target adds its whole
+/// frontmatter to the state of every page that links to it, which is the other
+/// half of what [#37] found over the state budget.
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
+const FRONTMATTER_LIMIT: usize = 1_200;
 
 /// Room left over in a post for what holds it together — the braces, the
 /// commas between items, the `model` field, the escaping of a quote in the
-/// file's own text. A post is only split when the estimate crosses the budget
+/// file's own text. A post is only split when the estimate crosses a budget
 /// with this margin, so the split errs towards an early one.
 const POST_MARGIN: usize = 1_024;
-
-/// A first paragraph cut to this many characters: the preview is a hint for the
-/// scent judgment, not the page.
-const PREVIEW_LIMIT: usize = 600;
 
 /// A round trip here is a second or two, so anything near this is a hang.
 const TIMEOUT: Duration = Duration::from_secs(120);
@@ -424,11 +462,51 @@ impl Share {
     }
 }
 
-/// What one question adds to a post: its state entry, the comma after that
-/// entry, the quotes and colon around the id the question is filed under, and
-/// the question itself. Measured in characters, for [`JevScorer::shares`].
-fn item_cost<T: Serialize>(entry: &T, question: &Question, id: &str) -> usize {
-    json_len(entry) + 1 + json_len(question) + json_len(id) + 4
+/// What one item of a post costs, in characters: its entry in the state, and
+/// the question asked about it with the quotes and colon that hold the id it is
+/// filed under.
+///
+/// Measured as the JSON each part is written as, for [`JevScorer::shares`].
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    state: usize,
+    question: usize,
+}
+
+impl Cost {
+    fn of<T: Serialize>(entry: &T, question: &Question, id: &str) -> Cost {
+        Cost {
+            // The comma that separates one state entry from the next.
+            state: json_len(entry) + 1,
+            question: json_len(question) + json_len(id) + 4,
+        }
+    }
+}
+
+/// What every post of one file pays before its share of the sections and
+/// links: the state the file brings with it, and the questions the API's state
+/// budget is measured against.
+#[derive(Debug, Clone, Copy)]
+struct Fixed {
+    /// The query and the file, in every post's state.
+    state: usize,
+    /// The longest question the file asks, which the docs' 32k budget adds to
+    /// the state.
+    longest: usize,
+    /// The file's own Score question, which the first post asks and no other.
+    score: usize,
+}
+
+impl Fixed {
+    /// Whether a post holding `used` so far can take one more item of `cost`
+    /// under both of the API's budgets — `state` plus the longest question, and
+    /// the whole request — with [`POST_MARGIN`] left over in each for the
+    /// braces, the `model` field and the escaping of the file's own text.
+    fn fits(&self, used: Cost, cost: Cost) -> bool {
+        let state = self.state + used.state + cost.state;
+        let whole = state + used.question + cost.question;
+        state + self.longest + POST_MARGIN <= STATE_CHARS && whole + POST_MARGIN <= REQUEST_CHARS
+    }
 }
 
 /// The characters one part of a post costs, measured as the JSON it is written
@@ -731,29 +809,60 @@ impl JevScorer {
     ///
     /// One post is the normal case: every question of a request sees the same
     /// state and is evaluated in parallel, so splitting gains latency nothing.
-    /// This is a size question. The docs allow 32k tokens for `state` plus the
-    /// longest question, and what can grow without bound is the file's content
-    /// — capped at [`CONTENT_LIMIT`], so about 10k tokens — and then its link
-    /// table, at about 250 tokens a link with previews (`docs/spike-notes.md`).
-    /// Only the questions are left to split, and the file goes in every post,
-    /// so each post is the file plus the sections and links that fit beside it.
+    /// This is a size question, and the size that binds is the state: the docs
+    /// allow 32k tokens for `state` plus the longest question, and the state
+    /// grows with a link table at roughly 250 tokens a link with previews
+    /// (`docs/spike-notes.md`) — a page of 17k characters and 92 previewed
+    /// links is one request the API refuses and two it answers ([#37]). The
+    /// file's own text is capped at [`CONTENT_LIMIT`], so the sections and
+    /// links are dealt out into shares that fit beside it, the file goes in
+    /// every post, and its answers merge into one judgment.
     ///
     /// The questions are dealt out in the file's own order, sections first, so
     /// the answers of the posts in order are the file's sections and links in
     /// order. A post's cost is measured as the JSON of its parts at
-    /// [`CHARS_PER_TOKEN`], rounded up, with [`POST_MARGIN`] to spare: nothing
-    /// here tokenises, so the estimate is deliberately a conservative one.
+    /// [`CHARS_PER_TOKEN`] against [`STATE_CHARS`] and [`REQUEST_CHARS`], with
+    /// [`POST_MARGIN`] to spare: nothing here tokenises, so the estimate is
+    /// deliberately a conservative one.
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
     fn pack(
         &self,
         query: &str,
         file: FileState,
         sections: Vec<SectionState>,
-        links: Vec<LinkState>,
+        mut links: Vec<LinkState>,
     ) -> Request {
-        // The file's Score is about the whole file, so it is asked once, in the
-        // first post, and every post pays for the file state it asks about.
-        let fixed = json_len(&query) + json_len(&file) + json_len(&self.score_question());
-        let shares = self.shares(&sections, &links, fixed);
+        let fixed = Fixed {
+            // The file's own state: what every post carries whatever its share.
+            state: json_len(&query) + json_len(&file),
+            // The API's state budget is the state plus the longest question,
+            // and every post asks at least one question about what it carries.
+            longest: self.longest_question(),
+            // The file's Score is about the whole file, so it is asked once, in
+            // the first post, and only that post pays for it.
+            score: json_len(&self.score_question()),
+        };
+
+        // A file whose own state and longest question leave no room for a
+        // previewed link drops its previews before it drops links: a link
+        // judged from its anchor is worth more than a link never judged at all,
+        // and a preview is a hint (`JevScorer::preview`). What this bounds is a
+        // file whose text fills the budget on its own — content of
+        // [`CONTENT_LIMIT`] characters is sent as more than that once its
+        // quotes and newlines are escaped.
+        let cheapest = links
+            .iter()
+            .filter(|link| link.target_preview.is_some())
+            .map(json_len)
+            .min();
+        if cheapest.is_some_and(|entry| fixed.state + fixed.longest + entry > STATE_CHARS) {
+            for link in &mut links {
+                link.target_preview = None;
+            }
+        }
+
+        let shares = self.shares(&sections, &links, &fixed);
 
         Request {
             posts: shares
@@ -769,12 +878,31 @@ impl JevScorer {
         }
     }
 
+    /// The characters of the longest question this file asks: what the state
+    /// budget is measured with, because the API's 32k is `state` plus the
+    /// longest question and every post carries both.
+    ///
+    /// The three shapes differ by a sentence or two of the mode's wording and
+    /// by the id they are filed under; the longest of them is what the state
+    /// has to fit beside.
+    fn longest_question(&self) -> usize {
+        [
+            self.score_question(),
+            self.section_question(0),
+            self.link_question(0),
+        ]
+        .iter()
+        .map(json_len)
+        .max()
+        .expect("three questions")
+    }
+
     /// Deals the file's sections and links out into shares that each fit the
-    /// state budget beside the file.
+    /// API's budgets beside the file.
     ///
     /// Always at least one share, even for a file with no sections and no
     /// links: the file still has a Score to ask.
-    fn shares(&self, sections: &[SectionState], links: &[LinkState], fixed: usize) -> Vec<Share> {
+    fn shares(&self, sections: &[SectionState], links: &[LinkState], fixed: &Fixed) -> Vec<Share> {
         // An item's cost is its state entry, the question, and the characters
         // that hold them in the body: the comma between entries, and the quotes
         // and colon around the id each question is filed under. The question is
@@ -787,7 +915,7 @@ impl JevScorer {
             .map(|(index, section)| {
                 (
                     Item::Section(index),
-                    item_cost(
+                    Cost::of(
                         section,
                         &self.section_question(index),
                         &section_question(index),
@@ -797,22 +925,26 @@ impl JevScorer {
             .chain(links.iter().enumerate().map(|(index, link)| {
                 (
                     Item::Link(index),
-                    item_cost(link, &self.link_question(index), &link_question(index)),
+                    Cost::of(link, &self.link_question(index), &link_question(index)),
                 )
             }));
 
         let mut shares = vec![Share::default()];
-        let mut used = 0;
+        // What this share holds so far: its own state entries and its own
+        // questions. The file's Score is the first share's to ask, and no later
+        // one pays for it.
+        let mut used = Cost {
+            question: fixed.score,
+            ..Cost::default()
+        };
         for (item, cost) in costs {
             let open = shares.last().expect("a share is always open");
             // A share with something in it gives way to an item that would not
             // fit; an empty one takes the item whatever it costs, so dealing
             // always makes progress.
-            if !open.is_empty()
-                && (fixed + used + cost + POST_MARGIN).div_ceil(CHARS_PER_TOKEN) > STATE_TOKENS
-            {
+            if !open.is_empty() && !fixed.fits(used, cost) {
                 shares.push(Share::default());
-                used = 0;
+                used = Cost::default();
             }
             match item {
                 Item::Section(index) => shares
@@ -828,7 +960,8 @@ impl JevScorer {
                         .push(index);
                 }
             }
-            used += cost;
+            used.state += cost.state;
+            used.question += cost.question;
         }
         shares
     }
@@ -1056,7 +1189,7 @@ impl JevScorer {
         })
     }
 
-    /// The target's title, frontmatter and first paragraph.
+    /// The target's title, frontmatter and first paragraph, each bounded.
     ///
     /// Nothing when previews are off, when the link leaves the root — that
     /// content is outside what the caller asked s1m to look at — or when the
@@ -1064,16 +1197,22 @@ impl JevScorer {
     /// links are still judged, from their anchor, sentence and heading. The
     /// frontmatter is the one part that can be dropped on its own
     /// ([`JevScorer::with_preview_frontmatter`]).
+    ///
+    /// Every part is bounded, because a preview is a hint about a target and
+    /// the target is a file this walk did not choose: a title is one line, the
+    /// first paragraph is cut at [`PREVIEW_LIMIT`], and the frontmatter at
+    /// [`FRONTMATTER_LIMIT`]. Without those bounds one page's frontmatter is
+    /// added to the state of every page that links to it.
     fn preview(&self, link: &Link) -> Option<PreviewState> {
         if !self.previews || !link.in_root {
             return None;
         }
         let preview = parse::preview(self.root.join(&link.target)).ok()?;
         Some(PreviewState {
-            title: preview.title,
+            title: clamp(&preview.title, PREVIEW_LIMIT),
             frontmatter: self
                 .preview_frontmatter
-                .then_some(preview.frontmatter)
+                .then(|| frontmatter(preview.frontmatter))
                 .filter(|frontmatter| !frontmatter.is_empty()),
             first_paragraph: preview
                 .first_paragraph
@@ -1143,6 +1282,27 @@ fn clamp(text: &str, limit: usize) -> String {
 /// it repeats, and the server's `retry-after` wins when it sends one.
 fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(250 * 2u64.pow(attempt - 1))
+}
+
+/// The frontmatter a preview carries: whole fields in the target's own order
+/// until [`FRONTMATTER_LIMIT`] characters are spent, and no field after that.
+///
+/// The fields are kept whole rather than cut, so a preview never shows half a
+/// `related:` list as if it were the list. A target whose frontmatter is an
+/// essay keeps its opening fields and loses the rest, which is what bounds one
+/// page's frontmatter to one page's worth of every request that links to it.
+fn frontmatter(fields: Vec<FrontmatterField>) -> Vec<FrontmatterField> {
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for field in fields {
+        let cost = json_len(&field) + 1;
+        if used + cost > FRONTMATTER_LIMIT {
+            break;
+        }
+        used += cost;
+        kept.push(field);
+    }
+    kept
 }
 
 #[cfg(test)]
@@ -1257,9 +1417,17 @@ mod tests {
                 .clone()
         }
 
-        /// A scorer pointed at this server, with previews on.
+        /// A scorer pointed at this server, with previews on and the fixture
+        /// wiki as the root link previews are read from.
         fn scorer(&self) -> JevScorer {
-            JevScorer::new("test-key", root())
+            self.scorer_in(&root())
+        }
+
+        /// A scorer pointed at this server whose root is `root`: the directory
+        /// a link's preview is read from, which is the temporary directory for
+        /// a test that generated the pages it links to.
+        fn scorer_in(&self, root: &Path) -> JevScorer {
+            JevScorer::new("test-key", root)
                 .expect("a client")
                 .with_endpoint(&self.url)
         }
@@ -1431,6 +1599,29 @@ mod tests {
         "payments/cutoffs.md",
         "../outside.md",
     ];
+
+    /// A reply that answers every question the request asks, whatever its ids
+    /// are: a Score for the file's own, a Noul for every other.
+    ///
+    /// [`numbered_reply`] numbers its answers by the link a question names,
+    /// which is what a test tracing a scent back to its link needs and what a
+    /// page whose targets are not `page-NNN.md` cannot use.
+    fn any_reply(request: &Value, level: f64) -> String {
+        let answers = request["questions"]
+            .as_object()
+            .expect("a question map")
+            .keys()
+            .map(|id| {
+                let answer = if id == FILE_QUESTION {
+                    json!({"type": "score", "score": level, "confidence": 0.87})
+                } else {
+                    json!({"type": "noul", "noul": 0.6})
+                };
+                (id.clone(), answer)
+            })
+            .collect::<Map<String, Value>>();
+        reply(answers)
+    }
 
     // ------------------------------------------------------------ the tests
 
@@ -2124,6 +2315,12 @@ mod tests {
     /// each named in its own anchor, so a scent can be traced back to the link
     /// it belongs to.
     fn generated(dir: &TempDir, headings: usize, pages: usize) -> ParsedFile {
+        hub(dir, headings, pages, "")
+    }
+
+    /// [`generated`], with a frontmatter block of `frontmatter` on every page
+    /// the hub links to, so every link in it carries a preview.
+    fn hub(dir: &TempDir, headings: usize, pages: usize, frontmatter: &str) -> ParsedFile {
         let mut source = String::from("# Hub\n\nThe generated hub page.\n\n");
         for index in 0..headings {
             source.push_str(&format!(
@@ -2134,7 +2331,9 @@ mod tests {
             let page = format!("page-{index:03}.md");
             fs::write(
                 dir.path().join(&page),
-                format!("# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"),
+                format!(
+                    "{frontmatter}# Page {index}\n\nPage {index} covers step {index} of the runbook.\n"
+                ),
             )
             .expect("a generated page");
             source.push_str(&format!(
@@ -2147,16 +2346,42 @@ mod tests {
     }
 
     /// What one post costs, as the characters the API receives: the estimate
-    /// [`JevScorer::shares`] works from is of these bytes, so a post over the
-    /// budget is a split that did not happen.
+    /// [`JevScorer::shares`] works from is of these bytes.
     fn post_length(request: &Value) -> usize {
-        serde_json::to_string(request)
-            .expect("a request is strings and numbers")
-            .len()
+        json_len(request)
     }
 
-    /// The budget in characters, at the four-per-token rule the split uses.
-    const BUDGET_CHARS: usize = STATE_TOKENS * CHARS_PER_TOKEN;
+    /// What one post's state costs, the same way: what the docs' 32k budget is
+    /// measured on, plus the longest question the post asks.
+    fn state_length(request: &Value) -> usize {
+        json_len(&request["state"])
+            + request["questions"]
+                .as_object()
+                .expect("a question map")
+                .values()
+                .map(json_len)
+                .max()
+                .unwrap_or(0)
+    }
+
+    /// Both of the API's budgets, checked on one post as the API receives it.
+    ///
+    /// These are the characters the estimate is made of, so a post over either
+    /// is the split letting the API refuse a request: `state` plus the longest
+    /// question against [`STATE_CHARS`], and the whole request against
+    /// [`REQUEST_CHARS`].
+    fn assert_within_budget(request: &Value) {
+        assert!(
+            state_length(request) <= STATE_CHARS,
+            "a post is over the state budget: {} characters of state and longest question, over {STATE_CHARS}",
+            state_length(request)
+        );
+        assert!(
+            post_length(request) <= REQUEST_CHARS,
+            "a post is over the request budget: {} characters, over {REQUEST_CHARS}",
+            post_length(request)
+        );
+    }
 
     /// A hub page whose links are too many for one post is asked in several:
     /// every post inside the state budget, the file in every one, the file's
@@ -2182,11 +2407,7 @@ mod tests {
             requests.iter().map(post_length).collect::<Vec<_>>()
         );
         for request in &requests {
-            assert!(
-                post_length(request) <= BUDGET_CHARS,
-                "a post of {} characters is over the budget",
-                post_length(request)
-            );
+            assert_within_budget(request);
             assert_eq!(
                 request["state"]["file"]["content"], content,
                 "every post carries the file itself"
@@ -2274,10 +2495,7 @@ mod tests {
             requests.iter().map(post_length).collect::<Vec<_>>()
         );
         for request in &requests {
-            assert!(
-                post_length(request) <= BUDGET_CHARS,
-                "a post is over the budget"
-            );
+            assert_within_budget(request);
         }
 
         assert_eq!(outcome.judgment.sections.len(), file.sections.len());
@@ -2475,6 +2693,294 @@ mod tests {
             .expect("a judgment");
         assert_eq!(api.requests().len(), 3, "so is a new query");
         assert_eq!(cached.calls(), 3, "every one of them was a call");
+    }
+
+    // -------------------------------------------------------- the state budget
+
+    /// The page [#37] was found on: a page of around 17,000 characters with 22
+    /// headings and 92 links, each to a sibling page with frontmatter of its
+    /// own, so every link carries a preview into the state.
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    fn big_page(dir: &TempDir) -> ParsedFile {
+        let headings = 22;
+        let pages = 92;
+        let mut source = String::from(
+            "---\ntitle: Hub\ntags: release, runbook\n---\n\n# Hub\n\nThe hub page for the release process.\n\n",
+        );
+        let mut next = 0;
+        for heading in 0..headings {
+            source.push_str(&format!(
+                "## Heading {heading}\n\nThe text under heading {heading} explains how the release process works, in a sentence of ordinary wiki length.\n\n"
+            ));
+            // Four links under every heading, and one more under the first four:
+            // 92 in all, so `page_number` finds the link an answer belongs to.
+            for _ in 0..4 + usize::from(heading < pages - headings * 4) {
+                source.push_str(&format!(
+                    "- [Page {next}](page-{next:03}.md) — step {next} of the release runbook, and a sentence about it that runs on a little.\n"
+                ));
+                next += 1;
+            }
+            source.push('\n');
+        }
+        // The file's own text, up to the size the issue reports: it is not what
+        // fills the budget, but it is what the page is.
+        while source.chars().count() < 16_984 {
+            source.push_str("Filler prose that a wiki author would have written here.\n\n");
+        }
+        for index in 0..pages {
+            fs::write(
+                dir.path().join(format!("page-{index:03}.md")),
+                format!(
+                    "---\ntitle: Page {index}\ntags: release, runbook, packaging\nrelated: [page-001.md, page-002.md, page-003.md]\nsummary: How step {index} of the release runbook works, with notes about packaging and publishing.\nupdated: 2026-09-20\nowner: someone\n---\n\n# Page {index}\n\nPage {index} covers step {index} of the runbook in a paragraph of the ordinary length a wiki author writes.\n"
+                ),
+            )
+            .expect("a generated page");
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &source).expect("the hub");
+        parse::parse(&path, dir.path()).expect("a parse")
+    }
+
+    /// The state one post would carry if the file were not split: every section
+    /// and every link of every post, plus the file the posts all carry.
+    fn whole_state(requests: &[Value]) -> usize {
+        let file =
+            json_len(&requests[0]["state"]["query"]) + json_len(&requests[0]["state"]["file"]);
+        let entries: usize = requests
+            .iter()
+            .map(|request| {
+                let sections = request["state"]["sections"]
+                    .as_array()
+                    .expect("a section list");
+                let links = request["state"]["links"].as_array().expect("a link list");
+                sections
+                    .iter()
+                    .chain(links.iter())
+                    .map(json_len)
+                    .sum::<usize>()
+                    + sections.len()
+                    + links.len()
+            })
+            .sum();
+        file + entries
+    }
+
+    /// A page of 17k characters with 92 links to pages that have frontmatter:
+    /// one request, whose state was over the API's budget, and the API refused
+    /// it with `max_tokens_exceeded` ([#37]).
+    ///
+    /// The state of that page does not fit one post, so it is judged in
+    /// several, and every post — the state plus its longest question, and the
+    /// whole request — is inside the budget the estimate keeps it in. Every
+    /// answer still lands on the link that named it.
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    #[tokio::test]
+    async fn a_page_of_17k_chars_with_92_previewed_links_is_split_across_posts() {
+        let dir = TempDir::new("issue-37");
+        let file = big_page(&dir);
+        assert_eq!(file.links.len(), 92);
+        assert_eq!(file.sections.len(), 23);
+        let api = FakeApi::new(|_, request| (200, numbered_reply(request, 2.0)));
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .judge("how do I cut a release and publish the package", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            whole_state(&requests) > STATE_CHARS,
+            "the page's own state has to be over one post's budget for this to be the reported bug: {} characters",
+            whole_state(&requests)
+        );
+        assert!(
+            requests.len() > 1,
+            "a state that does not fit is judged in several posts, got {}",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+        }
+
+        // The answers still come back on the entries that asked for them: one
+        // per link, on its own target, with the scent the fake numbered it by.
+        assert_eq!(outcome.judgment.links.len(), file.links.len());
+        for (index, (judged, link)) in outcome.judgment.links.iter().zip(&file.links).enumerate() {
+            assert_eq!(judged.target, link.target, "link {index}");
+            let target = link.target.to_str().expect("a target path");
+            let expected = 0.4 + page_number(target) as f64 / 1000.0;
+            assert!(
+                (judged.scent - expected).abs() < 1e-9,
+                "link {index} got {}",
+                judged.scent
+            );
+        }
+        assert_eq!(outcome.detail.requests, requests.len());
+    }
+
+    /// A preview is a hint about a target, and the target is a file this walk
+    /// did not choose: every part of one is bounded, so no page's frontmatter
+    /// or first paragraph is added whole to every request that links to it
+    /// ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    #[tokio::test]
+    async fn a_preview_is_bounded_by_the_state_it_adds() {
+        let dir = TempDir::new("bounded-preview");
+        let essay = "Long summary prose about packaging and publishing. ".repeat(500);
+        let heading = "# ".to_string() + &"T".repeat(4_000);
+        fs::write(
+            dir.path().join("big.md"),
+            format!(
+                "---\ntitle: Big\ntags: release, runbook\nsummary: {essay}\n---\n\n{heading}\n\n{}\n",
+                "Paragraph prose. ".repeat(400)
+            ),
+        )
+        .expect("a page");
+        fs::write(dir.path().join("hub.md"), "# Hub\n\n[Big](big.md)\n").expect("a hub");
+        let file = parse::parse(dir.path().join("hub.md"), dir.path()).expect("a parse");
+
+        let api = FakeApi::new(|_, request| (200, any_reply(request, 1.5)));
+        api.scorer_in(dir.path())
+            .judge("how do I cut a release", &file)
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        let preview = &requests[0]["state"]["links"][0]["target_preview"];
+        assert!(
+            !preview.is_null(),
+            "the target is readable, so there is a preview: {preview}"
+        );
+        let fields = preview["frontmatter"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            json_len(&fields) <= FRONTMATTER_LIMIT,
+            "the frontmatter is over its own budget: {} characters",
+            json_len(&fields)
+        );
+        assert!(
+            fields.iter().any(|field| field["key"] == "title"),
+            "the fields that fit are kept whole and in order: {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|field| field["key"] == "summary"),
+            "the field that would not fit is left out rather than cut in half: {fields:?}"
+        );
+        let paragraph = preview["first_paragraph"]
+            .as_str()
+            .expect("the page has a paragraph");
+        assert!(
+            paragraph.contains("[truncated at"),
+            "a paragraph longer than the limit says so: {paragraph}"
+        );
+        let title = preview["title"].as_str().expect("a title");
+        assert!(
+            title.chars().count() <= PREVIEW_LIMIT,
+            "the title is bounded too, and this one is {} characters",
+            title.chars().count()
+        );
+        assert!(
+            preview_length(preview) < PREVIEW_LIMIT + FRONTMATTER_LIMIT + 200,
+            "a preview costs a bounded number of characters"
+        );
+    }
+
+    /// What one preview costs the state, in characters.
+    fn preview_length(preview: &Value) -> usize {
+        json_len(preview)
+    }
+
+    /// A file whose own text fills the state budget drops its links' previews
+    /// rather than its links: a link judged from its anchor is worth more than
+    /// a link never judged, and the preview is the hint that goes first
+    /// ([#37]).
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    #[tokio::test]
+    async fn a_file_that_fills_the_state_budget_drops_its_previews_before_its_links() {
+        let api = FakeApi::new(|_, _| (200, reply(Map::new())));
+        let scorer = api.scorer();
+        let query = "a query";
+        let link = LinkState {
+            anchor: "Page".to_string(),
+            sentence: "Page.".to_string(),
+            heading: None,
+            target: "page.md".to_string(),
+            target_preview: Some(PreviewState {
+                title: "Page".to_string(),
+                frontmatter: Some(vec![FrontmatterField {
+                    key: "tags".to_string(),
+                    value: "release, runbook".to_string(),
+                }]),
+                first_paragraph: Some("A page about the release runbook.".to_string()),
+            }),
+        };
+        let plain = LinkState {
+            target_preview: None,
+            ..link.clone()
+        };
+        let empty = FileState {
+            path: "hub.md".to_string(),
+            title: "Hub".to_string(),
+            content: String::new(),
+        };
+        // The file's own state, all but the room one plain link needs: every
+        // quote is escaped to two characters in the state, so the content is
+        // sized from the budgets rather than guessed at.
+        let overhead = json_len(&empty) + json_len(&query);
+        let room = STATE_CHARS - overhead - scorer.longest_question() - json_len(&plain);
+        let content = "\"".repeat(room.div_ceil(2));
+
+        let request = scorer.pack(
+            query,
+            FileState {
+                content: content.clone(),
+                ..empty.clone()
+            },
+            Vec::new(),
+            vec![link.clone()],
+        );
+
+        assert_eq!(request.posts.len(), 1, "there is one link to ask about");
+        assert!(
+            request.posts[0].body.state.links[0]
+                .target_preview
+                .is_none(),
+            "the file's own state leaves no room for a previewed link, so the preview goes"
+        );
+        assert_eq!(
+            request.posts[0].body.state.links[0].target, link.target,
+            "the link itself is still judged"
+        );
+        let state = json_len(&request.posts[0].body.state);
+        assert!(
+            state <= STATE_CHARS,
+            "and what is left fits: {state} characters of state"
+        );
+
+        // A file with room for a preview keeps them, which is the case the cap
+        // and the split are for.
+        let request = scorer.pack(
+            query,
+            FileState {
+                content: "ordinary page text".to_string(),
+                ..empty
+            },
+            Vec::new(),
+            vec![link],
+        );
+        assert!(
+            request.posts[0].body.state.links[0]
+                .target_preview
+                .is_some(),
+            "a page that is not over the budget keeps its previews"
+        );
     }
 
     #[test]

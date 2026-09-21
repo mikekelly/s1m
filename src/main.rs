@@ -87,6 +87,12 @@ Exit codes:
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
 
+A page the walk reached but could not judge is not an error: it is named on
+stderr as skipped, its links are not followed, and the reading list keeps every
+page that was judged. The code is the list's own, so a walk that got past the
+entry files still exits 0 with one page missing. Only a run that judged nothing
+at all — an entry file whose judgment failed with nothing else reached — is 2.
+
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, a score per section and a scent
 per link (see docs/spike-notes.md).";

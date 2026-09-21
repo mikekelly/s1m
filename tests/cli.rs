@@ -30,6 +30,11 @@ const DEEP: &str = "tests/fixtures/cli/deep.md";
 /// An entry file that is not there, for the run that must name it.
 const GONE: &str = "tests/fixtures/cli/gone.md";
 
+/// An entry page that links on to `next.md` and to a page that is not there:
+/// the wiki shape a walk meets when one page of it cannot be judged, and one
+/// hop further than `entry.md`.
+const BROKEN_LINK_ENTRY: &str = "tests/fixtures/cli/broken.md";
+
 /// A criterion of the caller's own, for the run that replaces a mode with one.
 const CRITERIA: &str = "tests/fixtures/criteria/payouts.md";
 
@@ -56,6 +61,12 @@ const IGNORE_SECRET: &str = "Combination 4471 opens the safe";
 
 /// A root whose `.s1mignore` does not parse, and the page beside it.
 const BROKEN_ENTRY: &str = "tests/fixtures/ignore-broken/entry.md";
+
+/// What the API answers when a state is over its budget: the 400 a page of 17k
+/// characters with 92 previewed links met ([#37]).
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
+const OVER_BUDGET: &str = r#"{"detail":{"error_type":"max_tokens_exceeded"}}"#;
 
 /// The id the scorer asks the file's own question under; every other question
 /// in a request is a link, `link_0`, `link_1`, and so on.
@@ -353,12 +364,27 @@ impl FakeApi {
     /// test varies to put links above or below `--threshold`; `section` does
     /// the same for the sections `--threshold` keeps.
     fn new(score: f64, noul: f64, section: f64) -> FakeApi {
+        FakeApi::answering(score, noul, section, None)
+    }
+
+    /// The same server, refusing the page whose path ends in `page`: the API's
+    /// own answer when a state is over its budget — the `max_tokens_exceeded`
+    /// of [#37] — which is what a page that cannot be judged looks like from
+    /// the CLI.
+    ///
+    /// [#37]: https://github.com/mikekelly/s1m/issues/37
+    fn refusing(page: &str, score: f64, noul: f64, section: f64) -> FakeApi {
+        FakeApi::answering(score, noul, section, Some(page))
+    }
+
+    fn answering(score: f64, noul: f64, section: f64, refuse: Option<&str>) -> FakeApi {
         let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
         let address = listener.local_addr().expect("the bound address");
         let requests = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let recorded = Arc::clone(&requests);
         let flag = Arc::clone(&stop);
+        let refused = refuse.map(str::to_string);
         let thread = thread::spawn(move || {
             for stream in listener.incoming() {
                 if flag.load(Ordering::SeqCst) {
@@ -368,12 +394,22 @@ impl FakeApi {
                 let Some(request) = read_request(&mut stream) else {
                     continue;
                 };
+                let refused = refused.as_ref().is_some_and(|page| {
+                    request["state"]["file"]["path"]
+                        .as_str()
+                        .is_some_and(|path| path.ends_with(page))
+                });
                 recorded
                     .lock()
                     .expect("the lock is not poisoned")
                     .push(request.clone());
-                let body = reply(&request, score, noul, section);
-                let _ = stream.write_all(response(&body).as_bytes());
+                let body = if refused {
+                    OVER_BUDGET.to_string()
+                } else {
+                    reply(&request, score, noul, section)
+                };
+                let status = if refused { 400 } else { 200 };
+                let _ = stream.write_all(response(status, &body).as_bytes());
             }
         });
         FakeApi {
@@ -491,9 +527,16 @@ fn reply(request: &Value, score: f64, noul: f64, section: f64) -> String {
 
 /// A response as a one-shot HTTP/1.1 reply: the length is the body's, and the
 /// connection closes after it.
-fn response(body: &str) -> String {
+fn response(status: u16, body: &str) -> String {
+    let reason = match status {
+        200 => "OK",
+        401 => "Unauthorized",
+        429 => "Too Many Requests",
+        529 => "Overloaded",
+        _ => "Bad Request",
+    };
     format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\n\
          content-length: {}\r\nconnection: close\r\n\r\n{body}",
         body.len()
     )
@@ -664,6 +707,96 @@ fn nothing_above_the_threshold_exits_1_with_the_entry_file() {
     let error = stderr(&output);
     assert!(error.contains("nothing cleared the threshold"), "{error}");
     assert_eq!(error.lines().count(), 1, "{error}");
+}
+
+/// A page the API will not judge — a state over its budget, the
+/// `max_tokens_exceeded` of [#37] — is skipped, not fatal: the walk keeps the
+/// pages it judged, says which page it dropped in one line on stderr, and exits
+/// with the code its reading list earned.
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
+#[test]
+fn a_page_that_cannot_be_judged_is_skipped_and_the_walk_carries_on() {
+    // The page that cannot be judged is two hops on, where `broken.md` links to
+    // `next.md` and `next.md` links to `deep.md`: the walk still reaches beyond
+    // the entry file, so the run earns a 0 and prints a list.
+    let api = FakeApi::refusing(DEEP, 3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, BROKEN_LINK_ENTRY], &api, &cache);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a walked page was judged, so the run is a reading list: {}",
+        stderr(&output)
+    );
+    let list = json(&output);
+    assert_eq!(
+        paths(&list),
+        [BROKEN_LINK_ENTRY, NEXT],
+        "the page that could not be judged is not in the list, and the pages around it are"
+    );
+    let error = stderr(&output);
+    assert!(
+        error.contains(DEEP) && error.contains("max_tokens_exceeded"),
+        "the page and the reason are on stderr: {error}"
+    );
+    assert_eq!(
+        error.lines().filter(|line| line.contains(DEEP)).count(),
+        1,
+        "one line for the page that was dropped: {error}"
+    );
+}
+
+/// A page whose judgment fails is not retried and not revisited: the walk asks
+/// about it once, and it is not a visited file.
+#[test]
+fn a_page_that_cannot_be_judged_is_asked_once() {
+    let api = FakeApi::refusing(DEEP, 3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, BROKEN_LINK_ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        api.answered(),
+        3,
+        "the entry, the page on from it, and the one that failed — once each"
+    );
+    let list = json(&output);
+    assert_eq!(
+        list["visited"], 2,
+        "the page that failed is not one of the files that were judged"
+    );
+}
+
+/// Nothing judged at all: an entry file whose judgment failed, with no other
+/// page reached, has no reading list to print. Exit 2, one line naming it, and
+/// nothing on stdout — the same shape as an entry file that cannot be read
+/// ([#37]).
+///
+/// [#37]: https://github.com/mikekelly/s1m/issues/37
+#[test]
+fn an_entry_file_that_cannot_be_judged_exits_2() {
+    let api = FakeApi::refusing(ENTRY, 3.0, 0.9, 0.7);
+    let cache = Cache::new();
+
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error = stderr(&output);
+    assert!(
+        error.contains(ENTRY) && error.contains("max_tokens_exceeded"),
+        "{error}"
+    );
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert_eq!(
+        api.answered(),
+        1,
+        "nothing else was reached, so nothing else was asked"
+    );
 }
 
 /// An entry file the caller named and cannot be read is the caller's mistake,
