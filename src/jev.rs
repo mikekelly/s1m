@@ -911,10 +911,10 @@ impl JevScorer {
     /// past the target. The link being judged leads to a section page whose
     /// own links name the topics under it, which is evidence about where the
     /// walk ends up that the target's own prose may not carry. Read from the
-    /// target's links only — nothing is followed, and nothing is read that the
-    /// walk had not already reached — and bounded by [`LEADS`] and
-    /// [`LEAD_LIMIT`] so that one hub cannot fill the state of every page that
-    /// links to it.
+    /// target's links, which the preview reads anyway — nothing is followed,
+    /// and no page is read for this that no preview would read — and bounded by
+    /// [`LEADS`] and [`LEAD_LIMIT`] so that one hub cannot fill the state of
+    /// every page that links to it.
     ///
     /// [#46]: https://github.com/mikekelly/s1m/issues/46
     pub fn with_preview_leads(mut self, leads: bool) -> Self {
