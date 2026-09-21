@@ -268,42 +268,27 @@ fn an_unreadable_or_empty_criteria_file_exits_2_naming_it() {
     );
 }
 
-/// The hidden flags of the link-context experiment [#46] are a run's state: each
-/// one reaches the request the binary sends, under the name the API's state
-/// spells it, and the state a run that names none of them sends is the one that
-/// ships.
+/// The hidden opt-out flags of [#46] are a run's state: the run that names none
+/// of them carries the whole of it, and each flag takes exactly its own part
+/// away and leaves the rest.
 ///
 /// This is the flag-to-field wiring the unit tests cannot see: the switches are
 /// [`s1m::jev::Context`]'s, and nothing but this checks that the flag a person
-/// types is the field the harness measures.
+/// types is the field the shipped state is built from.
 ///
 /// [#46]: https://github.com/mikekelly/s1m/issues/46
 #[test]
-fn the_hidden_link_context_flags_reach_the_request() {
+fn the_hidden_ablation_flags_take_the_state_away() {
     let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
-
-    let output = run_with(
-        &[
-            QUERY,
-            ENTRY,
-            "--preview-headings",
-            "--preview-leads",
-            "--via-titles",
-            "--two-hop-links",
-        ],
-        &api,
-        &cache,
-    );
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 
+    // What ships: the target's own headings and the anchor text of its own
+    // links. `next.md` is an H1, a sentence and one link, so it has no headings
+    // to carry and one lead, and the question reaches past the link it names.
     let requests = api.requests();
     let entry = request_for(&requests, ENTRY);
-    let next = request_for(&requests, NEXT);
-
-    // The target's own headings and the anchor text of its own in-root links.
-    // `next.md` is an H1 and one link, so its headings are none and its lead is
-    // the one link it makes.
     assert_eq!(
         entry["state"]["links"][0]["target_preview"]["headings"],
         json!([])
@@ -312,55 +297,63 @@ fn the_hidden_link_context_flags_reach_the_request() {
         entry["state"]["links"][0]["target_preview"]["leads_to"],
         json!(["Deep"])
     );
+    let two_hop = instructions(entry, "link_0");
+    assert!(
+        two_hop.contains("directly or through the pages it links to"),
+        "the two-hop question is what ships: {two_hop}"
+    );
 
-    // The path the walk came by: present and empty where it started, the entry
-    // file's title one hop on.
-    assert_eq!(entry["state"]["via"], json!([]));
-    assert_eq!(next["state"]["via"], json!(["Entry"]));
+    // Each state flag takes its own field away and leaves the other one.
+    for (flag, gone) in [
+        ("--no-preview-headings", "headings"),
+        ("--no-preview-leads", "leads_to"),
+    ] {
+        let api = FakeApi::new(3.0, 0.9, 0.7);
+        let cache = Cache::new();
+        let output = run_with(&[QUERY, ENTRY, flag], &api, &cache);
+        assert_eq!(output.status.code(), Some(0), "{flag}: {}", stderr(&output));
 
-    // The link question is the two-hop one, on every file of the walk.
-    for request in &requests {
-        if let Some(link) = request["state"]["links"]
-            .as_array()
-            .and_then(|links| links.first())
-        {
-            assert!(link.is_object(), "{request}");
-            let asked = instructions(request, "link_0");
-            assert!(
-                asked.contains("directly or through the pages it links to"),
-                "the two-hop question is what reached the API: {asked}"
-            );
+        let requests = api.requests();
+        let entry = request_for(&requests, ENTRY);
+        let preview = &entry["state"]["links"][0]["target_preview"];
+        assert!(
+            preview.get(gone).is_none(),
+            "{flag} left {gone} in: {preview}"
+        );
+        for other in ["headings", "leads_to"] {
+            if other != gone {
+                assert!(
+                    preview.get(other).is_some(),
+                    "{flag} took {other} with it: {preview}"
+                );
+            }
         }
+        assert_eq!(
+            instructions(entry, "link_0"),
+            two_hop,
+            "{flag} changed the question"
+        );
     }
 
-    // Without the flags, the same walk sends the state that shipped: no path,
-    // no headings, no leads, and the question the spike tuned the threshold
-    // with.
+    // And the question flag is the question, not the state.
     let api = FakeApi::new(3.0, 0.9, 0.7);
     let cache = Cache::new();
-    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+    let output = run_with(&[QUERY, ENTRY, "--one-hop-links"], &api, &cache);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 
-    for request in api.requests() {
-        assert!(request["state"].get("via").is_none(), "{request}");
-        let links = request["state"]["links"].as_array().expect("a link list");
-        for link in links {
-            assert!(
-                link["target_preview"].get("headings").is_none(),
-                "{request}"
-            );
-            assert!(
-                link["target_preview"].get("leads_to").is_none(),
-                "{request}"
-            );
-        }
-        if !links.is_empty() {
-            assert!(
-                !instructions(&request, "link_0").contains("directly or through"),
-                "{request}"
-            );
-        }
-    }
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    let one_hop = instructions(entry, "link_0");
+    assert!(
+        !one_hop.contains("directly or through") && one_hop.contains("`links[0]`"),
+        "the one-hop question is asked: {one_hop}"
+    );
+    assert!(
+        entry["state"]["links"][0]["target_preview"]
+            .get("headings")
+            .is_some(),
+        "and the state is not what it changed"
+    );
 }
 
 /// The request one file was judged in, found by the fixture path it ends with.

@@ -84,16 +84,16 @@ const SWEEP: [f64; 4] = [0.5, 0.6, 0.7, 0.8];
 /// How many bins the calibration tables cut 0 to 1 into.
 const BINS: usize = 10;
 
-/// The link state that ships: a preview with the frontmatter, one hop, and
-/// none of the switches [#46] measures.
+/// The link state that shipped before [#46]: a preview with the title,
+/// frontmatter and first paragraph, and the link question asked about one hop.
+/// Every number in this report before that issue was measured against it.
 ///
 /// [#46]: https://github.com/mikekelly/s1m/issues/46
-const SHIPS: Context = Context {
+const BEFORE_46: Context = Context {
     previews: true,
     frontmatter: true,
     headings: false,
     leads: false,
-    via: false,
     two_hop: false,
 };
 
@@ -102,73 +102,57 @@ const SHIPS: Context = Context {
 ///
 /// [#10]: https://github.com/mikekelly/s1m/issues/10
 const PREVIEWS: [(&str, Context); 3] = [
-    ("previews on (default)", SHIPS),
+    ("previews on (default)", Context::DEFAULT),
     (
         "previews, no frontmatter",
         Context {
             frontmatter: false,
-            ..SHIPS
+            ..Context::DEFAULT
         },
     ),
     (
         "previews off",
         Context {
             previews: false,
-            ..SHIPS
+            ..Context::DEFAULT
         },
     ),
 ];
 
-/// The variants [#46] measures, in the report's order: what ships, then each
-/// switch on its own, then the pair the decision rule asks about, then the
-/// two-hop link question and the pair it is asked alongside.
+/// What each part of the shipped link state is worth: the ablations of [#46],
+/// in the report's order, one part of the state or the question taken away at a
+/// time, then the state that shipped before the issue.
 ///
-/// `via` is switched on its own and nowhere else: it names the pages the walk
-/// came through, which is a different question from what the target of a link
-/// holds, and the decision rule does not pair it with the rest.
+/// The rows are named for what they take away rather than what they add,
+/// because what ships is now everything they add: the decision on the issue was
+/// to carry the target's headings and its own link anchors and to ask the link
+/// question about two hops, and these are what each of those three earns.
 ///
 /// [#46]: https://github.com/mikekelly/s1m/issues/46
-const CONTEXTS: [(&str, Context); 7] = [
-    ("what ships (default)", SHIPS),
+const CONTEXTS: [(&str, Context); 5] = [
+    ("what ships (default)", Context::DEFAULT),
     (
-        "+ headings",
+        "no headings",
         Context {
-            headings: true,
-            ..SHIPS
+            headings: false,
+            ..Context::DEFAULT
         },
     ),
     (
-        "+ leads_to",
+        "no leads_to",
         Context {
-            leads: true,
-            ..SHIPS
-        },
-    ),
-    ("+ via", Context { via: true, ..SHIPS }),
-    (
-        "+ headings + leads_to",
-        Context {
-            headings: true,
-            leads: true,
-            ..SHIPS
+            leads: false,
+            ..Context::DEFAULT
         },
     ),
     (
-        "+ two-hop question",
+        "one hop",
         Context {
-            two_hop: true,
-            ..SHIPS
+            two_hop: false,
+            ..Context::DEFAULT
         },
     ),
-    (
-        "+ two-hop question + headings + leads_to",
-        Context {
-            two_hop: true,
-            headings: true,
-            leads: true,
-            ..SHIPS
-        },
-    ),
+    ("before #46", BEFORE_46),
 ];
 
 // ---------------------------------------------------------------- the command
@@ -641,23 +625,13 @@ struct Billed {
 /// the run spent has to be countable from outside it.
 #[async_trait]
 trait Bill: Send + Sync {
-    async fn bill(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        via: &[PathBuf],
-    ) -> Result<Billed, ScorerError>;
+    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError>;
 }
 
 #[async_trait]
 impl Bill for JevScorer {
-    async fn bill(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        via: &[PathBuf],
-    ) -> Result<Billed, ScorerError> {
-        let outcome = self.judge(query, file, via).await?;
+    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
+        let outcome = self.judge(query, file).await?;
         Ok(Billed {
             judgment: outcome.judgment,
             detail: outcome.detail,
@@ -668,13 +642,8 @@ impl Bill for JevScorer {
 
 #[async_trait]
 impl Bill for CachedScorer<JevScorer> {
-    async fn bill(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        via: &[PathBuf],
-    ) -> Result<Billed, ScorerError> {
-        let scored = self.judge(query, file, via).await?;
+    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
+        let scored = self.judge(query, file).await?;
         let bought = scored.called();
         match scored {
             Scored::Reused { judgment, detail } | Scored::Called { judgment, detail } => {
@@ -718,13 +687,8 @@ impl Metered {
 
 #[async_trait]
 impl Scorer for Metered {
-    async fn score(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        via: &[PathBuf],
-    ) -> Result<FileJudgment, ScorerError> {
-        let billed = self.inner.bill(query, file, via).await?;
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
+        let billed = self.inner.bill(query, file).await?;
         self.lock().add(&billed.detail, billed.bought);
         Ok(billed.judgment)
     }
@@ -1216,7 +1180,9 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for budget in &budgets {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, *budget, SHIPS, args.threshold).await?;
+            let run = env
+                .walk(query, *budget, Context::DEFAULT, args.threshold)
+                .await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1240,7 +1206,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for threshold in SWEEP {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, tight, SHIPS, threshold).await?;
+            let run = env.walk(query, tight, Context::DEFAULT, threshold).await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1249,9 +1215,9 @@ async fn evaluate(args: &Args) -> Result<String, String> {
 
     // What ships is what the gold set already walked at the tight budget:
     // re-walking it would be free, and would report no cost, so the run that
-    // paid for it is the one the experiment shows.
+    // paid for it is the one the experiments show.
     let mut previews = vec![(PREVIEWS[0].0, at[0].1.clone())];
-    // The link-state variants of #46, the first of them the same run again.
+    // The ablations of #46, the first of them the same run again.
     let mut contexts = vec![(CONTEXTS[0].0, at[0].1.clone())];
     for (label, context) in PREVIEWS.iter().skip(1) {
         let runs = experiment(&env, &gold, tight, *context, args.threshold, &mut total).await?;
@@ -1346,7 +1312,7 @@ async fn scents(
     let mut table = Vec::new();
     for (label, context) in PREVIEWS {
         let meter = env.scorer(query, context)?;
-        let judgment = Scorer::score(&meter, &query.query, &page, &[])
+        let judgment = Scorer::score(&meter, &query.query, &page)
             .await
             .map_err(|error| format!("{}: {error}", query.id))?;
         spent.merge(&meter.take());
@@ -2235,15 +2201,16 @@ impl Findings {
         }
     }
 
-    /// The richer link state [#46] measures: what each switch adds to a link's
-    /// preview, what it costs in tokens and in requests, and what it finds.
+    /// What the shipped link state carries, and what each part of it earns:
+    /// the ablations of [#46], which is the decision that put the target's
+    /// headings, its own link anchors and the two-hop question into the state.
     ///
     /// [#36]: https://github.com/mikekelly/s1m/issues/36
     /// [#46]: https://github.com/mikekelly/s1m/issues/46
     fn the_link_context_experiment(&self, out: &mut String) {
         let _ = writeln!(
             out,
-            "## The link context experiment: headings, leads and the path"
+            "## The link context: what the state carries, and what each part earns"
         );
         let _ = writeln!(out);
         let _ = writeln!(
@@ -2252,23 +2219,24 @@ impl Findings {
              heading, and the target's title, frontmatter and first paragraph. The failure \
              analysis on a private wiki ([#36]) found the queries that reached nothing doing it \
              two or three hops out, behind intermediate pages whose preview says nothing about \
-             what lies under them. [#46] measures four switches against that, each on its own and \
-             in the pairs the decision rule asks about, at `--max-files {}`:",
+             what lies under them, and [#46] measured what a link needs to carry to reach them. \
+             All three parts measured there now ship, so the tables below are ablations of the \
+             shipped state rather than additions to it, each at `--max-files {}`:",
             self.budgets[0]
         );
         let _ = writeln!(out);
         let _ = writeln!(
             out,
-            "- **`+ headings`**: the target's own H2/H3 headings, in order, at most 40 of them and \
-             each cut at 80 characters.\n\
-             - **`+ leads_to`**: the anchor text of the target's own in-root links, in order, \
-             deduped, at most 30 and each cut at 60 characters — one hop of lookahead past the \
-             target.\n\
-             - **`+ via`**: the titles of the pages the walk came through, in order, at the top \
-             level of the state.\n\
-             - **`+ two-hop question`**: the link question reworded to ask what this link reaches \
-             directly or through the pages it links to, with the yes-criterion to match. The \
-             question is the only thing that changes; every state field is what it was."
+            "- **The target's own H2/H3 headings**, in order, at most 40 of them and each cut at 80 \
+             characters.\n\
+             - **The anchor text of the target's own in-root links**, in order, deduped, at most 30 \
+             and each cut at 60 characters — one hop of lookahead past the target.\n\
+             - **The link question asked about two hops** rather than one: what this link reaches \
+             directly or through the pages it links to, with the yes-criterion to match. The state \
+             is unchanged by this one; only the question is.\n\
+             - **`before #46`** is the state all of that was measured against — one hop, no \
+             headings, no leads — and it is the row every number in this report before the issue \
+             was made from."
         );
         let _ = writeln!(out);
         head(
@@ -2300,31 +2268,29 @@ impl Findings {
             );
         }
         let _ = writeln!(out);
-        // What the requests the variants asked come to against what ships: the
-        // one number that says what a richer state costs a walk this size.
-        let shipped = sum(&self.contexts[0].1, |run| run.spent.requests);
-        let combined = self
-            .contexts
-            .last()
-            .map(|(_, runs)| sum(runs, |run| run.spent.requests))
-            .unwrap_or_default();
         let _ = writeln!(
             out,
             "`Requests` is what the API was asked over the whole gold set and `Req/answer` the same \
              over the files it judged, so 1.00 is a link table that fits one post: a variant above \
              1.00 is splitting pages the state budget no longer holds ([#37]). A `Requests` column \
              that rose while `Req/answer` stayed at 1.00 is the other cost — a link the model now \
-             rates above `--threshold` is a page the walk visits and pays for, which is where a \
-             variant's recall comes from. The fullest variant asks {:.1}× what ships does.",
-            match shipped {
-                0 => 0.0,
-                _ => combined as f64 / shipped as f64,
+             rates above `--threshold` is a page the walk visits and pays for, which is where the \
+             shipped state's recall comes from. It asks {:.1}× the requests it asked before [#46].",
+            match self
+                .contexts
+                .last()
+                .map(|(_, runs)| sum(runs, |run| run.spent.requests))
+            {
+                Some(before) if before > 0 => {
+                    sum(&self.contexts[0].1, |run| run.spent.requests) as f64 / before as f64
+                }
+                _ => 0.0,
             }
         );
         let _ = writeln!(out);
 
         // Per query, the queries the shipped walk found least first: a mean over
-        // twenty queries hides the five that found nothing, which are the ones
+        // twenty queries hides the ones that found nothing, which are the ones
         // the experiment is about.
         let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
         let shipped = &self.contexts[0].1;

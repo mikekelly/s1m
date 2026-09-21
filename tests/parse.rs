@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use s1m::parse::{FrontmatterField, Link, ParseError, ParsedFile, Section, parse, preview, title};
+use s1m::parse::{FrontmatterField, Link, ParseError, ParsedFile, Section, parse, preview};
 
 /// Every page in the fixture wiki. The line-range invariant runs over all of
 /// them, so a page missing from here is a page whose ranges stop being checked.
@@ -533,31 +533,6 @@ fn preview_carries_the_headings_and_the_in_root_link_text() {
         !index.leads.contains(&"outside the root".to_string()),
         "and a link out of the root is not: {:?}",
         index.leads
-    );
-}
-
-#[test]
-fn title_is_the_name_the_reading_list_would_give_a_file() {
-    // The frontmatter title, the first H1, then the file name: the same string
-    // `preview` gives, and the same one the walk's `via` path is spelled with.
-    assert_eq!(
-        title(root().join("notes/ledger.md")).unwrap(),
-        "Ledger",
-        "the frontmatter title wins"
-    );
-    assert_eq!(
-        title(root().join("payments/README.md")).unwrap(),
-        "Payments",
-        "else the first H1"
-    );
-    assert_eq!(
-        title(root().join("payments/cutoffs.md")).unwrap(),
-        "cutoffs",
-        "else the file's own name"
-    );
-    assert!(
-        title(root().join("notes/nowhere.md")).is_err(),
-        "and a file that is not there is not a title"
     );
 }
 

@@ -540,7 +540,7 @@ impl<'a> Search<'a> {
         join_all(batch.iter().map(|entry| async move {
             let mut file = parse(root.join(&entry.path), root)?;
             file.links.retain(|link| !ignore.matched(&link.target));
-            let judgment = scorer.score(query, &file, &entry.via).await?;
+            let judgment = scorer.score(query, &file).await?;
             Ok((file, judgment))
         }))
         .await

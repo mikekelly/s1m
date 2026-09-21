@@ -244,18 +244,6 @@ pub fn preview(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Preview
     })
 }
 
-/// The title of one file — the frontmatter `title`, else the first H1, else the
-/// file name — without parsing the file whole.
-///
-/// The same string [`Preview::title`] gives, for callers that want only the
-/// name of a file: the walk reports the path a file was reached along, and a
-/// state that names those pages by title is asking for this.
-pub fn title(path: impl AsRef<Path>) -> Result<String, ParseError> {
-    let path = path.as_ref();
-    let source = read(path)?;
-    Ok(scan_title(&Scan::of(&source), path))
-}
-
 /// `path` as [`parse`] spells a link target: normalised, and relative to
 /// `root`.
 ///

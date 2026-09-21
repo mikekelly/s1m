@@ -222,86 +222,103 @@ tokens a link) and not the state, and it is what let a 92-link page through unsp
 a preview is about 900 characters of state after the bounds above, so the state budget binds at
 around **65 previewed links**, and the request budget later than that.
 
-## The link context: headings, leads, the path and a two-hop question
+## The link context: headings, leads and a two-hop question
 
-Measured 2026-09-21 for [#46](https://github.com/mikekelly/s1m/issues/46), with the evaluation
-harness over the vendored wiki's gold set at `--max-files 10` — the numbers are in
-[`eval/REPORT.md`](../eval/REPORT.md#the-link-context-experiment-headings-leads-and-the-path),
-which is where the per-query tables are. The failure analysis on a private wiki
-([#36](https://github.com/mikekelly/s1m/issues/36)) put the recall gap on the same one hop of
-evidence this spike measured: a link is judged from its anchor, its sentence and the target's
-title, frontmatter and first paragraph, and the pages the walk missed sit two or three hops out,
-behind an intermediate page whose preview says nothing about what lies under it. Four additions
-were measured, each switchable on its own and off by default:
+Measured 2026-09-21 for [#46](https://github.com/mikekelly/s1m/issues/46), on the vendored wiki's
+gold set with the harness ([`eval/REPORT.md`](../eval/REPORT.md#the-link-context-what-the-state-carries-and-what-each-part-earns))
+and on a private wiki's gold set by the session that owns it
+([#36](https://github.com/mikekelly/s1m/issues/36)). The failure analysis there put the recall gap
+on one hop of evidence: a link is judged from its anchor, its sentence and the target's title,
+frontmatter and first paragraph, and the pages the walk missed sit two or three hops out, behind
+an intermediate page whose preview says nothing about what lies under it. Three additions were
+measured, each switchable on its own, and one candidate was rejected:
 
-| Switch | What it adds |
+| Addition | What it is |
 | --- | --- |
-| `headings` | the target's H2/H3 headings, in order, at most 40 and each cut at 80 characters |
+| `headings` | the target's own H2/H3 headings, in order, at most 40 and each cut at 80 characters |
 | `leads_to` | the anchor text of the target's own in-root links, in order, deduped, at most 30 and each cut at 60 characters |
-| `via` | the titles of the pages the walk came through, in order, at the top of the state rather than per link |
-| `two-hop` | no state: the link question is asked about what this link reaches directly or through the pages it links to, with the yes-criterion to match |
+| `two-hop` | no state at all: the link question asked about what this link reaches directly or through the pages it links to, with the yes-criterion to match |
+| ~~`via`~~ | the titles of the pages the walk came through, at the top of the state. Measured, then dropped: no effect on either set (0.64 → 0.61 public, no movement private), and the only addition that costs recall. The path stays where it explains the walk, in the reading list |
 
-The same gold set, walked once per variant:
+### What each part earns, once it ships
 
-| Variant | Recall | Precision | Input (tok) | Cost | Requests |
+Every one of the three now ships, so the harness measures them the other way round: what taking
+each one away costs. The vendored wiki, at `--max-files` 10:
+
+| Variant | Recall | Precision | Read (tok) | Input (tok) | Cost | Requests |
+| --- | --- | --- | --- | --- | --- | --- |
+| what ships (default) | **0.83** | 0.26 | 68,663 | 1,057,882 | $0.044431 | 181 |
+| no `headings` | 0.76 | 0.26 | 62,512 | 923,212 | $0.038775 | 165 |
+| no `leads_to` | 0.73 | 0.29 | 48,228 | 645,438 | $0.027108 | 118 |
+| one hop | 0.69 | 0.29 | 47,685 | 596,166 | $0.025039 | 97 |
+| before [#46](https://github.com/mikekelly/s1m/issues/46) | 0.64 | 0.30 | 35,771 | 457,709 | $0.019224 | 85 |
+
+The private wiki, the same three additions as additions rather than ablations — the rows the
+decision was made from — at `--max-files` 25 over its own gold set:
+
+| Variant | Recall | Precision | Files judged | Cost (whole set, cold) | Zero-recall queries |
 | --- | --- | --- | --- | --- | --- |
-| what ships | 0.64 | 0.30 | 457,709 | $0.019224 | 85 |
-| `+ headings` | 0.72 | 0.33 | 511,642 | $0.021489 | 89 |
-| `+ leads_to` | 0.70 | 0.28 | 524,890 | $0.022045 | 91 |
-| `+ via` | 0.61 | 0.27 | 474,542 | $0.019931 | 85 |
-| `+ headings + leads_to` | 0.69 | 0.29 | 596,166 | $0.025039 | 97 |
-| `+ two-hop` | 0.72 | 0.30 | 544,303 | $0.022861 | 105 |
-| `+ two-hop + headings + leads_to` | **0.83** | 0.26 | 1,057,882 | $0.044431 | 181 |
+| before [#46](https://github.com/mikekelly/s1m/issues/46) | 0.57 | 0.14 | 25.2 | $0 (cached) | 6 |
+| `+ headings` | 0.61 | 0.16 | 28.7 | $0.42 | 5 |
+| `+ leads_to` | 0.79 | 0.21 | 30.6 | $0.55 | 1 |
+| ~~`+ via`~~ | 0.57 | 0.14 | 25.1 | $0.41 | 6 |
+| `+ headings + leads_to` | 0.83 | 0.20 | 30.4 | $0.62 | 2 |
+| `+ two-hop` | 0.64 | 0.15 | 27.8 | $0.42 | 5 |
+| **`+ two-hop + headings + leads_to`** | **0.87** | 0.21 | 32.2 | $0.64 | **0** |
 
-Reading them:
+The five zero-recall queries of that set, by variant:
 
-- **`headings` alone is the best single switch, and it costs almost nothing.** +0.08 recall for
-  +12% input tokens and +5% requests, and precision goes up rather than down (0.30 → 0.33): a
-  target's own section names say what the page is about where its opening line does not, and
-  they say it about pages whose first paragraph is boilerplate. This is the one field of the
-  four that looks like it should ship, on both numbers.
-- **`leads_to` moves recall almost as far, and is not additive with `headings`.** Alone 0.70,
-  and the pair 0.69 — below `headings` alone, with precision at 0.29 rather than 0.33. The two
-  carry much of the same signal (both say what lies under the target), and a hub's outbound
-  anchor list is a broader, noisier version of its headings. `headings + leads_to` is the pair
-  the issue's decision rule asked about, and on this wiki the pair is *worse* than one of its
-  halves.
-- **`via` does not help.** 0.64 → 0.61, precision 0.30 → 0.27: the path the walk came by is not
-  evidence about where a link leads, and it is the only one of the four that costs recall. The
-  path is worth its place in the reading list, where it explains the walk to the caller; in the
-  state it is noise.
-- **The two-hop question is the largest single lever.** +0.08 on its own — the same as
-  `headings` — from a wording change and no state at all, and with `headings` and `leads_to`
-  beside it, **+0.19 recall (0.64 → 0.83)**, which is more than any addition of state managed.
-  That is the #36 analysis stated as a number: the question "is following this likely to lead to
-  content useful for someone doing what `query` describes" can be answered from one hop, and the
-  model answered it one hop at a time; asking it to reach through the pages the target links to
-  is what moves the walk.
-- **The state budget did not bind on the vendored wiki, and it costs one more post where it
-  does.** Requests per answer was 1.00 under every variant here — no page in that wiki is big
-  enough for the richer preview to push it past the 32k state budget
-  ([#37](#the-state-budget-measured-on-the-counter-that-enforces-it)) — so the extra requests are
-  pages the walk now visits (the combined variant asks 2.1× what ships does) rather than posts.
-  On the shape #37 was found on — 17,007 characters, 22 headings, 88 links to pages that each
-  carry frontmatter, ten headings and ten links of their own, generated the way that section
-  generates it — the richer state costs exactly one more request, and no failure:
+| Query | before | `+ headings` | `+ leads_to` | `+ headings + leads_to` | `+ two-hop` | the three together |
+| --- | --- | --- | --- | --- | --- | --- |
+| Q03 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | **1.00** |
+| Q08 | 0.00 | 0.00 | 0.67 | **1.00** | 0.00 | **1.00** |
+| Q12 | 0.00 | 0.50 | 0.50 | **0.75** | 0.00 | **0.75** |
+| Q13 | 0.00 | 0.00 | 0.33 | **1.00** | 1.00 | 0.67 |
+| Q14 | 0.00 | 0.00 | 1.00 | **1.00** | 0.00 | **1.00** |
 
-  ```bash
-  s1m score-file "how do I cut a release and publish the package" /tmp/issue-46/hub.md \
-    --root /tmp/issue-46
-  # default:      112 questions in 2 request(s)   49,568 tokens in
-  # --two-hop-links --preview-headings --preview-leads:
-  #               112 questions in 3 request(s)   76,782 tokens in
-  ```
+### Reading it
 
-  One more post and 1.55× the input tokens on the page that already split, which is the price of
-  the fields when a page is link-heavy; a page of ordinary size pays the tokens and no post,
-  because a preview is only large when its target is.
-- **Two of the four zero-recall queries stay at zero under every variant**, including the
-  fullest one: nothing on a visited page links anywhere near those wanted pages, so no richer
+- **The state is worth carrying.** Publicly the three parts together are +0.19 of recall (0.64 →
+  0.83) for 2.3× the input tokens and 2.1× the requests; privately they are +0.30 (0.57 → 0.87)
+  and every zero-recall query is found. The requests do not rise because pages split — requests
+  per answer stays at 1.00 on the vendored wiki — but because a link the model now rates above
+  `--threshold` is a page the walk visits and pays for. Both sets pay that: 181 files judged
+  instead of 85, 32.2 instead of 25.2.
+- **`leads_to` is the switch the private wiki needed; `headings` is the cheaper half.** On the
+  private set `leads_to` alone moves recall from 0.57 to 0.79 and takes five zero queries to one,
+  where the vendored wiki has almost nothing for it to reach — its pages are small and link
+  sparsely. `headings` is the field that costs least (+12% input tokens) and, on the vendored
+  wiki, the one whose ablation costs most (0.83 → 0.76).
+- **The question matters as much as the state, and only the two together close the gap.** The
+  two-hop question alone is nearly free (+0.08 public, +0.07 private) and, with the richer state,
+  it is what takes the private set's last zero (0.83 → 0.87, Q03) and the vendored wiki's
+  `index-tables` (0.00 → 1.00). Asking about two hops is what the state is for: with the headings
+  and the lead anchors in view, "what does this reach" is a question the model can answer.
+- **Precision holds on the private set and gives a little on the vendored one.** 0.14 → 0.21
+  privately (the list gets more precise because it stops returning hubs nothing reached through),
+  0.30 → 0.26 publicly, where more pages are returned (129 against 71) for the same 39 labelled
+  ones. Recall is what the walk was losing; the reading an agent does rises 1.9× (35,771 →
+  68,663 tokens) and is still 80% below reading everything.
+- **The state budget still holds.** Requests per answer is 1.00 on the vendored wiki at this
+  budget, so nothing splits there. On the page shape [#37](#the-state-budget-measured-on-the-counter-that-enforces-it)
+  was found on, the richer state costs one more post — and the private wiki's largest page goes
+  from 3 requests to 5, +31% input tokens on that page, same wall time. A page that already had
+  to split splits further; no page is refused, and no link goes unjudged.
+- **Two of the four zero-recall queries on the vendored wiki stay at zero**, including under the
+  shipped state: nothing on a visited page links anywhere near those wanted pages, so no richer
   view of a link that was never offered can find them. That is the case
-  [#42](https://github.com/mikekelly/s1m/issues/42)'s catalogue pass is for, whatever this
-  experiment decides.
+  [#42](https://github.com/mikekelly/s1m/issues/42)'s catalogue pass is for.
+
+### Verdict
+
+**Ship all three.** The issue's decision rule was written for `headings + leads_to` alone, and on
+the private set that pair recovers 4 of the 5 zero queries with precision up (0.14 → 0.20), which
+would have been enough. Adding the two-hop question takes the fifth, puts the private set at 0.87
+recall — above the Explore baseline's 0.85 — with precision 0.21, at about three cents a query
+cold, and puts the vendored wiki at 0.83. `via` is dropped. `headings` and `leads_to` ship inside
+the target preview, the link question ships as the two-hop wording, and the three hidden flags
+(`--no-preview-headings`, `--no-preview-leads`, `--one-hop-links`) exist so the harness can keep
+measuring the ablations above.
 
 ## Do target previews earn their tokens
 

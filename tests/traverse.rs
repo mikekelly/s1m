@@ -61,8 +61,6 @@ struct Fake {
     in_flight: AtomicUsize,
     peak: AtomicUsize,
     mixer: AtomicUsize,
-    /// The path the walk came by, per file, as the scorer was asked about it.
-    seen: Mutex<HashMap<String, Vec<PathBuf>>>,
 }
 
 impl Fake {
@@ -80,7 +78,6 @@ impl Fake {
             in_flight: AtomicUsize::new(0),
             peak: AtomicUsize::new(0),
             mixer: AtomicUsize::new(mix),
-            seen: Mutex::new(HashMap::new()),
         }
     }
 
@@ -128,36 +125,17 @@ impl Fake {
     fn peak(&self) -> usize {
         self.peak.load(Ordering::SeqCst)
     }
-
-    /// The path the walk handed the scorer for `file`, spelled as the reading
-    /// list spells a `via`: relative to the root, in the order it came.
-    fn via_of(&self, file: &str) -> Vec<String> {
-        let seen = self.seen.lock().expect("the lock is not poisoned");
-        let via = seen
-            .get(file)
-            .unwrap_or_else(|| panic!("{file} was never scored"));
-        via.iter().map(|path| path.display().to_string()).collect()
-    }
 }
 
 #[async_trait::async_trait]
 impl Scorer for Fake {
-    async fn score(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        via: &[PathBuf],
-    ) -> Result<FileJudgment, ScorerError> {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         assert_eq!(query, QUERY, "the traversal's query reaches the scorer");
         let path = relative_to_root(&self.root, &file.path);
         let name = path.to_string_lossy().into_owned();
         let Some(entry) = self.table.get(name.as_str()) else {
             return Err(ScorerError::MissingAnswer { id: name });
         };
-        self.seen
-            .lock()
-            .expect("the lock is not poisoned")
-            .insert(name.clone(), via.to_vec());
         entry.calls.fetch_add(1, Ordering::SeqCst);
 
         let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
@@ -295,12 +273,7 @@ impl ByRule {
 
 #[async_trait::async_trait]
 impl Scorer for ByRule {
-    async fn score(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        _via: &[PathBuf],
-    ) -> Result<FileJudgment, ScorerError> {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         assert_eq!(query, QUERY, "the traversal's query reaches the scorer");
         *self
             .calls
@@ -761,46 +734,6 @@ async fn the_walk_stops_at_the_depth_budget() {
     let found = Settings::new(&["index.md"]).max_depth(0).run(&scorer).await;
     assert_eq!(paths(&found), ["index.md"]);
     assert_eq!(found.calls, 1);
-}
-
-/// The walk tells the scorer how it reached each file: the path it came by, in
-/// order, and empty for the files the caller named itself. It is what the `via`
-/// experiment of [#46] names in the state, and the walk is the only thing that
-/// knows it.
-///
-/// [#46]: https://github.com/mikekelly/s1m/issues/46
-#[tokio::test]
-async fn the_scorer_is_told_the_path_the_walk_came_by() {
-    let scorer = Fake::new(&[
-        ("index.md", Entry::new(0.9, &[("payments/README.md", 0.9)])),
-        (
-            "payments/README.md",
-            Entry::new(0.9, &[("notes/ledger.md", 0.9)]),
-        ),
-        ("notes/ledger.md", Entry::new(0.9, &[])),
-    ]);
-
-    let found = Settings::new(&["index.md"]).run(&scorer).await;
-
-    assert_eq!(
-        scorer.via_of("index.md"),
-        Vec::<String>::new(),
-        "an entry file was reached by nothing"
-    );
-    assert_eq!(scorer.via_of("payments/README.md"), ["index.md"]);
-    assert_eq!(
-        scorer.via_of("notes/ledger.md"),
-        ["index.md", "payments/README.md"]
-    );
-    assert_eq!(
-        visited(&found, "notes/ledger.md")
-            .via
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>(),
-        ["index.md", "payments/README.md"],
-        "and the reading list reports the same path the scorer was asked with"
-    );
 }
 
 #[tokio::test]

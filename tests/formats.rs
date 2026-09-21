@@ -186,12 +186,7 @@ impl Fake {
 
 #[async_trait::async_trait]
 impl Scorer for Fake {
-    async fn score(
-        &self,
-        query: &str,
-        file: &ParsedFile,
-        _via: &[PathBuf],
-    ) -> Result<FileJudgment, ScorerError> {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         assert_eq!(query, QUERY, "the run's query reaches the scorer");
         let page = relative_to_root(&self.root, &file.path);
         let page = page.to_string_lossy().into_owned();

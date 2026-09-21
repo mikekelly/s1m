@@ -165,25 +165,21 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
-    /// Send each link target's own H2/H3 headings in its preview. Hidden: the
-    /// experiment [#46] measures, off until it earns its state.
+    /// Leave each link target's own H2/H3 headings out of its preview, the way
+    /// the preview was before [#46]. Hidden: the ablation the evaluation
+    /// measures.
     #[arg(long, hide = true)]
-    preview_headings: bool,
+    no_preview_headings: bool,
 
-    /// Send the anchor text of each link target's own in-root links in its
-    /// preview. Hidden: the experiment [#46] measures.
+    /// Leave the anchor text of each link target's own in-root links out of its
+    /// preview. Hidden: the same ablation.
     #[arg(long, hide = true)]
-    preview_leads: bool,
+    no_preview_leads: bool,
 
-    /// Name the pages the walk came through in the request's state. Hidden: the
-    /// experiment [#46] measures.
+    /// Ask the link question about one hop rather than two, the way it was
+    /// asked before [#46]. Hidden: the same ablation.
     #[arg(long, hide = true)]
-    via_titles: bool,
-
-    /// Ask the link question about two hops rather than one. Hidden: the
-    /// experiment [#46] measures.
-    #[arg(long, hide = true)]
-    two_hop_links: bool,
+    one_hop_links: bool,
 
     /// How the reading list is printed: `json` for a caller that parses it,
     /// `md` for what to read, `tree` for the walk's link tree.
@@ -266,35 +262,30 @@ enum Command {
         /// numbers are this run's rather than the cache's.
         #[arg(long)]
         no_cache: bool,
-        /// Send the target's H2/H3 headings in each link's preview. Hidden: the
-        /// same experiment [#46] the query's hidden flags switch on.
+        /// Leave the target's H2/H3 headings out of each link's preview.
+        /// Hidden: the same ablation the query's hidden flags ask for.
         #[arg(long, hide = true)]
-        preview_headings: bool,
-        /// Send the anchor text of each target's own in-root links in its
-        /// preview. Hidden, the same experiment.
+        no_preview_headings: bool,
+        /// Leave the anchor text of each target's own in-root links out of its
+        /// preview. Hidden, the same ablation.
         #[arg(long, hide = true)]
-        preview_leads: bool,
-        /// Name the pages the walk came through in the state. Hidden, the same
-        /// experiment; a single file has no walk, so the path is the empty one.
+        no_preview_leads: bool,
+        /// Ask the link question about one hop rather than two. Hidden, the
+        /// same ablation.
         #[arg(long, hide = true)]
-        via_titles: bool,
-        /// Ask the link question about two hops rather than one. Hidden, the
-        /// same experiment.
-        #[arg(long, hide = true)]
-        two_hop_links: bool,
+        one_hop_links: bool,
     },
 }
 
 impl Cli {
-    /// What the request carries about each link, as the hidden experiment flags
-    /// ask for it ([`Context`]). Every one of them is off by default, so a run
-    /// that names none sends the state that ships.
+    /// What the request carries about each link, as the hidden ablation flags
+    /// take it away ([`Context`]). A run that names none of them sends the
+    /// state that ships.
     fn context(&self) -> Context {
         Context {
-            headings: self.preview_headings,
-            leads: self.preview_leads,
-            via: self.via_titles,
-            two_hop: self.two_hop_links,
+            headings: !self.no_preview_headings,
+            leads: !self.no_preview_leads,
+            two_hop: !self.one_hop_links,
             ..Context::default()
         }
     }
@@ -328,17 +319,15 @@ async fn main() {
             root,
             no_previews,
             no_cache,
-            preview_headings,
-            preview_leads,
-            via_titles,
-            two_hop_links,
+            no_preview_headings,
+            no_preview_leads,
+            one_hop_links,
         }) => {
             let context = Context {
                 previews: !no_previews,
-                headings: preview_headings,
-                leads: preview_leads,
-                via: via_titles,
-                two_hop: two_hop_links,
+                headings: !no_preview_headings,
+                leads: !no_preview_leads,
+                two_hop: !one_hop_links,
                 ..Context::default()
             };
             if let Err(error) = score_file(&query, &file, root, context, no_cache).await {
@@ -484,12 +473,12 @@ async fn score_file(
     let mode = jev.mode().clone();
 
     let (judgment, source) = if no_cache {
-        let outcome = jev.judge(query, &parsed, &[]).await?;
+        let outcome = jev.judge(query, &parsed).await?;
         (outcome.judgment, Source::Uncached(outcome.detail))
     } else {
         let cached = CachedScorer::from_env(jev)?;
         let dir = cached.dir().to_path_buf();
-        match cached.judge(query, &parsed, &[]).await? {
+        match cached.judge(query, &parsed).await? {
             Scored::Called { judgment, detail } => (judgment, Source::Call { dir, detail }),
             Scored::Reused { judgment, .. } => (judgment, Source::Entry(dir)),
         }
