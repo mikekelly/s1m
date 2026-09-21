@@ -65,12 +65,25 @@ pub struct Degrees {
     pub histogram: BTreeMap<String, usize>,
 }
 
+/// Which page the depths were measured from.
+///
+/// A convention is one of [`ENTRY_CONVENTIONS`], which are constants of this
+/// harness and so safe to print. A page the caller named is not: it is a path
+/// in a wiki that may be private, so it is recorded as having been given and
+/// never as itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Entry {
+    Convention(String),
+    Given,
+}
+
 /// How far each page sits from the entry page.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Depth {
-    /// The convention the entry page was found under, `None` when the root
-    /// holds neither.
-    pub entry: Option<String>,
+    /// Where the walk started, `None` when the root holds neither convention
+    /// and the caller named no page.
+    pub entry: Option<Entry>,
     /// Pages per hop count from the entry page, the entry page itself at 0.
     pub histogram: BTreeMap<usize, usize>,
     /// Pages no walk from the entry page reaches. Every page when there is no
@@ -95,7 +108,7 @@ pub const BUCKETS: [(&str, usize, usize); 8] = [
 /// Every page is parsed once and every link looked up in a map of the pages, so
 /// the cost is linear in the text and the links: a wiki of a few thousand pages
 /// is one pass, not a pass per page.
-pub fn collect(root: &Path) -> Result<GraphStats, String> {
+pub fn collect(root: &Path, entry: Option<&str>) -> Result<GraphStats, String> {
     let pages = parse::pages(root);
     if pages.is_empty() {
         return Err(format!(
@@ -162,9 +175,20 @@ pub fn collect(root: &Path) -> Result<GraphStats, String> {
 
     let edges = out.iter().map(Vec::len).sum();
     let incoming = in_degrees(&out);
-    let entry = ENTRY_CONVENTIONS
-        .into_iter()
-        .find(|convention| index.contains_key(Path::new(convention)));
+    // A page the caller named wins over a convention, and one the wiki does
+    // not hold is a mistake rather than a wiki nothing can reach.
+    let entry = match entry {
+        Some(page) => {
+            let at = *index
+                .get(Path::new(page))
+                .ok_or_else(|| format!("{page}: not a page under {}", root.display()))?;
+            Some((Entry::Given, at))
+        }
+        None => ENTRY_CONVENTIONS.into_iter().find_map(|convention| {
+            let at = *index.get(Path::new(convention))?;
+            Some((Entry::Convention(convention.to_string()), at))
+        }),
+    };
     Ok(GraphStats {
         pages: pages.len(),
         words,
@@ -174,18 +198,15 @@ pub fn collect(root: &Path) -> Result<GraphStats, String> {
         out_degree: degrees(out.iter().map(Vec::len)),
         in_degree: degrees(incoming.iter().copied()),
         orphans: incoming.iter().filter(|count| **count == 0).count(),
-        depth: depth(
-            &out,
-            entry.and_then(|page| index.get(Path::new(page)).map(|at| (page, *at))),
-        ),
+        depth: depth(&out, entry),
         largest_scc: largest_scc(&out),
     })
 }
 
 /// How far every page sits from the entry page, breadth first: one hop count
 /// per page, and a page no link chain reaches counts as unreachable.
-fn depth(out: &[Vec<usize>], entry: Option<(&str, usize)>) -> Depth {
-    let Some((page, at)) = entry else {
+fn depth(out: &[Vec<usize>], entry: Option<(Entry, usize)>) -> Depth {
+    let Some((entry, at)) = entry else {
         return Depth {
             entry: None,
             histogram: BTreeMap::new(),
@@ -208,7 +229,7 @@ fn depth(out: &[Vec<usize>], entry: Option<(&str, usize)>) -> Depth {
         }
     }
     Depth {
-        entry: Some(page.to_string()),
+        entry: Some(entry),
         histogram,
         unreachable: out.len() - reached,
     }
@@ -331,9 +352,9 @@ fn mean(values: &[usize]) -> f64 {
 }
 
 /// The statistics as a markdown table: two columns, every cell a number or a
-/// word this file wrote. The entry page is named by the convention it was found
-/// under, which is a constant of the harness ([`ENTRY_CONVENTIONS`]) and not
-/// something the wiki said.
+/// word this file wrote. An entry page found by convention is named by the
+/// convention, which is a constant of the harness ([`ENTRY_CONVENTIONS`]) and
+/// not something the wiki said; one the caller gave is reported as given.
 pub fn table(stats: &GraphStats) -> String {
     let mut out = String::from("| | |\n| --- | --- |\n");
     let mut row = |name: &str, value: String| {
@@ -368,7 +389,8 @@ pub fn table(stats: &GraphStats) -> String {
     row(
         "Entry page",
         match &stats.depth.entry {
-            Some(convention) => format!("the `{convention}` convention"),
+            Some(Entry::Convention(convention)) => format!("the `{convention}` convention"),
+            Some(Entry::Given) => "given".to_string(),
             None => "none: the root holds neither convention".to_string(),
         },
     );
@@ -439,7 +461,7 @@ mod tests {
     #[test]
     fn counts_pages_words_headings_and_links() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path()).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
 
         assert_eq!(stats.pages, 5);
         // Counted by hand: 13 + 5 + 6 + 4 + 2 tokens.
@@ -464,7 +486,7 @@ mod tests {
     #[test]
     fn describes_both_degree_distributions_and_counts_orphans() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path()).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
 
         // Out-degrees, by hand: index 3, a 1, b 0, c 1, d 0.
         assert_eq!(
@@ -498,9 +520,12 @@ mod tests {
     #[test]
     fn measures_depth_from_the_entry_page_and_the_largest_cycle() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path()).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
 
-        assert_eq!(stats.depth.entry.as_deref(), Some("index.md"));
+        assert_eq!(
+            stats.depth.entry,
+            Some(Entry::Convention("index.md".to_string()))
+        );
         // The entry page, then `a`, `b` and `c` one hop away.
         assert_eq!(stats.depth.histogram, BTreeMap::from([(0, 1), (1, 3)]));
         // `d.md` is reachable from nothing.
@@ -514,13 +539,16 @@ mod tests {
         let wiki = TempDir::new("graph-readme");
         wiki.write("README.md", "# Readme\n\nSee [a](a.md).\n");
         wiki.write("a.md", "# A\n");
-        let stats = collect(wiki.path()).expect("a wiki of two pages");
-        assert_eq!(stats.depth.entry.as_deref(), Some("README.md"));
+        let stats = collect(wiki.path(), None).expect("a wiki of two pages");
+        assert_eq!(
+            stats.depth.entry,
+            Some(Entry::Convention("README.md".to_string()))
+        );
         assert_eq!(stats.depth.unreachable, 0);
 
         let neither = TempDir::new("graph-no-entry");
         neither.write("a.md", "# A\n");
-        let stats = collect(neither.path()).expect("a wiki of one page");
+        let stats = collect(neither.path(), None).expect("a wiki of one page");
         assert_eq!(stats.depth.entry, None);
         // With no entry page nothing is reached, and the histogram is empty.
         assert_eq!(stats.depth.unreachable, 1);
@@ -532,7 +560,7 @@ mod tests {
     #[test]
     fn the_table_is_numbers_and_fixed_words() {
         let wiki = tiny_wiki();
-        let stats = collect(wiki.path()).expect("a wiki of five pages");
+        let stats = collect(wiki.path(), None).expect("a wiki of five pages");
         let table = table(&stats);
 
         assert!(table.contains("| Pages | 5 |"), "{table}");
@@ -556,5 +584,37 @@ mod tests {
                 "{page} is named in the table:\n{table}"
             );
         }
+    }
+
+    /// A wiki whose root holds neither convention still has a graph to measure
+    /// depth over: the caller names the page to start from. What the report
+    /// may then say about it is that it was given — never which page it was.
+    #[test]
+    fn an_entry_page_can_be_given_when_no_convention_is_there() {
+        let wiki = TempDir::new("graph-given");
+        wiki.write("docs/start.md", "# Start\n\nSee [a](../a.md).\n");
+        wiki.write("a.md", "# A\n");
+        wiki.write("b.md", "# B\n");
+
+        // Without one, nothing is reachable: neither convention is there.
+        let found = collect(wiki.path(), None).expect("a wiki of three pages");
+        assert_eq!(found.depth.entry, None);
+        assert_eq!(found.depth.unreachable, 3);
+
+        let given = collect(wiki.path(), Some("docs/start.md")).expect("the page it was given");
+        assert_eq!(given.depth.entry, Some(Entry::Given));
+        assert_eq!(given.depth.histogram, BTreeMap::from([(0, 1), (1, 1)]));
+        assert_eq!(given.depth.unreachable, 1);
+
+        // The page it was given never reaches the table.
+        let table = table(&given);
+        assert!(table.contains("| Entry page | given |"), "{table}");
+        assert!(!table.contains("docs/start.md"), "{table}");
+        assert!(!table.contains("start"), "{table}");
+
+        // A page the wiki does not hold is the caller's mistake, not an
+        // unreachable wiki.
+        let error = collect(wiki.path(), Some("docs/absent.md")).expect_err("no such page");
+        assert!(error.contains("not a page"), "{error}");
     }
 }

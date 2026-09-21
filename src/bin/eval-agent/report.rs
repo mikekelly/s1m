@@ -472,7 +472,7 @@ mod tests {
             },
             orphans: 200,
             depth: crate::graph::Depth {
-                entry: Some("index.md".to_string()),
+                entry: Some(crate::graph::Entry::Convention("index.md".to_string())),
                 histogram: BTreeMap::from([(0, 1), (1, 40)]),
                 unreachable: 12,
             },

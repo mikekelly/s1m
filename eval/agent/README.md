@@ -34,7 +34,10 @@ cargo run --release --bin eval-agent -- report \
   --out /path/to/run-dir --report REPORT.md
 ```
 
-`graph-stats` writes `graph_stats.json` and `graph_stats.md`. `run` writes
+`graph-stats` writes `graph_stats.json` and `graph_stats.md`. Depth is
+measured from `index.md`, else `README.md`; a wiki whose root holds neither
+takes `--entry <relative path>`, and the report then says the entry page was
+`given` rather than which one it was. `run` writes
 `runs.jsonl`, `aggregates.json` and each run's own output under `raw/`.
 `report` renders `aggregates.json` plus `graph_stats.json` — it picks the
 latter up from `--out` on its own, or takes `--stats PATH`.

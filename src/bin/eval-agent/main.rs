@@ -113,6 +113,11 @@ enum Command {
         /// Where `graph_stats.json` and `graph_stats.md` are written.
         #[arg(long)]
         out: PathBuf,
+        /// The page depth is measured from, relative to the wiki root, for a
+        /// wiki whose root holds neither `index.md` nor `README.md`. The
+        /// report says only that an entry page was given, never which.
+        #[arg(long)]
+        entry: Option<String>,
     },
     /// Every query under every condition, one JSONL row a run.
     Run(RunArgs),
@@ -141,7 +146,7 @@ fn main() {
 
 fn dispatch(command: Command) -> Result<(), String> {
     match command {
-        Command::GraphStats { wiki, out } => graph_stats(&wiki, &out),
+        Command::GraphStats { wiki, out, entry } => graph_stats(&wiki, &out, entry.as_deref()),
         Command::Run(RunArgs {
             wiki,
             gold,
@@ -185,8 +190,12 @@ fn beside_me() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("s1m"))
 }
 
-fn graph_stats(wiki: &std::path::Path, out: &std::path::Path) -> Result<(), String> {
-    let stats = graph::collect(wiki)?;
+fn graph_stats(
+    wiki: &std::path::Path,
+    out: &std::path::Path,
+    entry: Option<&str>,
+) -> Result<(), String> {
+    let stats = graph::collect(wiki, entry)?;
     std::fs::create_dir_all(out).map_err(|error| format!("{}: {error}", out.display()))?;
 
     let json = out.join("graph_stats.json");
