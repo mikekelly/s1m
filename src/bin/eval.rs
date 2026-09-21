@@ -1570,8 +1570,9 @@ impl Findings {
         let (tight, tight_runs) = &self.at[0];
         let _ = writeln!(
             out,
-            "`--max-files` is the number of files the walk may visit, and the walk judges that many \
-             before the reading list is asked anything. `Visited` counts the files it judged; \
+            "`--max-files` is the number of files the walk may judge beyond the entry files, which \
+             are always visited, and the walk judges that many before the reading list is asked \
+             anything. `Visited` counts the files it judged; \
              `Returned` is the list the agent opens — the ones that earn a place on their own, \
              relevance at or above `--threshold` {} or a section at or above it, most relevant \
              first — and the rest, the entry files, hubs and near-misses, are what the JSON reports \

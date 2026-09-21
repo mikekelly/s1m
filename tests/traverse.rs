@@ -8,7 +8,9 @@
 //! test makes the order answers arrive in irrelevant.
 
 use std::collections::HashMap;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -20,6 +22,10 @@ use s1m::scorer::{FileJudgment, LinkJudgment, Scorer, ScorerError, SectionJudgme
 use s1m::traverse::{Config, Failure, Traversal, TraverseError, VisitedFile, traverse};
 
 const QUERY: &str = "settlement timing for instant payouts";
+
+/// The round size `main.rs` hands the walk: the tests about the round boundary
+/// walk at the round size a caller gets.
+const FANOUT: usize = 8;
 
 /// The fake's delay per answer: long enough that two futures of one round
 /// really do interleave, short enough that the suite stays quick.
@@ -167,6 +173,206 @@ impl Scorer for Fake {
                 .collect(),
         })
     }
+}
+
+// ------------------------------------------------------------- written trees
+
+/// A tree of pages written under the system temp directory, removed when it is
+/// dropped.
+///
+/// The fixture wiki is nine pages. A test about a hub of thirty links, or a
+/// budget of twenty-five files, needs a tree bigger than any fixture worth
+/// keeping in the repository: the test that needs one writes it, so the shape
+/// it asserts on is in the test itself. The name carries the process and a
+/// counter, so two test binaries running at once never share one.
+struct Tree {
+    dir: PathBuf,
+}
+
+impl Tree {
+    fn new(label: &str) -> Tree {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "s1m-traverse-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("a tree under the system temp directory");
+        Tree { dir }
+    }
+
+    /// Writes one page: `name` relative to the root, whose links to each of
+    /// `links` — also relative to the root — sit under a heading, so the page
+    /// has a section and one link per target.
+    fn page(&self, name: &str, links: &[String]) -> &Tree {
+        let mut body = format!("# {name}\n\n");
+        for link in links {
+            body.push_str(&format!("- [{link}]({link})\n"));
+        }
+        fs::write(self.dir.join(name), body).expect("a page in the tree");
+        self
+    }
+
+    fn root(&self) -> PathBuf {
+        self.dir.clone()
+    }
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// The scorer for a written tree: one relevance for every page, one scent for
+/// every link, and a scent of its own for a target the test names.
+///
+/// A table cannot hold a tree this size — thirty links is thirty rows, and the
+/// tree would be written twice — so the scents are a rule and the tree's own
+/// shape says the rest. What it judges is the file's own links, the way the
+/// table fake does: the walk can only follow a link a page makes. It counts the
+/// calls per file as the table fake does, because one call per file is the
+/// walk's contract whatever the round size.
+struct ByRule {
+    relevance: f64,
+    scent: f64,
+    named: HashMap<String, f64>,
+    calls: Mutex<HashMap<String, usize>>,
+}
+
+impl ByRule {
+    fn new(relevance: f64, scent: f64) -> ByRule {
+        ByRule {
+            relevance,
+            scent,
+            named: HashMap::new(),
+            calls: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Judges a link to `target` at `scent` rather than at the default.
+    fn link(mut self, target: &str, scent: f64) -> ByRule {
+        self.named.insert(target.to_string(), scent);
+        self
+    }
+
+    /// The files the scorer was asked about more than once: there must be none,
+    /// however many rounds a file waits through.
+    fn asked_twice(&self) -> Vec<String> {
+        let calls = self.calls.lock().expect("the fake's call log");
+        let mut twice: Vec<String> = calls
+            .iter()
+            .filter(|(_, calls)| **calls > 1)
+            .map(|(name, _)| name.clone())
+            .collect();
+        twice.sort();
+        twice
+    }
+}
+
+#[async_trait::async_trait]
+impl Scorer for ByRule {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
+        assert_eq!(query, QUERY, "the traversal's query reaches the scorer");
+        *self
+            .calls
+            .lock()
+            .expect("the fake's call log")
+            .entry(file.path.display().to_string())
+            .or_insert(0) += 1;
+        Ok(FileJudgment {
+            relevance: self.relevance,
+            // The heading and the range are the fake's own and deliberately
+            // not the parser's, as in the table fake.
+            sections: file
+                .sections
+                .iter()
+                .enumerate()
+                .map(|(index, _)| SectionJudgment {
+                    heading: None,
+                    lines: [0, 0],
+                    score: 0.5 + index as f64 / 100.0,
+                })
+                .collect(),
+            links: file
+                .links
+                .iter()
+                .map(|link| LinkJudgment {
+                    target: link.target.clone(),
+                    scent: self
+                        .named
+                        .get(&link.target.to_string_lossy().into_owned())
+                        .copied()
+                        .unwrap_or(self.scent),
+                })
+                .collect(),
+        })
+    }
+}
+
+/// How many spokes the crowd's hub links.
+const CROWD: usize = 30;
+
+/// The crowd: an entry page with a hub's shape — one guide and thirty spokes —
+/// where the guide reaches the leaf two hops from the entry.
+///
+/// The scents are the point: the guide at 0.9 from the entry, each of the
+/// thirty spokes at 0.65, and the leaf at 0.9 from the guide. The leaf's path
+/// score is 0.81, better than a spoke one hop down and worse than the guide, so
+/// a walk that follows the path score reaches it after the guide whatever the
+/// hub crowds the frontier with.
+fn crowd(label: &str) -> Tree {
+    let tree = Tree::new(label);
+    let mut hub: Vec<String> = vec!["guide.md".to_string()];
+    hub.extend((1..=CROWD).map(|n| format!("spoke-{n:02}.md")));
+    tree.page("index.md", &hub);
+    tree.page("guide.md", &["leaf.md".to_string()]);
+    tree.page("leaf.md", &[]);
+    for n in 1..=CROWD {
+        tree.page(&format!("spoke-{n:02}.md"), &[]);
+    }
+    tree
+}
+
+/// The crowd's scents: every link 0.65, except the guide's and the leaf's.
+fn crowd_scorer() -> ByRule {
+    ByRule::new(0.5, 0.65)
+        .link("guide.md", 0.9)
+        .link("leaf.md", 0.9)
+}
+
+/// The below-threshold tree: the entry links four section hubs at 0.7, and the
+/// first of them — `hub.md` — carries a crowd of thirty spokes and a leaf at
+/// 0.85.
+///
+/// The leaf is the case the private eval was worried about: its path score is
+/// 0.7 × 0.85 = 0.595, below the 0.6 threshold, while the link's own scent
+/// clears it. The link is admitted on its own scent and the path score decides
+/// only where it waits.
+fn section_hubs(label: &str) -> Tree {
+    let tree = Tree::new(label);
+    let hubs: Vec<String> = (1..=3)
+        .map(|n| format!("section-{n}.md"))
+        .chain(std::iter::once("hub.md".to_string()))
+        .collect();
+    tree.page("index.md", &hubs);
+    let mut hub: Vec<String> = vec!["leaf.md".to_string()];
+    hub.extend((1..=CROWD).map(|n| format!("spoke-{n:02}.md")));
+    tree.page("hub.md", &hub);
+    tree.page("leaf.md", &[]);
+    for n in 1..=3 {
+        tree.page(&format!("section-{n}.md"), &[]);
+    }
+    for n in 1..=CROWD {
+        tree.page(&format!("spoke-{n:02}.md"), &[]);
+    }
+    tree
+}
+
+/// The below-threshold scents: every link 0.7, except the hub's to the leaf.
+fn section_hubs_scorer() -> ByRule {
+    ByRule::new(0.5, 0.7).link("leaf.md", 0.85)
 }
 
 /// A different delay per call, mixed from a counter read off the clock so no
@@ -487,12 +693,13 @@ async fn the_frontier_stops_at_the_file_budget() {
         ("notes/ledger.md", Entry::new(0.9, &[])),
     ]);
 
-    let found = Settings::new(&["index.md"]).max_files(2).run(&scorer).await;
+    // A budget of one is one file beyond the entry the caller named, whichever
+    // path reaches it: the ledger link was queued at 0.5 from the index and at
+    // 0.9 from the README, and the walk has no room for it.
+    let found = Settings::new(&["index.md"]).max_files(1).run(&scorer).await;
 
     assert_eq!(paths(&found), ["index.md", "payments/README.md"]);
     assert_eq!(found.calls, 2);
-    // The README queued its ledger link, and the budget stopped the walk
-    // before spending a call on it.
     assert_eq!(
         judged(visited(&found, "payments/README.md")),
         [link("notes/ledger.md", 0.9, true)]
@@ -763,19 +970,24 @@ async fn a_scorer_that_fails_is_reported_and_the_walk_continues() {
 #[tokio::test]
 async fn a_tie_on_path_score_is_broken_by_path() {
     let scorer = Fake::new(&[
-        ("index.md", Entry::new(0.9, &[])),
-        ("notes/scratch.md", Entry::new(0.9, &[])),
+        (
+            "index.md",
+            Entry::new(
+                0.9,
+                &[("payments/README.md", 0.9), ("notes/ledger.md", 0.9)],
+            ),
+        ),
+        ("payments/README.md", Entry::new(0.9, &[])),
+        ("notes/ledger.md", Entry::new(0.9, &[])),
     ]);
 
-    // Both entries start at path score 1, and the budget of one file leaves
-    // the tie to the path rather than to the order the entries were given in.
-    let found = Settings::new(&["notes/scratch.md", "index.md"])
-        .max_files(1)
-        .run(&scorer)
-        .await;
+    // Both of the index's links are judged at 0.9, and a budget of one file
+    // beyond the entry leaves the tie to the path rather than to the order the
+    // links appear in.
+    let found = Settings::new(&["index.md"]).max_files(1).run(&scorer).await;
 
-    assert_eq!(paths(&found), ["index.md"]);
-    assert_eq!(scorer.called(), ["index.md"]);
+    assert_eq!(paths(&found), ["index.md", "notes/ledger.md"]);
+    assert_eq!(scorer.called(), ["index.md", "notes/ledger.md"]);
 }
 
 #[tokio::test]
@@ -871,6 +1083,242 @@ async fn a_round_scores_at_most_fanout_files_at_once() {
     assert_eq!(
         paths(&one_at_a_time),
         ["index.md", "notes/scratch.md", "notes/reading.md"]
+    );
+}
+
+/// A hub link at 0.7 leading to a leaf link at 0.85: the leaf's path score is
+/// 0.595, below the 0.6 threshold, and it is visited within a budget of five.
+///
+/// The link is admitted on its own scent — 0.85 clears 0.6 — and the path score
+/// only orders the frontier. Four section hubs at 0.7 outrank it and take the
+/// first four of the five files the budget buys, so the leaf is reached at the
+/// last one: a round that treated the hub's answer as settled, or a budget that
+/// counted the entry file, would stop before it.
+#[tokio::test]
+async fn a_leaf_below_the_threshold_path_score_is_visited_within_the_budget() {
+    let tree = section_hubs("below-threshold");
+    let found = Settings::over(tree.root(), &["index.md"])
+        .max_files(5)
+        .fanout(FANOUT)
+        .run(&section_hubs_scorer())
+        .await;
+
+    let leaf = visited(&found, "leaf.md");
+    assert_eq!(leaf.depth, 2);
+    assert_eq!(leaf.scent, Some(0.85));
+    assert_eq!(leaf.path_score, 0.7 * 0.85);
+    assert!(
+        leaf.path_score < 0.6,
+        "the path score the threshold would have dropped it on"
+    );
+    assert_eq!(
+        leaf.via,
+        [PathBuf::from("index.md"), PathBuf::from("hub.md")]
+    );
+    assert!(
+        followed(visited(&found, "hub.md"), "leaf.md"),
+        "the link was admitted on its own 0.85"
+    );
+    assert_eq!(found.results.len(), 6, "the entry file is free");
+}
+
+/// A hub of thirty links at 0.65 and one leaf at 0.9 two hops down: the leaf is
+/// visited within a budget of five.
+///
+/// The entry links the guide and the thirty spokes, and the guide links the
+/// leaf at 0.81. The spokes are popped into the guide's round at 0.65, and a
+/// round that visited everything it popped would spend the whole budget on
+/// them: the leaf is better than every spoke and gets its turn first.
+#[tokio::test]
+async fn a_leaf_two_hops_down_is_reached_ahead_of_a_hubs_crowd() {
+    let tree = crowd("crowd");
+    let found = Settings::over(tree.root(), &["index.md"])
+        .max_files(5)
+        .fanout(FANOUT)
+        .run(&crowd_scorer())
+        .await;
+
+    let leaf = visited(&found, "leaf.md");
+    assert_eq!(leaf.depth, 2);
+    assert_eq!(leaf.scent, Some(0.9));
+    assert_eq!(leaf.path_score, 0.9 * 0.9);
+    assert_eq!(
+        leaf.via,
+        [PathBuf::from("index.md"), PathBuf::from("guide.md")]
+    );
+    assert_eq!(
+        found.results.iter().filter(|file| file.depth > 0).count(),
+        5,
+        "five files beyond the entry, and no more"
+    );
+}
+
+/// Fanout is the concurrency cap and nothing else: the crowd walked a file at a
+/// time and eight at a time visits the same files, so the round a file was
+/// scored in cannot decide whether it is in the reading list.
+///
+/// What the round size does change is what a round buys: the files of a round
+/// are scored together, so one the budget never gets to — a file the round
+/// overtook and the budget then stopped short of — was still paid for, and
+/// `calls` is larger at the larger round size. It is the same file, never a
+/// second judgment for a file that was already asked about.
+#[tokio::test]
+async fn fanout_does_not_decide_which_files_are_visited() {
+    let tree = crowd("fanout");
+    let one_at_a_time = Settings::over(tree.root(), &["index.md"])
+        .max_files(5)
+        .fanout(1)
+        .run(&crowd_scorer())
+        .await;
+    let eight_at_a_time_scorer = crowd_scorer();
+    let eight_at_a_time = Settings::over(tree.root(), &["index.md"])
+        .max_files(5)
+        .fanout(FANOUT)
+        .run(&eight_at_a_time_scorer)
+        .await;
+
+    assert_eq!(paths(&one_at_a_time), paths(&eight_at_a_time));
+    assert_eq!(visited(&one_at_a_time, "leaf.md").path_score, 0.9 * 0.9);
+    assert_eq!(visited(&eight_at_a_time, "leaf.md").path_score, 0.9 * 0.9);
+    assert_eq!(
+        one_at_a_time.calls,
+        one_at_a_time.results.len(),
+        "a file at a time buys one judgment per file it visits"
+    );
+    assert!(eight_at_a_time.calls >= one_at_a_time.calls);
+    assert!(
+        eight_at_a_time_scorer.asked_twice().is_empty(),
+        "asked twice: {:?}",
+        eight_at_a_time_scorer.asked_twice()
+    );
+}
+
+/// The budget counts the files the walk judges beyond the entry files: eight
+/// entries at `--max-files 25` is twenty-five pages past them, with every entry
+/// in the list besides.
+#[tokio::test]
+async fn the_budget_counts_files_beyond_the_entry_files() {
+    let tree = Tree::new("budget");
+    let entries: Vec<String> = (1..=8).map(|n| format!("entry-{n}.md")).collect();
+    for (index, entry) in entries.iter().enumerate() {
+        let links: Vec<String> = (1..=5)
+            .map(|n| format!("page-{}-{n}.md", index + 1))
+            .collect();
+        tree.page(entry, &links);
+        for link in &links {
+            tree.page(link, &[]);
+        }
+    }
+    let names: Vec<&str> = entries.iter().map(String::as_str).collect();
+
+    let found = Settings::over(tree.root(), &names)
+        .max_files(25)
+        .run(&ByRule::new(0.5, 0.9))
+        .await;
+
+    assert_eq!(
+        found.results.iter().filter(|file| file.depth > 0).count(),
+        25,
+        "`--max-files` is what the walk spends beyond the entry files"
+    );
+    assert_eq!(found.results.len(), 33, "the eight entries are free");
+    for entry in &entries {
+        assert_eq!(visited(&found, entry).depth, 0, "{entry} is an entry file");
+    }
+
+    // A budget of none is the entry files alone, and buys nothing.
+    let found = Settings::over(tree.root(), &names)
+        .max_files(0)
+        .run(&ByRule::new(0.5, 0.9))
+        .await;
+
+    assert_eq!(paths(&found).len(), 8);
+    assert_eq!(found.calls, 8);
+}
+
+/// With no budget the walk visits everything it admits: the guide, the leaf two
+/// hops down, and each of the hub's thirty spokes, one judgment apiece.
+///
+/// This is the walk the private eval ran with `--max-files 100000`, in
+/// miniature: nothing about the round may end it while the frontier holds a
+/// file — not a round that admitted nothing, not an answer of its own round
+/// left unrecorded — so the only thing that stops it is an empty frontier,
+/// `--max-depth`, or a link the threshold, the root or a better path refused.
+#[tokio::test]
+async fn the_walk_with_no_budget_visits_everything_it_admits() {
+    let tree = crowd("uncapped");
+    let scorer = ByRule::new(0.5, 0.65)
+        .link("guide.md", 0.85)
+        .link("leaf.md", 0.85);
+
+    let found = Settings::over(tree.root(), &["index.md"])
+        .max_files(usize::MAX)
+        .fanout(FANOUT)
+        .run(&scorer)
+        .await;
+
+    assert_eq!(
+        found.results.len(),
+        3 + CROWD,
+        "the entry, the guide, the leaf and every spoke"
+    );
+    assert_eq!(found.calls, found.results.len(), "one judgment each");
+    assert_eq!(visited(&found, "leaf.md").depth, 2);
+    for n in 1..=CROWD {
+        visited(&found, &format!("spoke-{n:02}.md"));
+    }
+    assert!(found.failed.is_empty());
+    assert!(
+        scorer.asked_twice().is_empty(),
+        "asked twice: {:?}",
+        scorer.asked_twice()
+    );
+}
+
+/// A file a round overtook is not visited, so the walk can end with a judgment
+/// it bought and never used. One that answered is what the round spent; one that
+/// failed is the hole in the ranking it would have been had the file had its
+/// turn, and the walk reports it either way — it was reached, it was paid for,
+/// and the caller is owed the line that says why it is not in the list.
+#[tokio::test]
+async fn a_judgment_that_failed_and_was_never_used_is_still_reported() {
+    let scorer = Fake::new(&[
+        (
+            "index.md",
+            Entry::new(
+                0.5,
+                &[("notes/ledger.md", 0.9), ("payments/cutoffs.md", 0.8)],
+            ),
+        ),
+        (
+            "notes/ledger.md",
+            Entry::new(0.5, &[("payments/settlement.md", 0.95)]),
+        ),
+        // No judgment for the cutoffs page: the scorer fails for that one file,
+        // and the settlement link the ledger queues at 0.855 outranks it, so the
+        // round holds the failed answer and the budget is spent elsewhere.
+        ("payments/settlement.md", Entry::new(0.6, &[])),
+    ]);
+
+    let found = Settings::new(&["index.md"])
+        .max_files(2)
+        .fanout(FANOUT)
+        .run(&scorer)
+        .await;
+
+    assert_eq!(
+        paths(&found),
+        ["payments/settlement.md", "index.md", "notes/ledger.md"]
+    );
+    // Both files beyond the entry were visited; the third was judged, failed,
+    // and did not spend a place.
+    assert_eq!(found.calls, 4);
+    assert_eq!(
+        failures(&found)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>(),
+        ["payments/cutoffs.md"]
     );
 }
 
