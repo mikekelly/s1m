@@ -57,19 +57,27 @@ API — that is what the judgment is bought with — so a private wiki needs a
 
 const AFTER_HELP: &str = "\
 The reading list goes to stdout as JSON by default: most relevant first, then
-by path, and every path in it spelled the way the entry files were. Each result
-carries the ranges worth reading: one entry per heading section, with the lines
-to read, the score it was judged at, and the sections below
---threshold left out. A result with a via path was reached along a link; one
-without is an entry file.
+by path, and every path in it spelled the way the entry files were. `results`
+holds the files that earn a place on their own — relevance at or above
+--threshold, or a section at or above it — each with the ranges worth reading:
+one entry per heading section, with the lines to read, the score it was judged
+at, and the sections below --threshold left out. A result with a via path was
+reached along a link; one without is an entry file.
+
+The files the walk visited without earning a place — entry pages, hubs, section
+indexes, and pages that fell short of --threshold — are reported under `walked`
+instead: path, relevance, scent, via and the links it judged, and no sections.
+They are what the list was reached through, not pages to read, and `visited`
+counts them and the results together.
 
 --format picks how that list is printed. json is the plan's shape, for a caller
-that parses it. md is the same list to read or paste: each file with the lines
-worth reading, the heading to look for and the scores, most relevant first.
-tree is the walk's link tree: every file it visited with every link it judged
-beneath it, each link with the scent the model gave it and whether the walk
-followed it, so it is plain to see what was passed over and how narrowly.
-Scores print at two decimals in md and tree; json keeps the model's own numbers.
+that parses it. md is what to read, to paste into a task: the files that earned
+a place, each with the lines worth reading, the heading to look for and the
+scores, most relevant first. tree is the walk's link tree: every file it visited,
+walked files included, with every link it judged beneath it, each link with the
+scent the model gave it and whether the walk followed it, so it is plain to see
+what was passed over and how narrowly. Scores print at two decimals in md and
+tree; json keeps the model's own numbers.
 
 --mode picks the criterion Jev judges by (about, useful-for, answers); a
 --criteria FILE replaces it with a criterion of your own: the file's whole
@@ -82,17 +90,20 @@ not sent to the model, not previewed and not followed; and an entry file it
 matches is an error rather than a silent read.
 
 Exit codes:
-  0  the walk reached files beyond the entry files
-  1  nothing beyond the entry files is in the list: no link cleared the
-     threshold, or the page a link reached could not be judged
+  0  the walk reached files beyond the entry files that earned a place
+  1  nothing beyond the entry files did: results is the entry files alone, or
+     empty with the walk under `walked`. No link cleared the threshold,
+     everything reached was a hub, or the page a link reached could not be
+     judged
   2  error: the reason on stderr in one line, or a usage message for a flag that
      does not exist or will not take that value
 
 A page the walk reached but could not judge is not an error: it is named on
 stderr as skipped, its links are not followed, and the reading list keeps every
-page that was judged. The code is the list's own, so a walk that got past the
-entry files still exits 0 with one page missing. Only a run that judged nothing
-at all — an entry file whose judgment failed with nothing else reached — is 2.
+page that was judged. A page that was judged and earned no place is not an error
+either: it is under `walked`, with the links it offered. Only a run that judged
+nothing at all — an entry file whose judgment failed with nothing else reached —
+is 2.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, a score per section and a scent
@@ -144,8 +155,8 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = MAX_DEPTH)]
     max_depth: usize,
 
-    /// Least link scent that queues a target, 0 to 1. The sections the reading
-    /// list keeps are the ones that clear it too.
+    /// Least link scent that queues a target, and least relevance or section
+    /// score a file needs to earn a place in the reading list, 0 to 1.
     #[arg(long, value_name = "SCENT", default_value_t = THRESHOLD, value_parser = threshold)]
     threshold: f64,
 
@@ -154,7 +165,7 @@ struct Cli {
     no_cache: bool,
 
     /// How the reading list is printed: `json` for a caller that parses it,
-    /// `md` for a reading list to paste, `tree` for the walk's link tree.
+    /// `md` for what to read, `tree` for the walk's link tree.
     #[arg(long, value_name = "FORMAT", value_enum, default_value_t = FormatArg::Json)]
     format: FormatArg,
 
@@ -191,10 +202,11 @@ impl ModeArg {
 enum FormatArg {
     /// The plan's `Output` section: what a caller parses.
     Json,
-    /// A reading list to paste: each file with the lines worth reading.
+    /// What to read, to paste: the files that earned a place, each with the
+    /// lines worth reading.
     Md,
-    /// The walk's link tree: every judged link, with its scent and whether the
-    /// walk followed it.
+    /// The walk's link tree: every file it visited, `walked` included, and
+    /// every judged link with its scent and whether the walk followed it.
     Tree,
 }
 
@@ -275,9 +287,9 @@ async fn main() {
             Ok(code) => {
                 if code != 0 {
                     eprintln!(
-                        "s1m: nothing beyond the entry files is in the reading list: \
-                         nothing cleared the threshold, or the page a link reached \
-                         could not be judged"
+                        "s1m: nothing beyond the entry files earned a place in the reading \
+                         list: nothing cleared the threshold, everything reached was a hub, \
+                         or the page a link reached could not be judged"
                     );
                 }
                 std::process::exit(code);

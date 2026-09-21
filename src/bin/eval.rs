@@ -10,7 +10,12 @@
 //! Per query, at each file budget:
 //!
 //! - **Recall and precision** against the gold set: what the agent is asked to
-//!   read at that budget, and how much of it was wanted.
+//!   read at that budget, and how much of it was wanted. The list holds only
+//!   the files that earn a place on their own
+//!   ([`s1m::traverse::VisitedFile::earns_a_place`]), so precision is reported
+//!   twice — over the returned list, and over every file the walk judged, which
+//!   is what it was while the list returned all of them — and the pair, with
+//!   the wanted pages the cutoff drops, is what the cutoff bought and cost.
 //! - **Tokens the agent reads**, counted at [`CHARS_PER_TOKEN`] — the rule the
 //!   spike set its caps with, because nothing here tokenises. Three sets: the
 //!   returned line ranges, the same files whole, and the whole corpus. The
@@ -125,8 +130,9 @@ struct Args {
     /// File budgets to measure, smallest first.
     #[arg(long, value_delimiter = ',', default_value = "10,25")]
     budgets: Vec<usize>,
-    /// Least link scent that queues a target, and least section score the
-    /// reading list keeps.
+    /// Least link scent that queues a target. The same number is the reading
+    /// list's cutoff: a visited file earns a place on its relevance or on one
+    /// of its sections, and only sections at or above it are returned.
     #[arg(long, default_value_t = 0.6)]
     threshold: f64,
     /// Buy every judgment: ignore the answers on disk.
@@ -663,10 +669,20 @@ struct Judged {
 struct Score {
     /// How many pages the query wants.
     gold: usize,
-    /// How many the reading list returned.
+    /// How many files the walk judged: the returned list and the files walked
+    /// beside it, which is what `--max-files` budgets.
+    visited: usize,
+    /// How many the reading list returned: the files that earned a place.
     returned: usize,
-    /// How many of those it wanted.
+    /// How many of the returned files it wanted.
     found: usize,
+    /// How many of the files the walk judged it wanted, returned or walked.
+    ///
+    /// Not [`Score::found`] by another name: the walk can reach a wanted page
+    /// the reading list does not return. Over `visited` this is the precision
+    /// the harness reported when the list returned everything the walk visited,
+    /// so the pair says what the cutoff moved.
+    reached: usize,
     /// Tokens an agent reads when it opens the returned ranges.
     read_tokens: usize,
     /// Tokens it reads when it opens the returned files whole.
@@ -679,8 +695,8 @@ impl Score {
     }
 
     /// The share of what was returned that was wanted. A run that returned
-    /// nothing — a keyword ranker whose query matched no page — found none of
-    /// its budget.
+    /// nothing — a keyword ranker whose query matched no page, or a walk whose
+    /// every file was a hub — found none of its budget.
     fn precision(&self) -> f64 {
         if self.returned == 0 {
             0.0
@@ -689,9 +705,27 @@ impl Score {
         }
     }
 
-    /// The wanted pages the reading list did not return.
-    fn missed(&self) -> usize {
-        self.gold - self.found
+    /// The same precision over everything the walk judged, the files it walked
+    /// included: the list's own number beside the one for all it was chosen
+    /// from, which is the number this section reported before the list had a
+    /// cutoff.
+    fn precision_over_visited(&self) -> f64 {
+        if self.visited == 0 {
+            0.0
+        } else {
+            self.reached as f64 / self.visited as f64
+        }
+    }
+
+    /// The wanted pages no walk reached at all: the ones no arrangement of the
+    /// reading list could have returned.
+    ///
+    /// Not the same question as what the list missed: a page the walk did reach
+    /// and the list did not return is a miss for recall and is not
+    /// unreachable, and the two are counted apart so that the cutoff is never
+    /// reported as the link graph.
+    fn unreached(&self) -> usize {
+        self.gold - self.reached
     }
 }
 
@@ -702,7 +736,12 @@ struct Run {
     id: String,
     score: Score,
     spent: Spent,
-    visits: Vec<Visit>,
+    /// The files the reading list returned: the ones that earned a place.
+    returned: Vec<Visit>,
+    /// The files the walk visited that did not earn one: entry files, hubs and
+    /// near-misses, kept for what they explain — where the walk reached them
+    /// from, and what they passed on — rather than for what they hold.
+    walked: Vec<Visit>,
     judged: Vec<Judged>,
     /// Files the walk reached and could not read. The wiki's business, named in
     /// the report rather than counted as a miss.
@@ -710,12 +749,18 @@ struct Run {
 }
 
 impl Run {
-    /// The pages this run returned.
-    fn returned(&self) -> BTreeSet<&Path> {
-        self.visits
-            .iter()
-            .map(|visit| visit.path.as_path())
-            .collect()
+    /// Every file the walk visited, returned first: what the JSON reports as
+    /// `results` and `walked` together, which is the population any question
+    /// about the walk has to ask about.
+    fn visited(&self) -> impl Iterator<Item = &Visit> {
+        self.returned.iter().chain(&self.walked)
+    }
+
+    /// The pages the walk reached, however the reading list treated them. A
+    /// walked page was reached too, so "did the walk get there" is this set and
+    /// not the returned list.
+    fn visited_paths(&self) -> BTreeSet<&Path> {
+        self.visited().map(|visit| visit.path.as_path()).collect()
     }
 }
 
@@ -835,21 +880,42 @@ impl Env<'_> {
             }
         }
 
-        let visits: Vec<Visit> = traversal
-            .results
-            .iter()
-            .map(|file| Visit {
+        // The walk returns every file it visited — a hub is worth walking
+        // through, whatever it is worth reading — and the reading list is the
+        // ones that earn a place on their own
+        // ([`s1m::traverse::VisitedFile::earns_a_place`]); the rest are what
+        // `walked` reports. The split is kept beside the returned list rather
+        // than thrown away, because the calibration and the pages a walk
+        // reaches are questions about the walk, and either would shrink if the
+        // cutoff's answer were taken for the walk's.
+        let mut returned = Vec::new();
+        let mut walked = Vec::new();
+        for file in &traversal.results {
+            let earns = file.earns_a_place(threshold);
+            let visit = Visit {
                 path: file.path.clone(),
                 relevance: Some(file.relevance),
                 scent: file.scent,
-                lines: file
-                    .sections
-                    .iter()
-                    .filter(|section| section.score >= threshold)
-                    .map(|section| section.lines)
-                    .collect(),
-            })
-            .collect();
+                // The ranges are a returned file's: a walked one has nothing
+                // to return, and nothing reads its lines.
+                lines: match earns {
+                    true => file
+                        .sections
+                        .iter()
+                        .filter(|section| section.score >= threshold)
+                        .map(|section| section.lines)
+                        .collect(),
+                    false => Vec::new(),
+                },
+            };
+            match earns {
+                true => returned.push(visit),
+                false => walked.push(visit),
+            }
+        }
+        // Every visited file's links, the walked ones included: a hub the list
+        // does not return is still a file whose links the walk judged, and
+        // dropping them would change what the calibration is over.
         let judged = traversal
             .results
             .iter()
@@ -863,12 +929,13 @@ impl Env<'_> {
             })
             .collect();
 
-        let score = self.score(query, &visits);
+        let score = self.score(query, &returned, &walked);
         Ok(Run {
             id: query.id.clone(),
             score,
             spent,
-            visits,
+            returned,
+            walked,
             judged,
             unreadable,
         })
@@ -920,16 +987,21 @@ impl Env<'_> {
         let whole_tokens: usize = tokens(hits.iter().map(|page| self.corpus.chars_of(page)).sum());
         Run {
             id: query.id.clone(),
+            // A grep reads every page it hit, so what it judged and what it
+            // returned are one list: the two precisions are the same number,
+            // and the row is comparable to s1m's rows on that footing.
             score: Score {
                 gold: expected.len(),
+                visited: hits.len(),
                 returned: hits.len(),
                 found,
+                reached: found,
                 // An agent that greps reads the files it hit, whole.
                 read_tokens: whole_tokens,
                 whole_tokens,
             },
             spent: Spent::default(),
-            visits: hits
+            returned: hits
                 .into_iter()
                 .map(|path| Visit {
                     path,
@@ -938,30 +1010,43 @@ impl Env<'_> {
                     lines: Vec::new(),
                 })
                 .collect(),
+            walked: Vec::new(),
             judged: Vec::new(),
             unreadable: Vec::new(),
         }
     }
 
     /// One reading list against one query's labels.
-    fn score(&self, query: &Query, visits: &[Visit]) -> Score {
+    ///
+    /// `returned` is the list the agent opens, and `read`/`whole` are its
+    /// files'; `walked` is beside it only to count what the walk reached, which
+    /// is the other precision and not the list's. Every page of both lists was
+    /// judged, so `visited` is all of them.
+    fn score(&self, query: &Query, returned: &[Visit], walked: &[Visit]) -> Score {
         let expected = query.expected();
-        let found = visits
+        let found = returned
             .iter()
             .filter(|visit| expected.contains(&visit.path))
             .count();
-        let read: usize = visits
+        let reached = returned
+            .iter()
+            .chain(walked)
+            .filter(|visit| expected.contains(&visit.path))
+            .count();
+        let read: usize = returned
             .iter()
             .map(|visit| self.corpus.chars_in(&visit.path, &visit.lines))
             .sum();
-        let whole: usize = visits
+        let whole: usize = returned
             .iter()
             .map(|visit| self.corpus.chars_of(&visit.path))
             .sum();
         Score {
             gold: expected.len(),
-            returned: visits.len(),
+            visited: returned.len() + walked.len(),
+            returned: returned.len(),
             found,
+            reached,
             read_tokens: tokens(read),
             whole_tokens: tokens(whole),
         }
@@ -1287,24 +1372,30 @@ impl Findings {
         let _ = writeln!(
             out,
             "- **Recall and precision at `--max-files {tight}`**: mean recall {}, mean precision {} \
-             — {} of the {} wanted pages, over {} files returned, {:.1} a query. {}",
+             — {} of the {} wanted pages are in the list the agent opens, over {} files returned, \
+             {:.1} a query — against {} over everything the walk visited: {} files judged, {} of \
+             them earned a place, and the rest are what the JSON reports as `walked`. {}",
             ratio(mean_recall(s1m)),
             ratio(mean_precision(s1m)),
             sum(s1m, |run| run.score.found),
             wanted,
             sum(s1m, |run| run.score.returned),
             sum(s1m, |run| run.score.returned) as f64 / s1m.len() as f64,
+            ratio(mean_precision_over_visited(s1m)),
+            sum(s1m, |run| run.score.visited),
+            sum(s1m, |run| run.score.returned),
             match tight == wide {
                 true => "One budget was measured, so nothing here says whether a wider one would \
                          return more."
                     .to_string(),
                 false => format!(
                     "The budget is not what binds: the walk runs out of links above `--threshold` \
-                     first, and `--max-files {wide}` returns {} files for the same mean recall ({}), \
-                     so everything below is a statement about the link graph and the threshold, not \
-                     about the budget.",
-                    sum(wider, |run| run.score.returned),
+                     first, and `--max-files {wide}` visits {} files for the same mean recall ({}), \
+                     {} of which earn a place, so everything below is a statement about the link \
+                     graph and the threshold, not about the budget.",
+                    sum(wider, |run| run.score.visited),
                     ratio(mean_recall(wider)),
+                    sum(wider, |run| run.score.returned),
                 ),
             },
         );
@@ -1476,13 +1567,27 @@ impl Findings {
     fn at_a_budget(&self, out: &mut String) {
         let _ = writeln!(out, "## Results at a fixed file budget");
         let _ = writeln!(out);
+        let (tight, tight_runs) = &self.at[0];
         let _ = writeln!(
             out,
-            "`--max-files` is the number of files the walk may visit, and the reading list returns \
-             everything it visited, most relevant first: the agent opens what it was handed. Recall \
-             is the wanted pages that are in the list over all of them; precision is the wanted \
-             pages in the list over everything in it. `read` is what the agent opens — the returned \
-             ranges only."
+            "`--max-files` is the number of files the walk may visit, and the walk judges that many \
+             before the reading list is asked anything. `Visited` counts the files it judged; \
+             `Returned` is the list the agent opens — the ones that earn a place on their own, \
+             relevance at or above `--threshold` {} or a section at or above it, most relevant \
+             first — and the rest, the entry files, hubs and near-misses, are what the JSON reports \
+             as `walked`. Recall is the wanted pages in that list over all of the query's wanted \
+             pages, and precision is the wanted pages in it over the files in it; precision \
+             (visited) is the same over everything the walk judged, which is the number this \
+             harness reported while the list was everything the walk had visited, so the two side \
+             by side are what the cutoff bought and cost. At `--max-files {tight}`: {} files \
+             visited and {} returned, mean precision {} against {} over everything visited. `read` \
+             is what the agent opens — the returned ranges only — and `whole` is those same files \
+             read entire.",
+            self.threshold,
+            sum(tight_runs, |run| run.score.visited),
+            sum(tight_runs, |run| run.score.returned),
+            ratio(mean_precision(tight_runs)),
+            ratio(mean_precision_over_visited(tight_runs)),
         );
         let _ = writeln!(out);
         for (budget, runs) in &self.at {
@@ -1493,10 +1598,12 @@ impl Findings {
                 &[
                     "Query",
                     "Gold",
+                    "Visited",
                     "Returned",
                     "Found",
                     "Recall",
                     "Precision",
+                    "Precision (visited)",
                     "Read (tok)",
                     "Whole (tok)",
                     "Cost",
@@ -1509,10 +1616,12 @@ impl Findings {
                     &[
                         format!("`{}`", run.id),
                         run.score.gold.to_string(),
+                        run.score.visited.to_string(),
                         run.score.returned.to_string(),
                         run.score.found.to_string(),
                         ratio(run.score.recall()),
                         ratio(run.score.precision()),
+                        ratio(run.score.precision_over_visited()),
                         run.score.read_tokens.to_string(),
                         run.score.whole_tokens.to_string(),
                         usd(run.spent.cost_usd()),
@@ -1527,8 +1636,10 @@ impl Findings {
                     String::new(),
                     String::new(),
                     String::new(),
+                    String::new(),
                     format!("**{}**", ratio(mean_recall(runs))),
                     format!("**{}**", ratio(mean_precision(runs))),
+                    format!("**{}**", ratio(mean_precision_over_visited(runs))),
                     format!("**{}**", sum(runs, |run| run.score.read_tokens)),
                     format!("**{}**", sum(runs, |run| run.score.whole_tokens)),
                     format!("**{}**", usd(sum_cost(runs))),
@@ -1624,26 +1735,46 @@ impl Findings {
         let _ = writeln!(out);
     }
 
-    /// The pages links cannot reach: a walk follows links, so a page nothing
-    /// links to is never reached however relevant it is, and these are the
-    /// wanted ones no walk returned.
+    /// The wanted pages no walk reached: a walk follows links, so a page
+    /// nothing links to is never reached however relevant it is, and a page
+    /// behind the budgets is not reached either. `reached` is every file the
+    /// walk judged, the ones the reading list returned and the ones it walked,
+    /// because this is a question about the walk rather than about the list —
+    /// the list shrinking must not make a page look unreachable.
+    ///
+    /// What the cutoff costs is the other number here: a wanted page the walk
+    /// did reach but that earned no place is in the JSON's `walked`, and is not
+    /// in the list the agent reads.
     fn never_reached(&self, out: &mut String) {
-        let _ = writeln!(out, "## The pages links cannot reach");
+        let _ = writeln!(out, "## The pages no walk reached");
         let _ = writeln!(out);
         let wide = self.widest();
         let (_, runs) = self.at_budget(wide);
-        let missed: usize = runs.iter().map(|run| run.score.missed()).sum();
+        let missed: usize = runs.iter().map(|run| run.score.unreached()).sum();
         let _ = writeln!(
             out,
             "Wanted pages no walk reached at `--max-files {wide}`: {missed} query/page pairs missed."
         );
+        let reached: usize = runs.iter().map(|run| run.score.reached).sum();
+        let cutoff: usize = runs
+            .iter()
+            .map(|run| run.score.reached - run.score.found)
+            .sum();
+        if cutoff > 0 {
+            let _ = writeln!(
+                out,
+                "The cutoff costs {cutoff} of the {reached} wanted pages a walk did reach: those are \
+                 in the JSON's `walked`, not in the list the agent reads, because reaching a page is \
+                 not returning it."
+            );
+        }
         let _ = writeln!(out);
         if missed == 0 {
             return;
         }
-        head(out, &["Query", "Wanted but not returned"]);
+        head(out, &["Query", "Wanted but not reached"]);
         for run in runs {
-            if run.score.missed() == 0 {
+            if run.score.unreached() == 0 {
                 continue;
             }
             let Some(wanted) = self.query(&run.id).map(Query::expected) else {
@@ -1651,7 +1782,7 @@ impl Findings {
             };
             let missing = wanted
                 .iter()
-                .filter(|page| !run.returned().contains(page.as_path()))
+                .filter(|page| !run.visited_paths().contains(page.as_path()))
                 .map(|page| format!("`{}`", page.display()))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1680,8 +1811,7 @@ impl Findings {
             .iter()
             .flat_map(|run| {
                 let expected = self.query(&run.id).map(Query::expected).unwrap_or_default();
-                run.visits
-                    .iter()
+                run.visited()
                     .filter_map(|visit| {
                         visit.scent.map(|scent| {
                             (
@@ -2020,9 +2150,10 @@ impl Findings {
         );
         let _ = writeln!(
             out,
-            "- **A hit is not an answer.** Recall counts returned files, not whether an agent \
-             could do the task with them, and `read` counts characters at {}, not what a tokeniser \
-             would charge.",
+            "- **A hit is not an answer.** Recall counts the files the reading list returned, not \
+             whether an agent could do the task with them: a wanted page the walk reached but that \
+             earned no place on its own is not in that list, so it counts as missed. `read` counts \
+             characters at {}, not what a tokeniser would charge.",
             CHARS_PER_TOKEN
         );
         let _ = writeln!(
@@ -2266,6 +2397,20 @@ fn mean_precision(runs: &[Run]) -> f64 {
     }
 }
 
+/// The same mean over everything the runs' walks judged: the precision these
+/// runs would have reported while the list was still everything visited.
+fn mean_precision_over_visited(runs: &[Run]) -> f64 {
+    match runs.is_empty() {
+        true => 0.0,
+        false => {
+            runs.iter()
+                .map(|run| run.score.precision_over_visited())
+                .sum::<f64>()
+                / runs.len() as f64
+        }
+    }
+}
+
 /// The mean of one answer's latency over the runs: the number a round's wall
 /// time is a multiple of.
 fn mean_run_latency(runs: &[Run]) -> Duration {
@@ -2376,6 +2521,10 @@ mod tests {
 
     /// Recall is what the list found over what was wanted, precision what it
     /// found over what it returned, and the read number is the ranges only.
+    ///
+    /// The walked file was judged and not returned: it is in the second
+    /// precision's denominator and neither of the first's, which is the whole
+    /// difference between the two numbers.
     #[test]
     fn a_run_scores_against_its_labels() {
         let corpus = corpus(&[
@@ -2392,22 +2541,26 @@ mod tests {
             ignore: Ignore::none(),
         };
         let query = query("q", &["wanted.md", "also.md"]);
-        let visits = [visit("wanted.md", &[[1, 2]]), visit("noise.md", &[[1, 1]])];
+        let returned = [visit("wanted.md", &[[1, 2]])];
+        let walked = [visit("noise.md", &[[1, 1]])];
 
-        let score = env.score(&query, &visits);
+        let score = env.score(&query, &returned, &walked);
         assert_eq!(score.gold, 2);
-        assert_eq!(score.returned, 2);
+        assert_eq!(score.visited, 2, "both files were judged");
+        assert_eq!(score.returned, 1);
         assert_eq!(score.found, 1);
+        assert_eq!(score.reached, 1, "the walk reached a wanted page");
         assert_eq!(score.recall(), 0.5);
-        assert_eq!(score.precision(), 0.5);
-        assert_eq!(score.missed(), 1);
+        assert_eq!(score.precision(), 1.0);
+        assert_eq!(score.precision_over_visited(), 0.5);
+        assert_eq!(score.unreached(), 1, "no walk reached also.md either");
         assert_eq!(
-            score.read_tokens, 3,
-            "wanted.md's first two lines and noise.md's one line, not the files"
+            score.read_tokens, 2,
+            "wanted.md's first two lines, not the walked file"
         );
         assert_eq!(
-            score.whole_tokens, 6,
-            "wanted.md whole and noise.md whole, not the ranges"
+            score.whole_tokens, 5,
+            "wanted.md's 19 characters whole, not the walked file's four as well"
         );
     }
 

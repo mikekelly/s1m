@@ -12,14 +12,22 @@
 //!
 //! - The plan's `Output` section: the query, the criterion the answers were
 //!   judged against, how many files were visited and how many calls they cost,
-//!   and one entry per visited file with its relevance, the scent of the link
-//!   that reached it, the `via` path, the line ranges worth reading and the
-//!   outgoing links that were judged.
-//! - Sorted by relevance descending, then path. Every path is spelled the way
-//!   the caller spelled its entry files, so `--root wiki` with `wiki/index.md`
-//!   reads `wiki/payments/cutoffs.md` and not `payments/cutoffs.md`. That is
-//!   the spelling the plan's example uses, and the one a caller can hand
-//!   straight back to an editor or another command.
+//!   and one entry per file that earned a place with its relevance, the scent
+//!   of the link that reached it, the `via` path, the line ranges worth reading
+//!   and the outgoing links that were judged.
+//! - `results` holds the files that earn a place on their own: relevance at or
+//!   above `threshold`, or a section at or above it
+//!   ([`crate::traverse::VisitedFile::earns_a_place`]). A hub is worth walking
+//!   through and not worth reading, so the entry pages and section indexes the
+//!   walk only passed through are reported under [`ReadingList::walked`]
+//!   instead: their path, relevance, scent, `via` and judged links, and no
+//!   `sections`. `visited` counts both lists, and each is sorted by relevance
+//!   descending, then path.
+//! - Every path is spelled the way the caller spelled its entry files, so
+//!   `--root wiki` with `wiki/index.md` reads `wiki/payments/cutoffs.md` and
+//!   not `payments/cutoffs.md`. That is the spelling the plan's example uses,
+//!   and the one a caller can hand straight back to an editor or another
+//!   command.
 //! - Sections are the parser's ranges and the model's scores, most useful
 //!   first, with the ones below `threshold` left out. A section's range
 //!   contains its subsections', so a caller that reads a returned range has
@@ -27,12 +35,13 @@
 //!
 //! What the exit code is:
 //!
-//! - 0 when the walk reached a file beyond the entry files, which is a reading
-//!   list the caller could not have written itself.
-//! - 1 when the walk reached nothing beyond the entry files: the model judged
-//!   the entry files' links and none passed, or the page one of them reached
-//!   could not be judged. The list is still printed — a caller that wants it
-//!   gets it — with one line on stderr saying why the code is not 0.
+//! - 0 when the walk reached a file beyond the entry files that earned a place,
+//!   which is a reading list the caller could not have written itself.
+//! - 1 when it did not: `results` is entry files alone, or empty with the walk
+//!   in [`ReadingList::visited`]. The model judged the entry files' links and
+//!   none passed, or everything it reached was a hub, or the page one of them
+//!   reached could not be judged. The list is still printed — a caller that
+//!   wants it gets it — with one line on stderr saying why the code is not 0.
 //! - 2 for anything that stops a list being an answer: bad flags, no query, an
 //!   entry file that cannot be read, an entry file the root's `.s1mignore`
 //!   covers ([`Error::Ignored`]), a `.s1mignore` that cannot be read or parsed,
@@ -189,14 +198,16 @@ impl<S: Scorer> Judge for Uncached<S> {
 /// Field names and order are that section: `query`, `mode`, `visited`, `calls`,
 /// `results`, and per result `path`, `relevance`, `scent`, `via`, `sections`,
 /// `links`, each section carrying `heading`, `lines` and `score` and each link
-/// `target`, `scent` and `followed`.
+/// `target`, `scent` and `followed`. [`Self::walked`] is the walk's other half,
+/// appended: the same file as a result without `sections`.
 #[derive(Debug, Serialize)]
 pub struct ReadingList {
     /// The query, unchanged.
     pub query: String,
     /// The relevance criterion the answers were judged against.
     pub mode: String,
-    /// Files scored, and so results returned.
+    /// Files judged: the ones in [`Self::results`] and the ones in
+    /// [`Self::walked`], which are what `--max-files` budgets.
     pub visited: usize,
     /// Answers bought from the API: the cache's misses, or every score when
     /// `--no-cache` skipped the cache. A repeat run of the same query is
@@ -206,13 +217,29 @@ pub struct ReadingList {
     /// fit the API's state budget in one request costs several, and is still
     /// one answer here (`s1m score-file` reports the requests).
     pub calls: u64,
-    /// The visited files, most relevant first, ties broken by path.
+    /// The visited files that earn a place, most relevant first, ties broken by
+    /// path.
     pub results: Vec<RankedFile>,
+    /// The visited files that did not earn a place on their own: entry files,
+    /// hubs and section indexes, and any page whose relevance and every section
+    /// fell below `threshold`.
+    ///
+    /// They are reported rather than dropped so the walk stays explainable —
+    /// the path that reached each one, the links it judged, its own relevance —
+    /// which is what [`crate::format`]'s tree is drawn from. Nothing here is
+    /// something to read: `md` leaves them out. Sorted like [`Self::results`],
+    /// and no `sections`: a file that earns no place has no ranges to return.
+    pub walked: Vec<WalkedFile>,
 }
 
 impl ReadingList {
     /// The code the process exits with. See the module documentation for what
     /// each one means.
+    ///
+    /// The question is whether the list holds anything the caller could not
+    /// have written itself, so a file a link reached has to be in `results` to
+    /// earn a 0: entry files alone are the caller's own starting points, and a
+    /// hub that the walk only passed through is not a page to read.
     pub fn exit_code(&self) -> i32 {
         if self.results.iter().any(|result| !result.via.is_empty()) {
             0
@@ -226,6 +253,29 @@ impl ReadingList {
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("a reading list is strings, numbers and booleans")
     }
+}
+
+/// One visited file that did not earn a place in [`ReadingList::results`].
+///
+/// The same file as a [`RankedFile`] minus its sections: it is reported for what
+/// it explains rather than for what it holds — where the walk reached it from,
+/// what it thought of the links it offered — so a hub that led to the pages that
+/// matter is still visible in the JSON and in `tree`, without being offered as
+/// something to read.
+#[derive(Debug, Serialize)]
+pub struct WalkedFile {
+    /// The file, spelled the way the caller spelled its entry files.
+    pub path: String,
+    /// How useful the file is for the query, 0 to 1.
+    pub relevance: f64,
+    /// The scent of the link that reached it; `None` for an entry file, which
+    /// no link reached.
+    pub scent: Option<f64>,
+    /// The files on the best path to this one, in order and excluding it; empty
+    /// for an entry file.
+    pub via: Vec<String>,
+    /// This file's outgoing links, in the order they appear, one per target.
+    pub links: Vec<RankedLink>,
 }
 
 /// One file in the reading list.
@@ -375,7 +425,9 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
     let traversal = traverse(&config, judge.scorer()).await?;
 
     let Traversal {
-        results, failed, ..
+        results: judged,
+        failed,
+        ..
     } = traversal;
     // One page that cannot be judged is a hole in the ranking, not the end of
     // the walk: it is named on stderr, the rest of the frontier keeps its
@@ -397,7 +449,7 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         }
     }
     let mut unjudged = unjudged.into_iter();
-    if results.is_empty()
+    if judged.is_empty()
         && let Some((path, source)) = unjudged.next()
     {
         return Err(Error::Judge {
@@ -409,32 +461,59 @@ pub async fn run(options: &Options, judge: &dyn Judge) -> Result<ReadingList, Er
         skipped(&root, &path, format_args!("could not be judged: {source}"));
     }
 
-    let results = results
-        .into_iter()
-        .map(|file| RankedFile {
-            path: display(&root, &file.path),
-            relevance: file.relevance,
-            scent: file.scent,
-            via: file.via.iter().map(|via| display(&root, via)).collect(),
-            sections: ranked_sections(&file.sections, options.threshold),
-            links: file
-                .links
-                .into_iter()
-                .map(|link| RankedLink {
-                    target: display(&root, &link.target),
-                    scent: link.scent,
-                    followed: link.followed,
-                })
-                .collect(),
-        })
-        .collect::<Vec<_>>();
+    // The walk returns every file it visited — a hub is worth walking through
+    // — and the reading list keeps only the ones that earn a place on their own
+    // ([`crate::traverse::VisitedFile::earns_a_place`]). The rest are reported
+    // as walked: the tree and the `via` paths beside them are what the caller
+    // reads to see how the list was reached, so they are not dropped.
+    let visited = judged.len();
+    let mut results = Vec::with_capacity(visited);
+    let mut walked = Vec::with_capacity(visited);
+    for file in judged {
+        let earns = file.earns_a_place(options.threshold);
+        let path = display(&root, &file.path);
+        let via = file
+            .via
+            .iter()
+            .map(|via| display(&root, via))
+            .collect::<Vec<_>>();
+        let links = file
+            .links
+            .into_iter()
+            .map(|link| RankedLink {
+                target: display(&root, &link.target),
+                scent: link.scent,
+                followed: link.followed,
+            })
+            .collect::<Vec<_>>();
+
+        if earns {
+            results.push(RankedFile {
+                path,
+                relevance: file.relevance,
+                scent: file.scent,
+                via,
+                sections: ranked_sections(&file.sections, options.threshold),
+                links,
+            });
+        } else {
+            walked.push(WalkedFile {
+                path,
+                relevance: file.relevance,
+                scent: file.scent,
+                via,
+                links,
+            });
+        }
+    }
 
     Ok(ReadingList {
         query: options.query.clone(),
         mode: options.mode.clone(),
-        visited: results.len(),
+        visited,
         calls: judge.calls(),
         results,
+        walked,
     })
 }
 
@@ -498,6 +577,7 @@ mod tests {
 
     const ENTRY: &str = "tests/fixtures/cli/entry.md";
     const BROKEN: &str = "tests/fixtures/cli/broken.md";
+    const HUB: &str = "tests/fixtures/cli/hub.md";
     const NESTED: &str = "tests/fixtures/cli/nested.md";
     const PREAMBLE: &str = "tests/fixtures/cli/preamble.md";
 
@@ -710,9 +790,91 @@ mod tests {
                         ],
                     },
                 ],
+                // Every file here earned a place, so the walk's other half is
+                // empty: `--format tree` prints it, and `md` would not.
+                "walked": [],
             })
         );
         assert_eq!(list.exit_code(), 0);
+    }
+
+    /// A file earns a place on its own: relevance at or above the threshold, or
+    /// a section at or above it. A hub earns neither — it is worth walking
+    /// through, not reading — so it is reported as walked, with what the
+    /// reading list says about any file but no sections, and the paths to what
+    /// it led to stay legible.
+    #[tokio::test]
+    async fn a_file_earns_a_place_on_its_relevance_or_a_section_of_it() {
+        // The hub at 0.2; the page it leads to at 0.8, which earns on its own
+        // relevance; and one at 0.3 with a "Preamble" section at 0.9. The three
+        // cases the cutoff tells apart.
+        fn relevance(file: &ParsedFile) -> f64 {
+            match file.path.file_stem().and_then(|stem| stem.to_str()) {
+                Some("hub") => 0.2,
+                Some("deep") => 0.8,
+                _ => 0.3,
+            }
+        }
+        fn section(section: &Section) -> f64 {
+            match section.heading.as_deref() {
+                Some("Preamble") => 0.9,
+                _ => 0.1,
+            }
+        }
+
+        let list = run_with(HUB, &Fake::uncached(relevance, 0.9).sectioning(section))
+            .await
+            .expect("the fixture walks");
+
+        assert_eq!(list.visited, 3, "the walk visits the hub and both leaves");
+        assert_eq!(
+            list.results
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "tests/fixtures/cli/deep.md",
+                "tests/fixtures/cli/preamble.md"
+            ],
+            "0.8 on its own relevance, and 0.3 with one section at 0.9"
+        );
+        assert_eq!(
+            list.walked
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            [HUB],
+            "a hub below the cutoff, with no section above it, is not something to read"
+        );
+        assert_eq!(
+            list.exit_code(),
+            0,
+            "the walk reached pages beyond the entry"
+        );
+
+        let json: Value = serde_json::from_str(&list.to_json()).expect("the reading list is JSON");
+        assert_eq!(
+            json["walked"][0],
+            json!({
+                "path": "tests/fixtures/cli/hub.md",
+                "relevance": 0.2,
+                "scent": null,
+                "via": [],
+                "links": [
+                    {
+                        "target": "tests/fixtures/cli/deep.md",
+                        "scent": 0.9,
+                        "followed": true,
+                    },
+                    {
+                        "target": "tests/fixtures/cli/preamble.md",
+                        "scent": 0.9,
+                        "followed": true,
+                    },
+                ],
+            }),
+            "a walked file is a result without its sections: where it was reached from, and what it offered"
+        );
     }
 
     /// The line ranges in the list are #4's parser's, section for section, and

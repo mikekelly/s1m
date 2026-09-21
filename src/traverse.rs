@@ -130,6 +130,27 @@ pub struct VisitedFile {
     pub links: Vec<JudgedLink>,
 }
 
+impl VisitedFile {
+    /// Whether this file earns a place in the reading list on its own: its
+    /// relevance is at or above `threshold`, or one of its sections is.
+    ///
+    /// The walk returns every file it visited — a hub is worth walking through
+    /// whatever it is worth reading — and this is the one question the reading
+    /// list asks of a visited file. A file that fails it is still reported, as
+    /// a file the walk visited rather than one to read ([`crate::cli`]), so the
+    /// tree and the link path that reached it survive.
+    ///
+    /// The CLI and the evaluation harness both ask it here, so neither can
+    /// measure a rule the other does not ship.
+    pub fn earns_a_place(&self, threshold: f64) -> bool {
+        self.relevance >= threshold
+            || self
+                .sections
+                .iter()
+                .any(|section| section.score >= threshold)
+    }
+}
+
 /// One heading section of a visited file, as it was judged.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

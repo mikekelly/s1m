@@ -77,13 +77,21 @@ s1m "how do I cut a release and publish the package" \
 
 A query and one or more entry files. The reading list goes to stdout as JSON: the query, the
 criterion the answers were judged against, how many files were visited and how many calls that
-cost, then one entry per visited file, most relevant first and ties broken by path. Each entry
-carries the relevance the model gave it, the scent of the link that reached it, the path that
-got there, the ranges worth reading, and its outgoing links as they were judged — `followed`
-says whether a link queued its target, so the caller can see what was passed over and why.
-`scent` is `null` and `via` is empty for an entry file, which no link reached; a file a link
-reached carries the scent of that link and the `via` path it came along. A link whose target
-resolves outside `--root` is never followed, whatever its scent.
+cost, then `results` — the files that earned a place, most relevant first and ties broken by
+path — and `walked`, the files the walk visited without earning one. Each result carries the
+relevance the model gave it, the scent of the link that reached it, the path that got there,
+the ranges worth reading, and its outgoing links as they were judged — `followed` says whether
+a link queued its target, so the caller can see what was passed over and why. `scent` is `null`
+and `via` is empty for an entry file, which no link reached; a file a link reached carries the
+scent of that link and the `via` path it came along. A link whose target resolves outside
+`--root` is never followed, whatever its scent.
+
+A file earns a place on its own: relevance at or above `--threshold`, or at least one section
+at or above it. A hub is worth walking through and not worth reading, so the entry pages,
+section indexes and near-misses the walk only passed through are reported under `walked`
+instead — the same file without `sections`: the path that reached it and the links it offered,
+which is what keeps the walk explainable without handing the caller pages not to read. The two
+lists together are every file the walk visited, which is what `visited` counts.
 
 `sections` is what to open: one entry per heading section of the file that the model called
 useful, each with the heading, the `[first, last]` lines to read and the score, most useful
@@ -93,51 +101,66 @@ near 0.5 means it was unsure, so the default leaves those out. Nothing is derive
 scores — a range is never narrowed or widened — and because a section's range contains its
 subsections', a parent that is a mix of useful and useless text lands near the middle and is
 dropped while the subsection that mattered stays. A caller that has read one returned range has
-read everything returned inside it. A file whose sections all fell below `--threshold` carries
-`"sections": []` in the JSON — it was scored, and nothing cleared the bar — and the `md` view
-says the same in words.
+read everything returned inside it. A result whose sections all fell below `--threshold`, and
+which is in the list on its relevance alone, carries `"sections": []` in the JSON — it was
+scored, and nothing cleared the bar — and the `md` view says the same in words.
 
 Every path is spelled the way the entry files were given: `--root wiki` with `wiki/index.md`
 gives `wiki/payments/cutoffs.md`, not `payments/cutoffs.md`, and those are the paths a caller
 hands back to its editor. An absolute `--root` gives absolute paths.
 
-This is a real run, first result and all (the other four results are elided, and the numbers are
-what a cold run costs — the same query again is answered from the cache and reports
-`"calls": 0`):
+This is a real run, the first result in full and the rest elided (it is answered from the
+committed [`eval/cache`](eval/cache), so it reports `"calls": 0`; a cold run of the same query
+buys one answer per file):
 
 ```json
 {
   "query": "how do I cut a release and publish the package",
   "mode": "useful-for",
   "visited": 5,
-  "calls": 5,
+  "calls": 0,
   "results": [
     {
       "path": "eval/wikis/llm-wiki-manager/wiki/concepts/release.md",
       "relevance": 0.7833333333333333,
-      "scent": 0.89,
+      "scent": 0.88,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
       "sections": [
         {
           "heading": "Release",
           "lines": [12, 26],
-          "score": 0.72
+          "score": 0.74
         }
       ],
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
-          "scent": 0.37,
+          "scent": 0.32,
           "followed": false
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md",
-          "scent": 0.21,
+          "scent": 0.19,
           "followed": false
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
-          "scent": 0.17,
+          "scent": 0.16,
+          "followed": false
+        }
+      ]
+    }
+  ],
+  "walked": [
+    {
+      "path": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
+      "relevance": 0.5566666666666666,
+      "scent": 0.7,
+      "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
+      "links": [
+        {
+          "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
+          "scent": 0.19,
           "followed": false
         }
       ]
@@ -146,11 +169,20 @@ what a cold run costs — the same query again is answered from the cache and re
 }
 ```
 
-That result is the whole answer for a caller with this task: `concepts/release.md` lines 12–26
-say the runbook lives in `RELEASING.md` at the repo root and list what it covers — branching,
-semver, tagging, npm Trusted Publishing, the release workflow, the post-release sync,
-troubleshooting and manual fallbacks. Reading the ranges the list returned is enough; the rest
-of the page is a "See also" list, which the model scored 0.14 and the threshold left out.
+That first result is the whole answer for a caller with this task: `concepts/release.md` lines
+12–26 say the runbook lives in `RELEASING.md` at the repo root and list what it covers —
+branching, semver, tagging, npm Trusted Publishing, the release workflow, the post-release
+sync, troubleshooting and manual fallbacks. Reading the ranges the list returned is enough; the
+rest of the page is a "See also" list, which the model scored 0.14 and the threshold left out.
+
+The run visited five files and returned three. `index.md`, the entry file, is a result because
+its "Concepts" section scored 0.62, and `dogfooding.md` because its section scored 0.64 — but
+the two files under `walked` earned neither: `node-version-and-types.md` came back at relevance
+0.56 with no section above the threshold, and `init-command.md` at 0.27. Both are worth walking
+through — they are how the walk reached the rest of the wiki — and neither is worth reading for
+this query, so they carry the path that reached them and the links they judged, and no ranges.
+Both lists are elided for length: the run returns three results and reports two files under
+`walked`.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -158,10 +190,10 @@ of the page is a "See also" list, which the model scored 0.14 and the threshold 
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
 | `--max-files` | 25 | Files visited before the walk stops. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over four more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target and least section score the list keeps, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
+| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
-| `--format` | `json` | `json` (the list above), `md` (a reading list to paste) or `tree` (the walk's link tree) |
+| `--format` | `json` | `json` (the list above), `md` (what to read: the results, with the lines worth reading) or `tree` (the walk's link tree, `walked` files included) |
 
 The `--threshold` and `--max-files` defaults are backed by numbers in
 [eval/REPORT.md](eval/REPORT.md), and the decisions are recorded in
@@ -172,8 +204,10 @@ The `--threshold` and `--max-files` defaults are backed by numbers in
 `--format` picks the view of that reading list. `json` is the default and the one to parse;
 `md` and `tree` are for a person, or for an agent that will paste the result into its own task.
 
-`md` is the list to act on: the same files in the same order, each with the lines worth reading
-and the score that put it there, one line per section.
+`md` is the list to act on: the files that earned a place, in the same order, each with the
+lines worth reading and the score that put it there, one line per section. What the walk
+visited without earning a place is the JSON's `walked` and `tree`'s, not `md`'s — a hub is
+walked through, not read — and both views still say how many files were visited.
 
 ```bash
 s1m --format md "how do I cut a release and publish the package" \
@@ -187,46 +221,37 @@ Criterion: useful-for; 5 files visited, 0 calls
 
 ## 1. `eval/wikis/llm-wiki-manager/wiki/concepts/release.md`
 
-relevance 0.77; scent 0.86; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.78; scent 0.88; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
 - lines 12-26, score 0.74, Release
 
 ## 2. `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-relevance 0.74; entry file
+relevance 0.72; entry file
 
-- lines 22-35, score 0.60, Concepts
+- lines 22-35, score 0.62, Concepts
 
 ## 3. `eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md`
 
-relevance 0.62; scent 0.87; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.61; scent 0.87; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 32-41, score 0.65, README vs wiki
-
-## 4. `eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md`
-
-relevance 0.55; scent 0.84; via `eval/wikis/llm-wiki-manager/wiki/index.md`
-
-- nothing above --threshold
-
-## 5. `eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md`
-
-relevance 0.27; scent 0.63; via `eval/wikis/llm-wiki-manager/wiki/index.md`
-
-- nothing above --threshold
+- lines 32-41, score 0.64, README vs wiki
 ```
 
-This is that query from the cache, so it reports no calls and its digits are the stored answers
-rather than the JSON sample's above; `md` is the same reading list either way. A file whose
-sections all fell below `--threshold` says so in place of a section line, and a section
-with no heading of its own — the text before a file's first heading — reads `(preamble)` where
-the heading would be.
+This is that query from the cache, so it reports no calls and its digits are the stored answers;
+`md` is the same reading list either way. It prints three files where the JSON above visits
+five: `node-version-and-types.md` and `init-command.md` earned no place, so they are not
+something to paste into a task, and the header still says how many files the walk visited. A
+result whose sections all fell below `--threshold` says so in place of a section line, and a
+section with no heading of its own — the text before a file's first heading — reads
+`(preamble)` where the heading would be.
 
-`tree` is the walk as it happened: every file it visited, and beneath each one every link the
-model judged, in the order the frontier would have taken them — highest scent first, ties broken
-by path. Each link line carries the scent it was given and what the walk did about it:
-`followed` when it queued the link's target, `pruned` when it did not, which is a scent below
-`--threshold`, a target outside `--root`, one past `--max-depth`, or one already reached.
+`tree` is the walk as it happened: every file it visited — the `results` and the `walked` alike
+— and beneath each one every link the model judged, in the order the frontier would have taken
+them, highest scent first, ties broken by path. Each link line carries the scent it was given
+and what the walk did about it: `followed` when it queued the link's target, `pruned` when it
+did not, which is a scent below `--threshold`, a target outside `--root`, one past
+`--max-depth`, or one already reached.
 
 ```bash
 s1m --format tree "how do I cut a release and publish the package" \
@@ -236,36 +261,41 @@ s1m --format tree "how do I cut a release and publish the package" \
 ```text
 how do I cut a release and publish the package (useful-for); 5 files visited, 0 calls
 
-eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.74
-  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.87; relevance 0.62
-    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.89
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.25
+eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.72
+  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.88; relevance 0.78
+    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.32
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.19
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.16
+  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.87; relevance 0.61
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.91
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.24
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.86; relevance 0.77
-    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.31
-    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.18
-  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.84; relevance 0.55
+  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.70; relevance 0.56
     eval/wikis/llm-wiki-manager/wiki/concepts/release.md  pruned; scent 0.90
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md  followed; scent 0.63; relevance 0.27
+  eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md  followed; scent 0.68; relevance 0.27
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.32
     ...
   ...
 ```
 
 The `...` lines are links the walk passed over, elided here; the run prints every one of them.
 The tree is where the walk's own answers show. `release.md` is the best page in the list and the
-entry follows the link at 0.86; `dogfooding.md`'s stronger-looking link to it, at 0.89, is
+entry follows the link at 0.88; `dogfooding.md`'s stronger-looking link to it, at 0.91, is
 `pruned`, because the file had already been reached and a file is visited once, along the best
 path found to it. The other pruned lines are links the model scored below `--threshold`, which
-is why five files are where the walk spent its calls. Roots are the files no link reached: the
-entry files the caller named, marked `entry file`. A link whose target the model never judged
-prints `scent unknown` — such a link can never be followed, and a 0.00 would read as a judgment
-when none was made.
+is why five files are where the walk spent its calls. A tree with more files on it than the list
+has is the cutoff at work: `node-version-and-types.md` at 0.56 and `init-command.md` at 0.27 are
+walked rather than returned, and they are here because the links under them are how the walk
+reached the rest of the wiki. Roots are the files no link reached: the entry files the caller
+named, marked `entry file`. A link whose target the model never judged prints `scent unknown` —
+such a link can never be followed, and a 0.00 would read as a judgment when none was made.
 
 Both views round scores to two decimals, because they are for reading: `json` is where the
-model's own number lives. Both are rendered from the reading list alone, so either can be
-printed from any list a caller has — including one it assembled itself — and neither can
-disagree with the JSON about a file, a range or a link.
+model's own number lives. Both are rendered from the reading list alone — `md` from `results`,
+`tree` from `results` and `walked` — so either can be printed from any list a caller has,
+including one it assembled itself, and neither can disagree with the JSON about a file, a range
+or a link.
 
 ### Relevance modes
 
@@ -383,8 +413,8 @@ Exit codes:
 
 | Code | Meaning |
 | --- | --- |
-| 0 | The walk reached files beyond the entry files |
-| 1 | Nothing beyond the entry files is in the list: either the model judged the entry files' links and none passed the threshold, or the page a link did reach could not be judged. The JSON is still on stdout, and one line on stderr says so |
+| 0 | The walk reached files beyond the entry files that earned a place |
+| 1 | Nothing beyond the entry files did: `results` is the entry files alone, or empty with the walk under `walked`. Either the model judged the entry files' links and none passed the threshold, or everything the walk reached was a hub — its relevance and every section below `--threshold` — or the page a link did reach could not be judged. The JSON is still on stdout, and one line on stderr says so |
 | 2 | Error: bad flags, an unknown `--mode`, a blank query, no entry file, an entry file that cannot be read, an entry file the root's `.s1mignore` covers, a `.s1mignore` that cannot be read or parsed, a criteria file that cannot be read or holds nothing, a missing `TYPESAFE_API_KEY`, or a run that judged nothing at all. One line on stderr, nothing on stdout — a mistyped flag is the exception, where the usage message is what tells the caller what the flags are |
 
 A file the walk *reached* but could not read is neither an error nor a silent omission: a link
@@ -392,11 +422,10 @@ to a page that is not there is the wiki's business, so it is named on stderr as 
 walk carries on. A page that *is* there but whose judgment failed is the same case: the API
 refusing one page — a state over its budget, a page whose text will not decode — is the wiki's
 business too, so that page is named on stderr as skipped, its links are not followed, and the
-walk keeps what it judged. The exit code is the reading list's, so a walk that got past the
-entry files still exits 0 with one page missing and one line saying which
-([#37](https://github.com/mikekelly/s1m/issues/37)). A run that judged nothing at all — an
-entry file whose judgment failed with no other page reached — is exit 2, because there is no
-list to print.
+walk keeps what it judged ([#37](https://github.com/mikekelly/s1m/issues/37)). A page that was
+judged and earned no place is not an error either: it is under `walked`, with the links it
+offered. Only a run that judged nothing at all — an entry file whose judgment failed with no
+other page reached — is exit 2, because there is no list to print.
 
 ### Environment
 
@@ -440,7 +469,8 @@ free — only because s1m keeps the answers.
 
 That is where the reading list's `calls` comes from. It counts the judgments bought from the
 API, not the files the walk visited: a cold run over three files reports `3`, the same run again
-reports `0` with `visited` unchanged, and `--no-cache` reports a call per file every time. A
+reports `0` with `visited` unchanged and the same files returned, and `--no-cache` reports a call
+per file every time. A
 judgment is one or more requests — a page whose sections and links did not fit one request took
 several — so `calls` is what a run cost in answers, and `s1m score-file` prints the requests
 behind one of them. Two runs that read the
@@ -491,12 +521,13 @@ cargo run --release --bin eval -- \
 ```
 
 The harness walks each query at `--max-files` 10 and 25 and reports, per query and in total:
-recall and precision against the gold set, the tokens an agent would read (the returned ranges,
-the same files whole, and the whole corpus), what the API was asked and what it cost, the same
-numbers for the keyword ranker, the calibration curve of a link's scent against what following
-it reached, a `--threshold` sweep, and the preview experiment
-[#10](https://github.com/mikekelly/s1m/issues/10) deferred — previews off, previews without
-frontmatter, previews as they ship.
+recall and precision against the gold set — the list holds only the files that earn a place, so
+precision is reported over that list and over everything the walk judged — the tokens an agent
+would read (the returned ranges, the same files whole, and the whole corpus), what the API was
+asked and what it cost, the same numbers for the keyword ranker, the calibration curve of a
+link's scent against what following it reached, a `--threshold` sweep, and the preview
+experiment [#10](https://github.com/mikekelly/s1m/issues/10) deferred — previews off, previews
+without frontmatter, previews as they ship.
 
 Nothing about a wiki or a gold set is in the harness: both are paths, so the same command
 measures a private wiki, and the gold set's paths are relative to `--wiki`. The report is
@@ -506,16 +537,18 @@ the same bytes with no key at all, and `--no-cache` with a key buys every judgme
 
 Its headline, in three lines:
 
-- **Recall and precision at `--max-files` 10**: mean recall 0.67, mean precision 0.27 — 23 of the
-  39 wanted pages, over 83 files returned. The budget is not what binds: the walk runs out of
-  links above `--threshold` first, and `--max-files 25` returns 87 files for the same mean recall.
-- **What an agent reads**: 35,245 tokens for the returned ranges, against 72,795 for the same
+- **Recall and precision at `--max-files` 10**: mean recall 0.64, mean precision 0.30 — 22 of the
+  39 wanted pages, over 69 files returned. The cutoff is what moved them: the walk judged 83
+  files and the list returns the 69 that earned a place, which took precision from 0.27 to 0.30
+  and cost one wanted page (0.67 → 0.64). The budget is not what binds: the walk runs out of
+  links above `--threshold` first, and `--max-files 25` judges 87 files for the same numbers.
+- **What an agent reads**: 35,245 tokens for the returned ranges, against 60,174 for the same
   files whole and 346,160 for every page on every query. Reading the returned files whole costs
-  21% of the corpus's text; the section scores take 52% off that, and the ranking 90% off reading
+  17% of the corpus's text; the section scores take 41% off that, and the ranking 90% off reading
   everything.
 - **What it costs**: $0.018798 for the gold set at `--max-files 10` — $0.000940 a query, at 0.19 s
   an answer. On this wiki the keyword ranker finds more and reads far more — recall 0.94 against
-  s1m's 0.67, at 6.9× the tokens.
+  s1m's 0.64, at 6.9× the tokens.
 
 ## Library
 
@@ -532,12 +565,12 @@ the CLI, so they can be driven directly from tests:
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
-| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns the visited files with their relevance, the scent that reached them, the `via` path, their sections (the parser's ranges, in document order) and the outgoing links it judged |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns every file it visited with its relevance, the scent that reached them, the `via` path, their sections (the parser's ranges, in document order) and the outgoing links it judged; `VisitedFile::earns_a_place(threshold)` is the one question the reading list asks of them |
 | `cli::Options` | One run's flags — the query, the entry files, the root and the budgets — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
-| `cli::ReadingList` | The plan's shape, `exit_code()` for the 0/1 decision, and `to_json()` for the JSON view — the other two views are `format::Format::render` |
-| `format::Format` | How a reading list is printed: `Json` as above, `Md` — the same files with the lines worth reading, to read or paste — and `Tree` — the walk's files with every link it judged, each link's scent and whether it was followed. `render(&ReadingList) -> String` is what stdout gets, and both reading views are drawn from the list alone, so a caller can print one it built itself |
+| `cli::ReadingList` | The plan's shape — `results` for the files that earned a place, `walked` for the ones the walk visited without earning one, `visited` counting both — with `exit_code()` for the 0/1 decision, and `to_json()` for the JSON view; the other two views are `format::Format::render` |
+| `format::Format` | How a reading list is printed: `Json` as above, `Md` — the results with the lines worth reading, to read or paste — and `Tree` — every visited file, `walked` included, with every link it judged, each link's scent and whether it was followed. `render(&ReadingList) -> String` is what stdout gets, and both reading views are drawn from the list alone, so a caller can print one it built itself |
 
 `path` and `root` must be given against the same base: both relative to the working directory,
 or both absolute. A link that resolves outside `root` keeps `inRoot: false` so it is never
