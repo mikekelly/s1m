@@ -20,7 +20,7 @@ use s1m::cache::{Cacheable, CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::format::Format;
 use s1m::ignore::{self, Ignore};
-use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevScorer, KeepRule, Mode};
+use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevScorer, KeepRule, Mode, Wording};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 use s1m::traverse::Admission;
@@ -156,6 +156,18 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     criteria: Option<PathBuf>,
 
+    /// Ask the three questions in another register, leaving the criterion
+    /// alone: each name is a wording [`s1m::jev`] states, and the default is
+    /// the wording that ships.
+    ///
+    /// Hidden: the experiment in https://github.com/mikekelly/s1m/issues/52,
+    /// not the CLI's interface. This flag and `--mode` compose rather than
+    /// conflict — one picks what counts as relevant, the other how the
+    /// questions about it are put — and the reading list reports the criterion's
+    /// name, not the wording's.
+    #[arg(long, value_name = "NAME", value_enum, hide = true)]
+    wording: Option<WordingArg>,
+
     /// The directory that bounds the walk; a link resolving outside it is not
     /// followed. Defaults to the first entry file's directory.
     #[arg(long, value_name = "DIR")]
@@ -255,6 +267,45 @@ impl ModeArg {
     }
 }
 
+/// The wording `--wording` picks, spelled as [`s1m::jev::Wording::name`] spells
+/// it. The wording itself — the sentences each one sends — lives in that module;
+/// this is only the flag's vocabulary, and clap rejects anything else with the
+/// usage message, exit 2.
+///
+/// Hidden like the flag: the experiment [#52] measured these as, not a caller's
+/// choice.
+///
+/// [#52]: https://github.com/mikekelly/s1m/issues/52
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum WordingArg {
+    Navigator,
+    Path,
+    SharpNo,
+    Rules,
+    Necessity,
+    Task,
+    ReaderAction,
+    AnswerBearing,
+    Reader,
+}
+
+impl WordingArg {
+    /// The wording itself.
+    fn wording(self) -> Wording {
+        match self {
+            WordingArg::Navigator => Wording::Navigator,
+            WordingArg::Path => Wording::Path,
+            WordingArg::SharpNo => Wording::SharpNo,
+            WordingArg::Rules => Wording::Rules,
+            WordingArg::Necessity => Wording::Necessity,
+            WordingArg::Task => Wording::Task,
+            WordingArg::ReaderAction => Wording::ReaderAction,
+            WordingArg::AnswerBearing => Wording::AnswerBearing,
+            WordingArg::Reader => Wording::Reader,
+        }
+    }
+}
+
 /// How a run's links are judged: the plan's one question per link, or the
 /// spike's one Choice over a page's links ([#47]).
 ///
@@ -344,6 +395,10 @@ enum Command {
         /// same ablation.
         #[arg(long, hide = true)]
         one_hop_links: bool,
+        /// Ask the three questions in another register, the way the hidden
+        /// `--wording` of a query does.
+        #[arg(long, value_name = "NAME", value_enum, hide = true)]
+        wording: Option<WordingArg>,
     },
 }
 
@@ -428,6 +483,7 @@ async fn main() {
             no_preview_headings,
             no_preview_leads,
             one_hop_links,
+            wording,
         }) => {
             let context = Context {
                 previews: !no_previews,
@@ -436,7 +492,7 @@ async fn main() {
                 two_hop: !one_hop_links,
                 ..Context::default()
             };
-            if let Err(error) = score_file(&query, &file, root, context, no_cache).await {
+            if let Err(error) = score_file(&query, &file, root, context, no_cache, wording).await {
                 fail(format!("{error:#}"));
             }
         }
@@ -470,6 +526,10 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     };
 
     let mode = criterion(cli.mode, cli.criteria.as_deref()).unwrap_or_else(|message| fail(message));
+    let mode = match cli.wording {
+        Some(wording) => wording.wording().word(mode),
+        None => mode,
+    };
     let context = cli.context();
     let judge: Box<dyn Judge> = match cli.scorer {
         ScorerArg::Noul => {
@@ -582,6 +642,7 @@ async fn score_file(
     root: Option<PathBuf>,
     context: Context,
     no_cache: bool,
+    wording: Option<WordingArg>,
 ) -> anyhow::Result<()> {
     let root = root.unwrap_or_else(|| {
         file.parent()
@@ -604,6 +665,15 @@ async fn score_file(
     let mut parsed = parse::parse(file, &root)?;
     parsed.links.retain(|link| !ignore.matched(&link.target));
     let jev = context.apply(scorer(&root)?);
+    // This view judges by the default criterion, so a wording re-words it; a
+    // query's mode comes from `--mode` and is worded there.
+    let jev = match wording {
+        Some(wording) => {
+            let mode = wording.wording().word(jev.mode().clone());
+            jev.with_mode(mode)
+        }
+        None => jev,
+    };
     let mode = jev.mode().clone();
 
     let (judgment, source) = if no_cache {

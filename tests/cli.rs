@@ -356,6 +356,121 @@ fn the_hidden_ablation_flags_take_the_state_away() {
     );
 }
 
+/// The hidden `--wording` flag of [#52] is how a register reaches a run: the
+/// run that names none sends the questions that ship, and each name re-words
+/// the three questions and leaves the criterion — and the state, but for the one
+/// register that defines a reader — where they were.
+///
+/// `src/jev.rs`'s tests pin the sentences and the fields each register touches;
+/// this is the flag a person types reaching them, and `--mode` and `--wording`
+/// composing rather than one replacing the other.
+///
+/// [#52]: https://github.com/mikekelly/s1m/issues/52
+#[test]
+fn the_hidden_wording_flag_re_words_the_questions() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    let shipped_link = instructions(entry, "link_0");
+    let shipped_file = instructions(entry, FILE_QUESTION);
+    let shipped_state = entry["state"].clone();
+    assert!(
+        shipped_state.get("reader").is_none(),
+        "the shipped state defines no reader: {shipped_state}"
+    );
+
+    // The click register: the link question, and nothing else.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY, "--wording", "navigator"], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    assert_eq!(
+        instructions(entry, "link_0"),
+        "A person looking for `query` is reading `file`. Would they click `links[0]` next?"
+    );
+    assert_ne!(instructions(entry, "link_0"), shipped_link);
+    assert_eq!(instructions(entry, FILE_QUESTION), shipped_file);
+    assert_eq!(entry["state"], shipped_state, "the wording moved the state");
+
+    // The cross-cutting register: the definition in the state, and every
+    // question about it.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY, "--wording", "reader"], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    assert_eq!(
+        entry["state"]["reader"],
+        json!("an agent that must complete `query` by reading pages")
+    );
+    for id in [FILE_QUESTION, "link_0"] {
+        assert!(
+            instructions(entry, id).contains("`reader`"),
+            "{id} is asked about the reader: {}",
+            instructions(entry, id)
+        );
+    }
+    let mut without_reader = entry["state"].clone();
+    without_reader
+        .as_object_mut()
+        .expect("a state object")
+        .remove("reader");
+    assert_eq!(
+        without_reader, shipped_state,
+        "the reader is all this wording adds to the state"
+    );
+
+    // The file register: the mode's ladder replaced by the reading one.
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let output = run_with(&[QUERY, ENTRY, "--wording", "answer-bearing"], &api, &cache);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    let requests = api.requests();
+    let entry = request_for(&requests, ENTRY);
+    assert_eq!(
+        instructions(entry, FILE_QUESTION),
+        "How much of what `query` needs is in `file` itself, not in the pages it links to?"
+    );
+    assert_eq!(
+        entry["questions"][FILE_QUESTION]["criteria"][3],
+        "all of it — `file` itself holds what `query` needs, whatever it links to."
+    );
+    assert_eq!(instructions(entry, "link_0"), shipped_link);
+
+    // And the two flags compose: the wording says what a link must be on the
+    // way to, and the mode is what it is on the way to.
+    for (mode, wanted) in [
+        ("about", "the pages on the subject of `query`"),
+        ("answers", "the pages that answer `query`"),
+    ] {
+        let api = FakeApi::new(3.0, 0.9, 0.7);
+        let cache = Cache::new();
+        let output = run_with(
+            &[QUERY, ENTRY, "--wording", "path", "--mode", mode],
+            &api,
+            &cache,
+        );
+        assert_eq!(output.status.code(), Some(0), "{mode}: {}", stderr(&output));
+
+        let requests = api.requests();
+        let entry = request_for(&requests, ENTRY);
+        assert_eq!(
+            instructions(entry, "link_0"),
+            format!("Is `links[0]` on the way from `file` to {wanted}?")
+        );
+    }
+}
+
 /// The request one file was judged in, found by the fixture path it ends with.
 fn request_for<'a>(requests: &'a [Value], page: &str) -> &'a Value {
     requests
