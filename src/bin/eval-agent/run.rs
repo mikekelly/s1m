@@ -260,6 +260,8 @@ pub fn method_flags() -> Vec<String> {
         "--verbose".to_string(),
         "--setting-sources \"\"".to_string(),
         "--settings HOOK".to_string(),
+        "--strict-mcp-config".to_string(),
+        "--disable-slash-commands".to_string(),
         format!("--tools {EXPLORE_TOOLS}"),
         format!("--allowedTools {EXPLORE_TOOLS}"),
         "--permission-prompts none".to_string(),
@@ -813,6 +815,12 @@ pub fn claude_arguments(
         String::new(),
         "--settings".to_string(),
         settings.display().to_string(),
+        // `--setting-sources ""` does not reach the account's own MCP servers
+        // or skills, and those arrive as tools and prompt: on one machine, 58
+        // extra tools and 18 skills, four times the parent's context before it
+        // has read a word of the wiki. What is being measured is the wiki.
+        "--strict-mcp-config".to_string(),
+        "--disable-slash-commands".to_string(),
         "--tools".to_string(),
         tools.to_string(),
         "--allowedTools".to_string(),
@@ -1456,6 +1464,23 @@ mod tests {
                 arguments.iter().filter(|flag| *flag == "Task").count(),
                 2,
                 "--tools and --allowedTools both name them: {arguments:?}"
+            );
+        }
+    }
+
+    /// The agent must measure the wiki, not the machine it is run on. Without
+    /// `--safe-mode` — which the hook rules out — the operator's own Claude
+    /// Code installation walks in: on the machine this was written on, 18
+    /// skills, 53 commands, 4 connected MCP servers and 58 extra tools, which
+    /// put the parent's first turn at 57k tokens against 12.6k without them.
+    /// That is the operator's context being measured as the wiki's.
+    #[test]
+    fn the_operators_own_installation_is_shut_out() {
+        let arguments = claude_arguments("ask", "Read", None, Path::new("/run/settings.json"));
+        for flag in ["--strict-mcp-config", "--disable-slash-commands"] {
+            assert!(
+                arguments.contains(&flag.to_string()),
+                "{flag}: {arguments:?}"
             );
         }
     }

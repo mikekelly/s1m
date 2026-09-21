@@ -154,7 +154,15 @@ subagent is failed for the same reason.
 The agent runs with `--setting-sources ""`, `--settings <the file above>` and
 `--permission-prompts none`, so anything that would prompt is denied rather
 than hanging. **Not `--safe-mode`**: it disables hooks, and the hook is the
-mechanism. `--setting-sources ""` is what keeps the wiki's own configuration
+mechanism. `--strict-mcp-config` and `--disable-slash-commands` go with it, because
+`--setting-sources ""` does **not** reach the account's own MCP servers or
+skills and `--safe-mode` used to: on one machine they arrived as 58 extra
+tools, 18 skills and 53 commands, putting the parent's first turn at 57k
+tokens against 12.6k — the operator's installation being measured as the
+wiki. With all three flags the session reports 4 tools, 0 skills, 0 MCP
+servers, and the Explore agent is still there.
+
+`--setting-sources ""` is what keeps the wiki's own configuration
 out, and on 2.1.278 that includes its `CLAUDE.md` — verified three ways on a
 throwaway wiki holding a `CLAUDE.md` with a distinctive instruction: with the
 default flags the agent quoted the instruction and obeyed it; with
