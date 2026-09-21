@@ -38,7 +38,7 @@
 //! - 0 when the walk reached a file beyond the entry files that earned a place,
 //!   which is a reading list the caller could not have written itself.
 //! - 1 when it did not: `results` is entry files alone, or empty with the walk
-//!   in [`ReadingList::visited`]. The model judged the entry files' links and
+//!   in [`ReadingList::walked`]. The model judged the entry files' links and
 //!   none passed, or everything it reached was a hub, or the page one of them
 //!   reached could not be judged. The list is still printed — a caller that
 //!   wants it gets it — with one line on stderr saying why the code is not 0.

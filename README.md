@@ -190,7 +190,7 @@ Both lists are elided for length: the run returns three results and reports two 
 | `--criteria` | none | A file whose content is the criterion, in place of `--mode` |
 | `--max-files` | 25 | Files visited before the walk stops. The eval shows the threshold binding first on a wiki this size: 25 returns the same mean recall as 10 over four more files, and a bigger corpus is unmeasured ([numbers](eval/REPORT.md#results-at-a-fixed-file-budget)) |
 | `--max-depth` | 6 | Link hops from an entry file |
-| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.67 to 0.72 for 39% more reading, 0.7 drops it to 0.53 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
+| `--threshold` | 0.6 | Least link scent that queues a target, least relevance or section score that earns a file a place in the list, 0 to 1. The knee of the eval's sweep: 0.5 lifts mean recall from 0.64 to 0.72 for 39% more reading, 0.7 drops it to 0.47 for 26% less ([numbers](eval/REPORT.md#the-default-threshold)) |
 | `--root` | the first entry file's directory | Bounds the walk: a link resolving outside it is not followed |
 | `--no-cache` | off | Call Jev for every file, ignoring the answers on disk |
 | `--format` | `json` | `json` (the list above), `md` (what to read: the results, with the lines worth reading) or `tree` (the walk's link tree, `walked` files included) |
@@ -351,8 +351,8 @@ separates a page which says nothing from one whose own links point at the answer
 ([docs/spike-notes.md](docs/spike-notes.md)) — so this is part of the request rather than a
 caller's flag. `s1m score-file --no-previews` stays as the spike's control case. The frontmatter
 is the part of a preview most likely to mislead, and the eval put a number on it: dropping the
-frontmatter costs 0.21 of mean recall (0.67 → 0.46) for 43% of the input tokens saved, and
-dropping previews altogether costs 0.28, so the frontmatter is the larger half of what a preview
+frontmatter costs 0.18 of mean recall (0.64 → 0.46) for 43% of the input tokens saved, and
+dropping previews altogether costs 0.26, so the frontmatter is the larger half of what a preview
 buys — `related:` is why ([eval/REPORT.md](eval/REPORT.md#the-preview-experiment-frontmatter)).
 
 Every part of a preview is bounded, because a preview is a hint about a target and the target is

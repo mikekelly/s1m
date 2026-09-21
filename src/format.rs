@@ -639,6 +639,55 @@ wiki/index.md  entry file; relevance 0.42
         );
     }
 
+    /// The other way round: a result can be the file that reached a walked page.
+    /// The tree nests it there all the same, because the line a file hangs from
+    /// is the link that reached it and not whether it earned a place — and the
+    /// walked page is printed once, under that link.
+    #[test]
+    fn tree_nests_a_walked_file_under_the_result_that_reached_it() {
+        let list = listing(
+            vec![
+                linking(
+                    reached("wiki/payments/README.md", 0.81, 0.86, &["wiki/index.md"]),
+                    &[("wiki/notes/ledger.md", Some(0.72), true)],
+                ),
+                reached(
+                    "wiki/payments/settlement.md",
+                    0.94,
+                    0.88,
+                    &["wiki/index.md"],
+                ),
+            ],
+            vec![
+                walked(linking(
+                    entry("wiki/index.md", 0.42),
+                    &[
+                        ("wiki/payments/settlement.md", Some(0.88), true),
+                        ("wiki/payments/README.md", Some(0.86), true),
+                    ],
+                )),
+                walked(reached(
+                    "wiki/notes/ledger.md",
+                    0.55,
+                    0.72,
+                    &["wiki/payments/README.md"],
+                )),
+            ],
+        );
+
+        assert_eq!(
+            Format::Tree.render(&list),
+            "\
+settlement timing (useful-for); 4 files visited, 4 calls
+
+wiki/index.md  entry file; relevance 0.42
+  wiki/payments/settlement.md  followed; scent 0.88; relevance 0.94
+  wiki/payments/README.md  followed; scent 0.86; relevance 0.81
+    wiki/notes/ledger.md  followed; scent 0.72; relevance 0.55
+"
+        );
+    }
+
     // ---------------------------------------------------------------- tree
 
     /// The plan's tree: every judged link on its own line with its scent and
