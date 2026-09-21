@@ -1,16 +1,21 @@
 {
-  "note": "Twenty queries over the vendored llm-wiki-manager vault, written by reading the wiki: for each, the pages a person with that task would want open. Paths are relative to --wiki, so the same harness measures any wiki against its own gold set. A page that is useful and unlisted costs precision, so precision is a lower bound and no label here says a page is useless.",
+  "note": "Twenty queries over the vendored llm-wiki-manager vault, written by reading the wiki: for each, the pages a person with that task would want open. Paths are relative to --wiki, so the same harness measures any wiki against its own gold set. A page that is useful and unlisted costs precision, so precision is a lower bound and no label here says a page is useless. Each query also carries a `category`, which is how eval-agent groups its results; the older `eval` binary ignores it.",
   "queries": [
     {
       "id": "release-and-publish",
+      "category": "how-to",
       "query": "how do I cut a release and publish the package",
       "mode": "useful-for",
       "entry": "index.md",
-      "expected": ["concepts/release.md", "concepts/node-version-and-types.md"],
+      "expected": [
+        "concepts/release.md",
+        "concepts/node-version-and-types.md"
+      ],
       "note": "release.md is the wiki's page on releasing (it points at RELEASING.md for the runbook); node-version-and-types.md covers the release workflow's Node pin and the gate chain a release runs."
     },
     {
       "id": "init-scaffold",
+      "category": "how-to",
       "query": "how does init scaffold a wiki into a new project",
       "mode": "useful-for",
       "entry": "index.md",
@@ -23,62 +28,87 @@
     },
     {
       "id": "init-copies",
+      "category": "lookup",
       "query": "which files does init copy into a consumer project",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["concepts/template-system.md", "entities/templates.md"],
+      "expected": [
+        "concepts/template-system.md",
+        "entities/templates.md"
+      ],
       "note": "templates/ is the scaffold source of truth; template-system.md is why and how it is copied."
     },
     {
       "id": "node-runtime-floor",
+      "category": "lookup",
       "query": "what node version must consumers run the CLI on",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["concepts/node-version-and-types.md"],
+      "expected": [
+        "concepts/node-version-and-types.md"
+      ],
       "note": "The runtime floor (engines.node) against the development pin (.nvmrc) is one page."
     },
     {
       "id": "types-alignment",
+      "category": "rationale",
       "query": "why must @types/node match the .nvmrc major",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["concepts/node-version-and-types.md"],
+      "expected": [
+        "concepts/node-version-and-types.md"
+      ],
       "note": "Same page as the floor, asked for the rule rather than the number."
     },
     {
       "id": "wiki-validation",
+      "category": "how-to",
       "query": "what validates wiki pages before a commit lands",
       "mode": "useful-for",
       "entry": "index.md",
-      "expected": ["concepts/wiki-scripts.md", "concepts/dogfooding.md"],
+      "expected": [
+        "concepts/wiki-scripts.md",
+        "concepts/dogfooding.md"
+      ],
       "note": "wiki-scripts.md is the lint/build/check subcommands; dogfooding.md is the pre-commit and pre-push hooks that run them."
     },
     {
       "id": "wiki-code-sync",
+      "category": "how-to",
       "query": "how does the wiki stay in sync with code changes",
       "mode": "useful-for",
       "entry": "index.md",
-      "expected": ["concepts/dogfooding.md"],
+      "expected": [
+        "concepts/dogfooding.md"
+      ],
       "note": "The maintenance-trigger workflow and code_refs are the answer, and dogfooding.md is where it is described."
     },
     {
       "id": "compiled-cli-tests",
+      "category": "lookup",
       "query": "which tests exercise the compiled CLI binary",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["concepts/e2e-tests.md", "concepts/unit-tests.md"],
+      "expected": [
+        "concepts/e2e-tests.md",
+        "concepts/unit-tests.md"
+      ],
       "note": "e2e-tests.md runs the built binary; unit-tests.md says which of its script tests invoke dist/bin/cli.js."
     },
     {
       "id": "run-unit-tests",
+      "category": "how-to",
       "query": "how do I run the unit test suite",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["concepts/unit-tests.md"],
+      "expected": [
+        "concepts/unit-tests.md"
+      ],
       "note": "One command and the config it reads."
     },
     {
       "id": "upgrade-preserves",
+      "category": "how-to",
       "query": "how does upgrade refresh an existing wiki without overwriting user pages",
       "mode": "answers",
       "entry": "index.md",
@@ -91,46 +121,67 @@
     },
     {
       "id": "source-layout",
+      "category": "orientation",
       "query": "what is the layout of the package source",
       "mode": "about",
       "entry": "index.md",
-      "expected": ["concepts/repo-layout.md"],
+      "expected": [
+        "concepts/repo-layout.md"
+      ],
       "note": "The table of bin/, src/, templates/, test/ and the dogfooded wiki."
     },
     {
       "id": "flat-entities",
+      "category": "rationale",
       "query": "why is the entities directory flat with no subdirectories",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["AGENTS.md", "schema.md"],
-      "note": "The scope-tag convention is stated in AGENTS.md §3a and specified in schema.md's flat namespace section."
+      "expected": [
+        "AGENTS.md",
+        "schema.md"
+      ],
+      "note": "The scope-tag convention is stated in AGENTS.md \u00a73a and specified in schema.md's flat namespace section."
     },
     {
       "id": "index-tables",
+      "category": "lookup",
       "query": "what generates the index.md tables",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["AGENTS.md", "concepts/wiki-scripts.md"],
+      "expected": [
+        "AGENTS.md",
+        "concepts/wiki-scripts.md"
+      ],
       "note": "AGENTS.md says never to hand-edit them and names build; wiki-scripts.md documents the subcommand."
     },
     {
       "id": "ingest-summary",
+      "category": "how-to",
       "query": "how do I add a summary page for an ingested source artifact",
       "mode": "useful-for",
       "entry": "index.md",
-      "expected": ["AGENTS.md", "schema.md", "raw/raw.md"],
-      "note": "The ingest workflow is in AGENTS.md §7 and schema.md, with the raw tree's hub page as where the artifact goes."
+      "expected": [
+        "AGENTS.md",
+        "schema.md",
+        "raw/raw.md"
+      ],
+      "note": "The ingest workflow is in AGENTS.md \u00a77 and schema.md, with the raw tree's hub page as where the artifact goes."
     },
     {
       "id": "raw-immutable",
+      "category": "lookup",
       "query": "where do immutable source artifacts live",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["raw/raw.md", "schema.md"],
+      "expected": [
+        "raw/raw.md",
+        "schema.md"
+      ],
       "note": "raw/raw.md is the hub of the immutable tree; schema.md gives the directory layout and the never-edit rule."
     },
     {
       "id": "what-is-it",
+      "category": "orientation",
       "query": "what is llm-wiki-manager for",
       "mode": "about",
       "entry": "index.md",
@@ -143,14 +194,18 @@
     },
     {
       "id": "cli-dispatch",
+      "category": "lookup",
       "query": "which module dispatches CLI subcommands",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["entities/cli.md"],
+      "expected": [
+        "entities/cli.md"
+      ],
       "note": "The dispatch table names the handler module for each subcommand."
     },
     {
       "id": "template-vars",
+      "category": "how-to",
       "query": "how are template variables interpolated during scaffolding",
       "mode": "answers",
       "entry": "index.md",
@@ -163,18 +218,26 @@
     },
     {
       "id": "utils-fs",
+      "category": "lookup",
       "query": "what does src/utils/fs.ts handle",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["entities/utils.md", "concepts/template-system.md"],
+      "expected": [
+        "entities/utils.md",
+        "concepts/template-system.md"
+      ],
       "note": "utils.md is the scope overview with the exports; template-system.md is the part of it that copies and interpolates."
     },
     {
       "id": "wiki-log",
+      "category": "lookup",
       "query": "what does the wiki log record",
       "mode": "answers",
       "entry": "index.md",
-      "expected": ["log.md", "AGENTS.md"],
+      "expected": [
+        "log.md",
+        "AGENTS.md"
+      ],
       "note": "log.md is the append-only record itself; AGENTS.md documents the entries it takes (ingest, query, lint, maintenance)."
     }
   ]
