@@ -72,7 +72,7 @@ must not go can say so in [`.s1mignore`](#keeping-paths-out-of-it-s1mignore).
 ## Use
 
 ```bash
-s1m "how do I cut a release and publish the package" \
+S1M_CACHE_DIR=eval/cache s1m "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
 ```
 
@@ -115,63 +115,57 @@ Every path is spelled the way the entry files were given: `--root wiki` with `wi
 gives `wiki/payments/cutoffs.md`, not `payments/cutoffs.md`, and those are the paths a caller
 hands back to its editor. An absolute `--root` gives absolute paths.
 
-This is a real run, the first result in full and the rest elided (it is answered from the
-committed [`eval/cache`](eval/cache), so it reports `"calls": 0`; a cold run of the same query
-buys one answer per file):
+This is a real run: the command above with `S1M_CACHE_DIR=eval/cache` pointing at the committed
+[`eval/cache`](eval/cache), which is why it reports `"calls": 0` — a cold run of the same query
+buys one answer per file. The first result is in full and the rest is elided:
 
 ```json
 {
   "query": "how do I cut a release and publish the package",
   "mode": "useful-for",
   "scorer": "noul",
-  "visited": 6,
+  "visited": 7,
   "calls": 0,
   "results": [
     {
       "path": "eval/wikis/llm-wiki-manager/wiki/concepts/release.md",
-      "relevance": 0.7633333333333333,
-      "scent": 0.89,
+      "relevance": 0.7799999999999999,
+      "scent": 0.9,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
-      "sections": [
-        {
-          "heading": "Release",
-          "lines": [12, 26],
-          "score": 0.76
-        }
-      ],
+      "sections": [],
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
-          "scent": 0.53,
+          "scent": 0.47,
           "followed": false,
           "reason": "below-threshold"
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md",
-          "scent": 0.44,
+          "scent": 0.42,
           "followed": false,
           "reason": "below-threshold"
         },
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
-          "scent": 0.61,
+          "scent": 0.58,
           "followed": false,
-          "reason": "already-reached"
+          "reason": "below-threshold"
         }
       ]
     },
-    … (the entry page, `repo-layout.md` and `dogfooding.md`, the rest of the list)
+    … (the entry page, `repo-layout.md`, `dogfooding.md` and `e2e-tests.md`, the rest of the list)
   ],
   "walked": [
     {
       "path": "eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md",
-      "relevance": 0.5566666666666666,
-      "scent": 0.67,
+      "relevance": 0.5533333333333333,
+      "scent": 0.7,
       "via": ["eval/wikis/llm-wiki-manager/wiki/index.md"],
       "links": [
         {
           "target": "eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md",
-          "scent": 0.84,
+          "scent": 0.85,
           "followed": false,
           "reason": "already-reached"
         },
@@ -183,20 +177,24 @@ buys one answer per file):
 }
 ```
 
-That first result is the whole answer for a caller with this task: `concepts/release.md` lines
-12–26 say the runbook lives in `RELEASING.md` at the repo root and list what it covers —
-branching, semver, tagging, npm Trusted Publishing, the release workflow, the post-release
-sync, troubleshooting and manual fallbacks. Reading the ranges the list returned is enough; the
-rest of the page is a "See also" list, which the model scored 0.14 and the threshold left out.
+The first result is the page this query is about: `concepts/release.md`, at relevance 0.78,
+whose "Release" section says the runbook lives in `RELEASING.md` at the repo root and what it
+covers — branching, semver, tagging, npm Trusted Publishing, the release workflow, the
+post-release sync, troubleshooting and manual fallbacks. It is in the list on that relevance
+alone: every section of the page came back below `--threshold`, so `sections` is empty and no
+range is offered for it — the file was scored, and nothing cleared the bar. The one range this
+run returns belongs to its last result: `e2e-tests.md` lines 78–83, its "CI and release"
+section at 0.64, the `release:check` chain a release runs through.
 
-The run visited five files and returned three. `index.md`, the entry file, is a result because
-its "Concepts" section scored 0.62, and `dogfooding.md` because its section scored 0.64 — but
-the two files under `walked` earned neither: `node-version-and-types.md` came back at relevance
-0.56 with no section above the threshold, and `init-command.md` at 0.27. Both are worth walking
-through — they are how the walk reached the rest of the wiki — and neither is worth reading for
-this query, so they carry the path that reached them and the links they judged, and no ranges.
-Both lists are elided for length: the run returns three results and reports two files under
-`walked`.
+The run visited seven files and returned five. `index.md`, the entry file, is a result on its
+relevance of 0.74, as are `repo-layout.md` at 0.66 and `dogfooding.md` at 0.60; `e2e-tests.md`
+is the last of them because its section cleared the threshold while its relevance of 0.44 did
+not — the two halves of the rule that earns a place, in one list. The two files under `walked`
+earned neither: `node-version-and-types.md` came back at relevance 0.55 with no section above
+the threshold, and `template-system.md` at 0.31. Both are worth walking through — they are how
+the walk reached the rest of the wiki — and neither is worth reading for this query, so they
+carry the path that reached them and the links they judged, and no ranges. Both lists are
+elided for length: the run returns five results and reports two files under `walked`.
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
@@ -326,47 +324,53 @@ visited without earning a place is the JSON's `walked` and `tree`'s, not `md`'s 
 walked through, not read — and both views still say how many files were visited.
 
 ```bash
-s1m --format md "how do I cut a release and publish the package" \
+S1M_CACHE_DIR=eval/cache s1m --format md "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
 ```
 
 ```markdown
 # Reading list: how do I cut a release and publish the package
 
-Criterion: useful-for; 6 files visited, 0 calls
+Criterion: useful-for; 7 files visited, 0 calls
 
 ## 1. `eval/wikis/llm-wiki-manager/wiki/concepts/release.md`
 
-relevance 0.76; scent 0.89; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.78; scent 0.90; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 12-26, score 0.76, Release
+- nothing above --threshold
 
 ## 2. `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-relevance 0.76; entry file
+relevance 0.74; entry file
 
 - nothing above --threshold
 
 ## 3. `eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md`
 
-relevance 0.66; scent 0.75; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.66; scent 0.78; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 55-66, score 0.61, Toolchain
+- nothing above --threshold
 
 ## 4. `eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md`
 
-relevance 0.60; scent 0.80; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+relevance 0.60; scent 0.82; via `eval/wikis/llm-wiki-manager/wiki/index.md`
 
-- lines 32-41, score 0.62, README vs wiki
+- nothing above --threshold
+
+## 5. `eval/wikis/llm-wiki-manager/wiki/concepts/e2e-tests.md`
+
+relevance 0.44; scent 0.64; via `eval/wikis/llm-wiki-manager/wiki/index.md`
+
+- lines 78-83, score 0.64, CI and release
 ```
 
 This is that query from the cache, so it reports no calls and its digits are the stored answers;
-`md` is the same reading list either way. It prints the four files the JSON returns and none of
+`md` is the same reading list either way. It prints the five files the JSON returns and none of
 the two it walked: `node-version-and-types.md` and `template-system.md` earned no place, so they
 are not something to paste into a task, and the header still says how many files the walk
 visited. A result whose sections all fell below `--threshold` says so in place of a section line
-— the entry page above — and a section with no heading of its own, the text before a file's first
-heading, reads `(preamble)` where the heading would be.
+— four of the five above — and a section with no heading of its own, the text before a file's
+first heading, reads `(preamble)` where the heading would be.
 
 `tree` is the walk as it happened: every file it visited — the `results` and the `walked` alike
 — and beneath each one every link the model judged, in the order the frontier would have taken
@@ -388,41 +392,48 @@ what misled two analyses of runs like the one below. A `followed` link with no l
 the other half of the same thing: the target was queued, and the walk stopped before its turn.
 
 ```bash
-s1m --format tree "how do I cut a release and publish the package" \
+S1M_CACHE_DIR=eval/cache s1m --format tree "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
 ```
 
 ```text
-how do I cut a release and publish the package (useful-for); 6 files visited, 0 calls
+how do I cut a release and publish the package (useful-for); 7 files visited, 0 calls
 
-eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.76
-  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.89; relevance 0.76
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.61
-    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.53
-    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.44
-  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.80; relevance 0.60
+eval/wikis/llm-wiki-manager/wiki/index.md  entry file; relevance 0.74
+  eval/wikis/llm-wiki-manager/wiki/concepts/release.md  followed; scent 0.90; relevance 0.78
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.58
+    eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  pruned; scent 0.47
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  pruned; scent 0.42
+  eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  followed; scent 0.82; relevance 0.60
     eval/wikis/llm-wiki-manager/wiki/concepts/release.md  already reached; scent 0.92
-    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.81
+    eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  pruned; scent 0.80
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  followed; scent 0.75; relevance 0.66
+  eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  followed; scent 0.78; relevance 0.66
     eval/wikis/llm-wiki-manager/wiki/concepts/release.md  already reached; scent 0.93
-    eval/wikis/llm-wiki-manager/wiki/concepts/template-system.md  followed; scent 0.65; relevance 0.29
-      eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.85
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  already reached; scent 0.77
+    eval/wikis/llm-wiki-manager/wiki/concepts/template-system.md  followed; scent 0.72; relevance 0.31
+      eval/wikis/llm-wiki-manager/wiki/concepts/repo-layout.md  already reached; scent 0.86
       ...
     ...
-  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.67; relevance 0.56
+  eval/wikis/llm-wiki-manager/wiki/concepts/node-version-and-types.md  followed; scent 0.70; relevance 0.55
+    eval/wikis/llm-wiki-manager/wiki/concepts/release.md  already reached; scent 0.92
     ...
+  eval/wikis/llm-wiki-manager/wiki/concepts/e2e-tests.md  followed; scent 0.64; relevance 0.44
+    eval/wikis/llm-wiki-manager/wiki/concepts/dogfooding.md  already reached; scent 0.76
+    eval/wikis/llm-wiki-manager/wiki/concepts/unit-tests.md  pruned; scent 0.54
+    eval/wikis/llm-wiki-manager/wiki/entities/commands.md  pruned; scent 0.40
+    eval/wikis/llm-wiki-manager/wiki/concepts/init-command.md  pruned; scent 0.31
   ...
 ```
 
 The `...` lines are links the walk passed over, elided here; the run prints every one of them.
 The tree is where the walk's own answers show. `release.md` is the best page in the list and the
-entry follows the link at 0.89; `dogfooding.md`'s stronger-looking link to it, at 0.92, says
+entry follows the link at 0.90; `dogfooding.md`'s stronger-looking link to it, at 0.92, says
 `already reached`, because the file had already been reached and a file is visited once, along
 the best path found to it. The lines marked `pruned` are links the model scored below
-`--threshold`, which is why six files are where the walk spent its calls. A tree with more files
-on it than the list has is the cutoff at work: `node-version-and-types.md` at 0.56 and
-`template-system.md` at 0.29 are walked rather than returned, and they are here because the
+`--threshold`, which is why seven files are where the walk spent its calls. A tree with more files
+on it than the list has is the cutoff at work: `node-version-and-types.md` at 0.55 and
+`template-system.md` at 0.31 are walked rather than returned, and they are here because the
 links under them are how the walk reached the rest of the wiki. Roots are the files no link
 reached: the entry files the caller named, marked `entry file`. A link whose target the model
 never judged prints `scent unknown` — such a link can never be followed, and a 0.00 would read
