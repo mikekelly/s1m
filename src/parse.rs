@@ -163,13 +163,14 @@ pub fn parse(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<ParsedFil
     let starts = line_starts(&source);
     let last_line = line_count(&source);
 
+    let links = links(&scan, path, root);
     let title = scan_title(&scan, path);
     Ok(ParsedFile {
         path: path.to_path_buf(),
         title,
         frontmatter: scan.frontmatter,
         sections: sections(&scan.headings, &source, &starts, scan.body_start, last_line),
-        links: links(&scan, path, root),
+        links,
     })
 }
 
@@ -221,23 +222,25 @@ pub fn preview(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Result<Preview
 
     let source = read(path)?;
     let scan = Scan::of(&source);
+    let headings = scan
+        .headings
+        .iter()
+        .filter(|heading| matches!(heading.level, 2 | 3))
+        .map(|heading| heading.text.clone())
+        .collect();
+    let leads = links(&scan, path, root)
+        .into_iter()
+        .filter(|link| link.in_root)
+        .map(|link| link.anchor)
+        .collect();
 
     Ok(Preview {
         path: path.to_path_buf(),
         title: scan_title(&scan, path),
         frontmatter: scan.frontmatter,
         first_paragraph: scan.first_paragraph,
-        headings: scan
-            .headings
-            .iter()
-            .filter(|heading| matches!(heading.level, 2 | 3))
-            .map(|heading| heading.text.clone())
-            .collect(),
-        leads: links(&scan, path, root)
-            .into_iter()
-            .filter(|link| link.in_root)
-            .map(|link| link.anchor)
-            .collect(),
+        headings,
+        leads,
     })
 }
 

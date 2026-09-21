@@ -21,7 +21,7 @@
 //! changing the builder.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -473,6 +473,20 @@ struct PreviewState {
     leads_to: Option<Vec<String>>,
 }
 
+/// What every post of one file carries whatever its share of the questions:
+/// the query, the file itself, and the path the walk came by when the run names
+/// it. [`JevScorer::pack`] builds one and hands the same one to every post.
+///
+/// It is one value rather than three arguments because the three go in together
+/// — a post that carried the file but not the query would be a post about
+/// nothing — and because they are the same bytes in every post of a file, which
+/// is what [`Fixed::state`] measures once.
+struct Head {
+    query: String,
+    file: FileState,
+    via: Option<Vec<String>>,
+}
+
 /// One file's request: the body to post, or the bodies when the file's sections
 /// and links do not fit the API's state budget in one.
 ///
@@ -748,6 +762,62 @@ pub struct JevScorer {
     preview_leads: bool,
     via_titles: bool,
     two_hop: bool,
+}
+
+/// The link state a request carries, and the phrasing of the link question it
+/// asks.
+///
+/// Every field is one of the switches [#46] measures, and the whole set is what
+/// the CLI's hidden flags and the evaluation harness's variant table are built
+/// from, so the two cannot drift. The default is what ships: a preview with the
+/// frontmatter, one hop, and nothing else — the state the preview experiment of
+/// [#10] settled on.
+///
+/// [#10]: https://github.com/mikekelly/s1m/issues/10
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Context {
+    /// The target's title and first paragraph.
+    pub previews: bool,
+    /// Its frontmatter as well.
+    pub frontmatter: bool,
+    /// Its H2/H3 headings ([`JevScorer::with_preview_headings`]).
+    pub headings: bool,
+    /// The anchor text of its own in-root links
+    /// ([`JevScorer::with_preview_leads`]).
+    pub leads: bool,
+    /// The titles of the pages the walk came through ([`JevScorer::with_via`]).
+    pub via: bool,
+    /// The link question asked about two hops rather than one
+    /// ([`JevScorer::with_two_hop_links`]).
+    pub two_hop: bool,
+}
+
+impl Default for Context {
+    /// What ships.
+    fn default() -> Context {
+        Context {
+            previews: true,
+            frontmatter: true,
+            headings: false,
+            leads: false,
+            via: false,
+            two_hop: false,
+        }
+    }
+}
+
+impl Context {
+    /// A scorer carrying this state.
+    pub fn apply(self, scorer: JevScorer) -> JevScorer {
+        scorer
+            .with_previews(self.previews)
+            .with_preview_frontmatter(self.frontmatter)
+            .with_preview_headings(self.headings)
+            .with_preview_leads(self.leads)
+            .with_via(self.via)
+            .with_two_hop_links(self.two_hop)
+    }
 }
 
 impl JevScorer {
@@ -1052,6 +1122,11 @@ impl JevScorer {
         }
 
         let shares = self.shares(&sections, &links, &fixed);
+        let head = Head {
+            query: query.to_string(),
+            file,
+            via,
+        };
 
         Request {
             posts: shares
@@ -1061,7 +1136,7 @@ impl JevScorer {
                     // The file's Score is about the whole file, so the first
                     // post asks it and later ones do not: three posts would
                     // otherwise buy three answers to one question.
-                    self.post(query, &file, &via, &sections, &links, share, index == 0)
+                    self.post(&head, &sections, &links, share, index == 0)
                 })
                 .collect(),
         }
@@ -1160,9 +1235,7 @@ impl JevScorer {
     /// which is the first post's to ask.
     fn post(
         &self,
-        query: &str,
-        file: &FileState,
-        via: &Option<Vec<String>>,
+        head: &Head,
         sections: &[SectionState],
         links: &[LinkState],
         share: &Share,
@@ -1174,9 +1247,9 @@ impl JevScorer {
         }
 
         let mut state = State {
-            query: query.to_string(),
-            file: file.clone(),
-            via: via.clone(),
+            query: head.query.clone(),
+            file: head.file.clone(),
+            via: head.via.clone(),
             sections: Vec::with_capacity(share.sections.len()),
             links: Vec::with_capacity(share.links.len()),
         };
@@ -1228,7 +1301,10 @@ impl JevScorer {
     /// phrasing of it instead, and takes that phrasing's yes with it.
     fn link_question(&self, index: usize) -> Question {
         let (instructions, yes) = match self.two_hop {
-            true => (&self.mode.link_question_two_hop, self.mode.link_true_two_hop),
+            true => (
+                &self.mode.link_question_two_hop,
+                self.mode.link_true_two_hop,
+            ),
             false => (&self.mode.link_question, self.mode.link_true),
         };
         Question::Noul {
@@ -1418,8 +1494,13 @@ impl JevScorer {
 
 #[async_trait]
 impl Scorer for JevScorer {
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        Ok(self.judge(query, file).await?.judgment)
+    async fn score(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<FileJudgment, ScorerError> {
+        Ok(self.judge(query, file, via).await?.judgment)
     }
 }
 
@@ -1429,8 +1510,13 @@ impl Cacheable for JevScorer {
     type Request = Request;
     type Detail = JevDetail;
 
-    fn request(&self, query: &str, file: &ParsedFile) -> Result<Request, ScorerError> {
-        JevScorer::request(self, query, file)
+    fn request(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<Request, ScorerError> {
+        JevScorer::request(self, query, file, via)
     }
 
     /// The endpoint as well as the body: a proxy and the API can answer one body
@@ -1460,6 +1546,33 @@ fn required_key(value: Option<String>) -> Result<String, ScorerError> {
         Some(key) if !key.trim().is_empty() => Ok(key),
         _ => Err(ScorerError::MissingApiKey),
     }
+}
+
+/// The headings a preview carries: the target's own, in order, at most
+/// [`HEADINGS`] of them and each clamped at [`HEADING_LIMIT`].
+fn headings(headings: Vec<String>) -> Vec<String> {
+    headings
+        .into_iter()
+        .take(HEADINGS)
+        .map(|heading| clamp(&heading, HEADING_LIMIT))
+        .collect()
+}
+
+/// The lead anchors a preview carries: the target's in-root link text, in
+/// order, with an anchor that repeats an earlier one left out, at most [`LEADS`]
+/// of them and each clamped at [`LEAD_LIMIT`].
+///
+/// A page names the same target in its opening sentence, its overview table and
+/// its "see also"; the model reading one anchor three times learns nothing the
+/// first did not say, and the state pays for each copy.
+fn leads_to(leads: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    leads
+        .into_iter()
+        .filter(|lead| seen.insert(lead.clone()))
+        .take(LEADS)
+        .map(|lead| clamp(&lead, LEAD_LIMIT))
+        .collect()
 }
 
 /// `text` cut to at most `limit` characters, on a character boundary, and told
@@ -1833,7 +1946,7 @@ mod tests {
             let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
             api.scorer()
                 .with_mode(mode.clone())
-                .judge(query, &fixture("index.md"))
+                .judge(query, &fixture("index.md"), &[])
                 .await
                 .expect("a judgment");
             sent.push((mode, api.requests().remove(0)));
@@ -1921,7 +2034,7 @@ mod tests {
         let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .with_mode(mode.clone())
-            .judge(query, &fixture("index.md"))
+            .judge(query, &fixture("index.md"), &[])
             .await
             .expect("a judgment");
 
@@ -1970,7 +2083,7 @@ mod tests {
         let file = fixture("index.md");
 
         api.scorer()
-            .judge("how are payments settled", &file)
+            .judge("how are payments settled", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2107,7 +2220,7 @@ mod tests {
         let file = fixture("index.md");
         let outcome = api
             .scorer()
-            .judge("how are payments settled", &file)
+            .judge("how are payments settled", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2169,7 +2282,7 @@ mod tests {
         let mut relevance = Vec::new();
         for _ in 0..3 {
             let outcome = scorer
-                .judge("how are payments settled", &file)
+                .judge("how are payments settled", &file, &[])
                 .await
                 .expect("a judgment");
             relevance.push(outcome.judgment.relevance);
@@ -2177,7 +2290,7 @@ mod tests {
         assert_eq!(relevance, [1.0, 0.5, 0.0]);
 
         let outcome = scorer
-            .judge("how are payments settled", &file)
+            .judge("how are payments settled", &file, &[])
             .await
             .expect("a judgment");
         assert_eq!(outcome.detail.relevance_level, 3.0, "answers cycle again");
@@ -2188,7 +2301,7 @@ mod tests {
     async fn a_link_without_a_readable_target_is_judged_from_its_own_text() {
         let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
-            .judge("how are payments settled", &fixture("index.md"))
+            .judge("how are payments settled", &fixture("index.md"), &[])
             .await
             .expect("a judgment");
 
@@ -2225,7 +2338,7 @@ mod tests {
         let file = fixture("notes/reading.md");
         let outcome = api
             .scorer()
-            .judge("what is there to read", &file)
+            .judge("what is there to read", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2269,7 +2382,7 @@ mod tests {
 
         let outcome = api
             .scorer()
-            .judge("what is there to read", &file)
+            .judge("what is there to read", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2307,7 +2420,7 @@ mod tests {
 
         let outcome = api
             .scorer()
-            .judge("what is there to read", &file)
+            .judge("what is there to read", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2329,7 +2442,7 @@ mod tests {
         let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .with_previews(false)
-            .judge("how are payments settled", &fixture("index.md"))
+            .judge("how are payments settled", &fixture("index.md"), &[])
             .await
             .expect("a judgment");
 
@@ -2356,7 +2469,7 @@ mod tests {
         let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
         api.scorer()
             .with_preview_frontmatter(false)
-            .judge("how are payments settled", &fixture("index.md"))
+            .judge("how are payments settled", &fixture("index.md"), &[])
             .await
             .expect("a judgment");
 
@@ -2380,6 +2493,279 @@ mod tests {
         );
     }
 
+    /// The `headings` experiment of [#46]: the target's own H2s and H3s, in
+    /// order, in its preview. The H1 is not among them — the preview's title
+    /// already carries it — and a target with no preview carries none either.
+    ///
+    /// Off, the key is absent, which is what keeps every request the harness's
+    /// committed cache holds a hit: the state of a run that asks for none of
+    /// this is the state it was.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_targets_headings_can_be_added_to_the_preview() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_preview_headings(true)
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+
+        let links = api.requests().remove(0)["state"]["links"].clone();
+        // The first link is payments/README.md: heading levels 2 and 3, in the
+        // file's own order.
+        assert_eq!(
+            links[0]["target_preview"]["headings"],
+            json!(["Instant payouts", "Windows", "Settlement"])
+        );
+        assert_eq!(INDEX_TARGETS[4], "../outside.md");
+        assert!(
+            links[4]["target_preview"].is_null(),
+            "a link that leaves the root has no preview, so no headings either"
+        );
+
+        // The same page, judged by a run that does not ask: the preview is the
+        // three parts the cache knows about and nothing else.
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        let scorer = api.scorer();
+        assert!(!scorer.preview_headings, "the default is what ships");
+        scorer
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+
+        // payments/settlement.md has frontmatter, so its preview carries every
+        // part the shipping state has and nothing more.
+        let preview = &api.requests()[0]["state"]["links"][2]["target_preview"];
+        let mut keys: Vec<&str> = preview
+            .as_object()
+            .expect("a preview")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["first_paragraph", "frontmatter", "title"]);
+    }
+
+    /// The `leads_to` experiment of [#46]: the anchor text of the target's own
+    /// in-root links, in order and deduped, which is one hop of lookahead past
+    /// the page the link being judged points at.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_targets_own_link_text_can_be_added_to_the_preview() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_preview_leads(true)
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+
+        let links = api.requests().remove(0)["state"]["links"].clone();
+        // payments/README.md links to payouts, then the ledger, then the
+        // cutoffs — twice, once from its prose and once as a wikilink — then to
+        // a window. The repeat is dropped; the link inside its fenced code
+        // block was never a link.
+        assert_eq!(
+            links[0]["target_preview"]["leads_to"],
+            json!(["payouts", "ledger", "cutoffs", "ten minute"])
+        );
+        // payments/cutoffs.md leads on with one wikilink, and the fixture's
+        // index page links to it second.
+        assert_eq!(
+            links[1]["target_preview"]["leads_to"],
+            json!(["settlement"])
+        );
+        assert!(
+            links[1]["target_preview"].get("headings").is_none(),
+            "one knob does not turn the other on"
+        );
+
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+        assert!(
+            api.requests()[0]["state"]["links"][0]["target_preview"]
+                .get("leads_to")
+                .is_none(),
+            "and off, no link carries it"
+        );
+    }
+
+    /// The `via` experiment of [#46]: the titles of the pages the walk came
+    /// through, in order, at the top level of the state.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_path_the_walk_came_by_can_be_named_in_the_state() {
+        let api = FakeApi::new(|_, _| (200, full_reply(2, 8, 2.0)));
+        let via = [
+            PathBuf::from("index.md"),
+            PathBuf::from("payments/README.md"),
+        ];
+        api.scorer()
+            .with_via(true)
+            .judge(
+                "how are payments settled",
+                &fixture("payments/settlement.md"),
+                &via,
+            )
+            .await
+            .expect("a judgment");
+
+        // The titles the reading list would show for those two pages: the
+        // index's frontmatter title, and the H1 of the page that links here.
+        assert_eq!(
+            api.requests()[0]["state"]["via"],
+            json!(["Home", "Payments"])
+        );
+
+        // An entry file has no path, and the state says so rather than saying
+        // nothing: "the walk started here" is not "this run does not say".
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_via(true)
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+        assert_eq!(api.requests()[0]["state"]["via"], json!([]));
+
+        // Off, the state carries no path at all.
+        let api = FakeApi::new(|_, _| (200, full_reply(2, 8, 2.0)));
+        api.scorer()
+            .judge(
+                "how are payments settled",
+                &fixture("payments/settlement.md"),
+                &via,
+            )
+            .await
+            .expect("a judgment");
+        assert!(
+            api.requests()[0]["state"].get("via").is_none(),
+            "the default state is the one the cache holds"
+        );
+    }
+
+    /// The fourth variant of [#46]: the link question asked about two hops, with
+    /// the yes-criterion that matches it. One question's wording changes — the
+    /// file's and the sections' are the mode's, and the no-criterion of a link
+    /// is still what a link that leads nowhere gets.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_link_question_can_be_asked_about_two_hops() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 8, 2.0)));
+        api.scorer()
+            .with_two_hop_links(true)
+            .judge("how are payments settled", &fixture("index.md"), &[])
+            .await
+            .expect("a judgment");
+
+        let questions = api.requests().remove(0)["questions"].clone();
+        for index in 0..INDEX_TARGETS.len() {
+            assert_eq!(
+                questions[&link_question(index)]["instructions"],
+                USEFUL_FOR
+                    .link_question_two_hop
+                    .replace("{index}", &index.to_string()),
+                "link {index} is asked about what it reaches"
+            );
+            assert_eq!(
+                questions[&link_question(index)]["criteria"]["true"],
+                USEFUL_FOR.link_true_two_hop
+            );
+            assert_eq!(
+                questions[&link_question(index)]["criteria"]["false"],
+                USEFUL_FOR.link_false
+            );
+        }
+        assert_eq!(
+            questions[FILE_QUESTION]["instructions"],
+            USEFUL_FOR.file_question.as_ref(),
+            "the file is still judged by the mode"
+        );
+        assert_eq!(
+            questions["section_0"]["instructions"],
+            USEFUL_FOR.section_question.replace("{index}", "0")
+        );
+    }
+
+    /// Each part of the richer state is bounded where [#46] says: 40 headings
+    /// at 80 characters each, 30 lead anchors at 60, and an anchor the target
+    /// repeats sent once. A preview is a hint, and a page that is all headings
+    /// or links is exactly the page whose state has to stay a hint.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn the_headings_and_leads_a_preview_carries_are_bounded() {
+        let api = FakeApi::new(|_, _| (200, full_reply(1, 1, 2.0)));
+        let dir = TempDir::new("bounded-preview");
+        let long = "a phrase that runs on ".repeat(6);
+        let mut target =
+            String::from("# Target\n\nA page with more under it than a preview carries.\n\n");
+        for index in 0..HEADINGS + 5 {
+            target.push_str(&format!("### Heading {index} {long}\n\nText.\n\n"));
+        }
+        for index in 0..LEADS + 10 {
+            // The second link repeats the first link's anchor, word for word:
+            // the same target named twice in a page's prose and its table.
+            let anchor = match index {
+                1 => format!("Lead 0 {long}"),
+                _ => format!("Lead {index} {long}"),
+            };
+            target.push_str(&format!("- [{anchor}](lead-{index}.md)\n"));
+        }
+        let path = dir.path().join("target.md");
+        fs::write(&path, &target).expect("a target page");
+        let hub = dir.path().join("hub.md");
+        fs::write(
+            &hub,
+            "# Hub\n\nA [target](target.md) with a lot under it.\n",
+        )
+        .expect("a hub page");
+
+        let file = parse::parse(&hub, dir.path()).expect("a parse");
+        api.scorer_in(dir.path())
+            .with_preview_headings(true)
+            .with_preview_leads(true)
+            .judge("what is under the target", &file, &[])
+            .await
+            .expect("a judgment");
+
+        let preview = api.requests().remove(0)["state"]["links"][0]["target_preview"].clone();
+        let headings = preview["headings"].as_array().expect("a heading list");
+        assert_eq!(headings.len(), HEADINGS, "the list stops at {HEADINGS}");
+        assert_eq!(
+            headings[0],
+            json!(clamp(&format!("Heading 0 {long}"), HEADING_LIMIT)),
+            "each heading is cut at {HEADING_LIMIT} characters and says so"
+        );
+        assert!(
+            headings[0]
+                .as_str()
+                .is_some_and(|heading| heading.ends_with("[truncated at 80 characters]")),
+            "the cut is visible to the model: {}",
+            headings[0]
+        );
+
+        let leads = preview["leads_to"].as_array().expect("a lead list");
+        assert_eq!(leads.len(), LEADS, "the list stops at {LEADS}");
+        assert_eq!(
+            leads[1],
+            json!(clamp(&format!("Lead 2 {long}"), LEAD_LIMIT)),
+            "the lead whose anchor repeated the one before it is not sent twice"
+        );
+        assert!(
+            leads[1]
+                .as_str()
+                .is_some_and(|lead| lead.ends_with("[truncated at 60 characters]")),
+            "each anchor is cut at {LEAD_LIMIT} characters and says so: {}",
+            leads[1]
+        );
+    }
+
     #[tokio::test]
     async fn an_answer_the_response_omits_is_an_error() {
         let api = FakeApi::new(|_, _| {
@@ -2400,7 +2786,7 @@ mod tests {
 
         let error = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect_err("link 3 has no answer");
         assert!(
@@ -2428,7 +2814,7 @@ mod tests {
 
         let error = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect_err("section 0 has no answer");
         assert!(
@@ -2459,7 +2845,7 @@ mod tests {
 
         let error = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect_err("a score where a noul belongs");
         assert!(
@@ -2490,7 +2876,7 @@ mod tests {
 
         let error = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect_err("a noul where a score belongs");
         assert!(
@@ -2570,6 +2956,88 @@ mod tests {
         );
     }
 
+    /// The richer state is still state ([#46]): a page whose every link carries
+    /// the target's headings and its own link text adds more per link than one
+    /// post holds, so it is split like any other over-budget page — every post
+    /// inside both of the API's budgets, the path the walk came by in each, and
+    /// every link still judged.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    #[tokio::test]
+    async fn a_page_whose_previews_carry_headings_and_leads_is_split_across_posts() {
+        let api = FakeApi::new(|_, request| (200, any_reply(request, 2.0)));
+        let dir = TempDir::new("richer-previews");
+        let mut hub = String::from("# Hub\n\nThe hub page for the runbook.\n\n");
+        for index in 0..160 {
+            let page = format!("target-{index:03}.md");
+            let mut target = format!("# Target {index}\n\nWhat target {index} is about.\n\n");
+            for heading in 0..10 {
+                target.push_str(&format!(
+                    "## Heading {heading} of target {index}, in the page's own words\n\nSomething under it.\n\n"
+                ));
+            }
+            for lead in 0..10 {
+                target.push_str(&format!(
+                    "- [Outbound link {lead} to another page of the wiki](other-{lead}.md)\n"
+                ));
+            }
+            fs::write(dir.path().join(&page), &target).expect("a generated target");
+            hub.push_str(&format!(
+                "- [Target {index}]({page}) — step {index} of the runbook.\n"
+            ));
+        }
+        let path = dir.path().join("hub.md");
+        fs::write(&path, &hub).expect("the hub");
+        let file = parse::parse(&path, dir.path()).expect("a parse");
+        let previous = dir.path().join("previous.md");
+        fs::write(&previous, "# Previous\n\nThe page that reached this one.\n")
+            .expect("the page before");
+
+        let outcome = api
+            .scorer_in(dir.path())
+            .with_preview_headings(true)
+            .with_preview_leads(true)
+            .with_via(true)
+            .judge(
+                "how does step 12 of the runbook work",
+                &file,
+                &[PathBuf::from("previous.md")],
+            )
+            .await
+            .expect("a judgment");
+
+        let requests = api.requests();
+        assert!(
+            whole_state(&requests) > STATE_CHARS,
+            "the fixture's state has to be over one post's budget for this to test the split: {} characters",
+            whole_state(&requests)
+        );
+        assert!(
+            requests.len() > 1,
+            "so it is split: {} posts",
+            requests.len()
+        );
+        for request in &requests {
+            assert_within_budget(request);
+            assert_eq!(
+                request["state"]["via"],
+                json!(["Previous"]),
+                "every post is asked with the path the walk came by"
+            );
+        }
+        assert_eq!(
+            outcome.detail.requests,
+            requests.len(),
+            "what the judgment reports is what it took"
+        );
+        assert_eq!(
+            outcome.judgment.links.len(),
+            file.links.len(),
+            "every link is judged, whichever post asked about it"
+        );
+        assert_eq!(outcome.judgment.sections.len(), file.sections.len());
+    }
+
     /// A hub page whose links are too many for one post is asked in several:
     /// every post inside the state budget, the file in every one, the file's
     /// Score in the first, and every answer still on the link that named it.
@@ -2582,7 +3050,7 @@ mod tests {
 
         let outcome = api
             .scorer()
-            .judge("how do I cut a release", &file)
+            .judge("how do I cut a release", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2670,7 +3138,7 @@ mod tests {
 
         let outcome = api
             .scorer()
-            .judge("how do I cut a release", &file)
+            .judge("how do I cut a release", &file, &[])
             .await
             .expect("a judgment");
 
@@ -2711,7 +3179,7 @@ mod tests {
 
         let error = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect_err("the request is rejected");
         match error {
@@ -2742,7 +3210,7 @@ mod tests {
 
         let outcome = api
             .scorer()
-            .judge("query", &fixture("index.md"))
+            .judge("query", &fixture("index.md"), &[])
             .await
             .expect("the retry is answered");
 
@@ -2764,7 +3232,7 @@ mod tests {
         };
 
         let error = scorer
-            .judge("query", &file)
+            .judge("query", &file, &[])
             .await
             .expect_err("there is nothing to send");
         assert!(matches!(error, ScorerError::Read { .. }), "{error}");
@@ -2783,7 +3251,7 @@ mod tests {
         let scorer = JevScorer::new("test-key", dir.path()).expect("a client");
         let key = |scorer: &JevScorer, query: &str, file: &ParsedFile| {
             scorer
-                .key(&scorer.request(query, file).expect("a request"))
+                .key(&scorer.request(query, file, &[]).expect("a request"))
                 .expect("the key bytes")
         };
         let query = "how are payments settled";
@@ -2856,8 +3324,8 @@ mod tests {
         let cached = CachedScorer::new(api.scorer(), dir.path()).expect("a cache");
         let query = "how are payments settled";
 
-        let first = cached.score(query, &page).await.expect("a judgment");
-        let second = cached.score(query, &page).await.expect("a judgment");
+        let first = cached.score(query, &page, &[]).await.expect("a judgment");
+        let second = cached.score(query, &page, &[]).await.expect("a judgment");
 
         assert_eq!(
             first, second,
@@ -2870,12 +3338,12 @@ mod tests {
         // The page changes, so the stored answer is for text that is no longer
         // there.
         fs::write(&path, "# Home\n\n[one](one.md) and more.\n").expect("an edit");
-        cached.score(query, &page).await.expect("a judgment");
+        cached.score(query, &page, &[]).await.expect("a judgment");
         assert_eq!(api.requests().len(), 2, "an edit is a new request");
 
         // A different query about the same page, too.
         cached
-            .score("how do refunds work", &page)
+            .score("how do refunds work", &page, &[])
             .await
             .expect("a judgment");
         assert_eq!(api.requests().len(), 3, "so is a new query");
@@ -2973,7 +3441,7 @@ mod tests {
 
         let outcome = api
             .scorer_in(dir.path())
-            .judge("how do I cut a release and publish the package", &file)
+            .judge("how do I cut a release and publish the package", &file, &[])
             .await
             .expect("a judgment");
 
@@ -3032,7 +3500,7 @@ mod tests {
 
         let api = FakeApi::new(|_, request| (200, any_reply(request, 1.5)));
         api.scorer_in(dir.path())
-            .judge("how do I cut a release", &file)
+            .judge("how do I cut a release", &file, &[])
             .await
             .expect("a judgment");
 
@@ -3101,6 +3569,8 @@ mod tests {
                     value: "release, runbook".to_string(),
                 }]),
                 first_paragraph: Some("A page about the release runbook.".to_string()),
+                headings: None,
+                leads_to: None,
             }),
         };
         let plain = LinkState {
@@ -3125,6 +3595,7 @@ mod tests {
                 content: content.clone(),
                 ..empty.clone()
             },
+            None,
             Vec::new(),
             vec![link.clone()],
         );
@@ -3154,6 +3625,7 @@ mod tests {
                 content: "ordinary page text".to_string(),
                 ..empty
             },
+            None,
             Vec::new(),
             vec![link],
         );

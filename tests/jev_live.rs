@@ -121,7 +121,10 @@ async fn a_hub_page_is_not_central_but_its_release_link_stands_out() {
     let file = page(&root, "index.md");
     let query = "how do I cut a release and publish the package";
 
-    let outcome = scorer.judge(query, &file).await.expect("the API answers");
+    let outcome = scorer
+        .judge(query, &file, &[])
+        .await
+        .expect("the API answers");
     assert_judged(&file, &outcome.judgment);
 
     assert!(
@@ -154,7 +157,7 @@ async fn the_release_page_is_judged_useful_for_a_release_query() {
     let file = page(&root, "concepts/release.md");
 
     let outcome = scorer
-        .judge("how do I cut a release and publish the package", &file)
+        .judge("how do I cut a release and publish the package", &file, &[])
         .await
         .expect("the API answers");
     assert_judged(&file, &outcome.judgment);
@@ -193,7 +196,7 @@ async fn a_file_with_only_external_links_is_still_judged() {
     let file = page(&root, "initial-plan.md");
 
     let outcome = scorer
-        .judge("how does s1m decide which links to follow", &file)
+        .judge("how does s1m decide which links to follow", &file, &[])
         .await
         .expect("the API answers");
     assert_judged(&file, &outcome.judgment);
@@ -254,7 +257,7 @@ async fn a_hub_page_too_big_for_one_request_is_split_and_answered() {
 
     let file = page(&dir, "hub.md");
     let outcome = scorer
-        .judge("how do I cut a release and publish the package", &file)
+        .judge("how do I cut a release and publish the package", &file, &[])
         .await
         .expect("the API answers every post");
     assert_judged(&file, &outcome.judgment);
@@ -299,8 +302,14 @@ async fn a_second_identical_run_is_answered_from_the_cache() {
     let file = page(&root, "index.md");
     let query = "how do I cut a release and publish the package";
 
-    let first = cached.judge(query, &file).await.expect("the API answers");
-    let second = cached.judge(query, &file).await.expect("the cache answers");
+    let first = cached
+        .judge(query, &file, &[])
+        .await
+        .expect("the API answers");
+    let second = cached
+        .judge(query, &file, &[])
+        .await
+        .expect("the cache answers");
 
     assert!(
         matches!(first, Scored::Called { .. }),
@@ -326,7 +335,7 @@ async fn a_second_identical_run_is_answered_from_the_cache() {
     // A different query is a different question, and is not answered from the
     // entry for this one.
     let other = cached
-        .judge("how are payments settled", &file)
+        .judge("how are payments settled", &file, &[])
         .await
         .expect("the API answers");
     assert!(

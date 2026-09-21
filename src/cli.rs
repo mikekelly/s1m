@@ -177,8 +177,13 @@ impl<S: Scorer> Uncached<S> {
 
 #[async_trait]
 impl<S: Scorer> Scorer for Uncached<S> {
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        let judgment = self.inner.score(query, file).await?;
+    async fn score(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<FileJudgment, ScorerError> {
+        let judgment = self.inner.score(query, file, via).await?;
         self.calls.fetch_add(1, Ordering::Relaxed);
         Ok(judgment)
     }
@@ -660,6 +665,7 @@ mod tests {
             &self,
             _query: &str,
             file: &ParsedFile,
+            _via: &[PathBuf],
         ) -> Result<FileJudgment, ScorerError> {
             if self.refuses(file) {
                 return Err(ScorerError::Status {

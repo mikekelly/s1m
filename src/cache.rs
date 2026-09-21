@@ -61,8 +61,14 @@ pub trait Cacheable: Scorer {
     /// answers were bought earlier, as `src/bin/eval.rs` does.
     type Detail: Send + Sync + Serialize + DeserializeOwned;
 
-    /// Builds the request for one file: the query, the file and its links.
-    fn request(&self, query: &str, file: &ParsedFile) -> Result<Self::Request, ScorerError>;
+    /// Builds the request for one file: the query, the file, its links and the
+    /// path the caller reached it by.
+    fn request(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<Self::Request, ScorerError>;
 
     /// The bytes the answer depends on, and nothing else: the query, the
     /// content, the questions and the model. Equal bytes from two calls must
@@ -209,8 +215,9 @@ impl<S: Cacheable> CachedScorer<S> {
         &self,
         query: &str,
         file: &ParsedFile,
+        via: &[PathBuf],
     ) -> Result<Scored<S::Detail>, ScorerError> {
-        let request = self.inner.request(query, file)?;
+        let request = self.inner.request(query, file, via)?;
         let key = self.key(&request)?;
 
         if let Some((judgment, detail)) = self.load(&key) {
@@ -260,8 +267,13 @@ impl<S: Cacheable> CachedScorer<S> {
 
 #[async_trait::async_trait]
 impl<S: Cacheable> Scorer for CachedScorer<S> {
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        Ok(self.judge(query, file).await?.into_judgment())
+    async fn score(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<FileJudgment, ScorerError> {
+        Ok(self.judge(query, file, via).await?.into_judgment())
     }
 }
 
@@ -348,8 +360,13 @@ mod tests {
 
     #[async_trait]
     impl Scorer for Fake {
-        async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-            let request = self.request(query, file)?;
+        async fn score(
+            &self,
+            query: &str,
+            file: &ParsedFile,
+            via: &[PathBuf],
+        ) -> Result<FileJudgment, ScorerError> {
+            let request = self.request(query, file, via)?;
             Ok(self.call(&request, file).await?.0)
         }
     }
@@ -363,7 +380,12 @@ mod tests {
         /// predictable from the same bytes the key is made of.
         type Detail = u64;
 
-        fn request(&self, query: &str, file: &ParsedFile) -> Result<String, ScorerError> {
+        fn request(
+            &self,
+            query: &str,
+            file: &ParsedFile,
+            _via: &[PathBuf],
+        ) -> Result<String, ScorerError> {
             let content = fs::read_to_string(&file.path).map_err(|source| ScorerError::Read {
                 path: file.path.clone(),
                 source,
@@ -407,8 +429,8 @@ mod tests {
         let (fake, calls) = Fake::new("useful-for");
         let cached = CachedScorer::new(fake, dir.path()).expect("a cache");
 
-        let first = cached.judge("query", &file).await.expect("an answer");
-        let second = cached.judge("query", &file).await.expect("an answer");
+        let first = cached.judge("query", &file, &[]).await.expect("an answer");
+        let second = cached.judge("query", &file, &[]).await.expect("an answer");
 
         assert_eq!(
             first.judgment(),
@@ -441,9 +463,9 @@ mod tests {
         let (fake, calls) = Fake::new("useful-for");
         let cached = CachedScorer::new(fake, dir.path()).expect("a cache");
 
-        cached.judge("query", &file).await.expect("an answer");
+        cached.judge("query", &file, &[]).await.expect("an answer");
         cached
-            .judge("another query", &file)
+            .judge("another query", &file, &[])
             .await
             .expect("an answer");
         assert_eq!(
@@ -454,7 +476,7 @@ mod tests {
 
         let edited = page(&dir, "# Home\n\nMore.\n");
         cached
-            .judge("another query", &edited)
+            .judge("another query", &edited, &[])
             .await
             .expect("an answer");
         assert_eq!(
@@ -469,7 +491,7 @@ mod tests {
         let (other, other_calls) = Fake::new("about");
         let other = CachedScorer::new(other, dir.path()).expect("a cache");
         let scored = other
-            .judge("another query", &edited)
+            .judge("another query", &edited, &[])
             .await
             .expect("an answer");
         assert!(
@@ -488,7 +510,10 @@ mod tests {
         let (fake, calls) = Fake::new("useful-for");
         let cached = CachedScorer::new(fake, dir.path()).expect("a cache");
 
-        let request = cached.inner.request("query", &file).expect("a request");
+        let request = cached
+            .inner
+            .request("query", &file, &[])
+            .expect("a request");
         let entry = cached.entry(&cached.key(&request).expect("a key"));
         let stale = serde_json::to_string(&Entry {
             format: FORMAT + 1,
@@ -501,7 +526,7 @@ mod tests {
         for unreadable in ["{ half a", "", stale.as_str()] {
             fs::write(&entry, unreadable).expect("a written entry");
 
-            let scored = cached.judge("query", &file).await.expect("a judgment");
+            let scored = cached.judge("query", &file, &[]).await.expect("a judgment");
             match scored {
                 Scored::Called { judgment, .. } => {
                     assert_eq!(
@@ -518,7 +543,7 @@ mod tests {
         // The fresh answer replaced the unreadable ones, so the next run is
         // served from disk again.
         assert!(matches!(
-            cached.judge("query", &file).await.expect("an answer"),
+            cached.judge("query", &file, &[]).await.expect("an answer"),
             Scored::Reused { .. }
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 3);

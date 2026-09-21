@@ -20,7 +20,7 @@ use s1m::cache::{CachedScorer, Scored};
 use s1m::cli::{self, Judge, Options, Uncached};
 use s1m::format::Format;
 use s1m::ignore::{self, Ignore};
-use s1m::jev::{self, JevDetail, JevScorer, Mode};
+use s1m::jev::{self, Context, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 
@@ -165,6 +165,26 @@ struct Cli {
     #[arg(long)]
     no_cache: bool,
 
+    /// Send each link target's own H2/H3 headings in its preview. Hidden: the
+    /// experiment [#46] measures, off until it earns its state.
+    #[arg(long, hide = true)]
+    preview_headings: bool,
+
+    /// Send the anchor text of each link target's own in-root links in its
+    /// preview. Hidden: the experiment [#46] measures.
+    #[arg(long, hide = true)]
+    preview_leads: bool,
+
+    /// Name the pages the walk came through in the request's state. Hidden: the
+    /// experiment [#46] measures.
+    #[arg(long, hide = true)]
+    via_titles: bool,
+
+    /// Ask the link question about two hops rather than one. Hidden: the
+    /// experiment [#46] measures.
+    #[arg(long, hide = true)]
+    two_hop_links: bool,
+
     /// How the reading list is printed: `json` for a caller that parses it,
     /// `md` for what to read, `tree` for the walk's link tree.
     #[arg(long, value_name = "FORMAT", value_enum, default_value_t = FormatArg::Json)]
@@ -246,10 +266,39 @@ enum Command {
         /// numbers are this run's rather than the cache's.
         #[arg(long)]
         no_cache: bool,
+        /// Send the target's H2/H3 headings in each link's preview. Hidden: the
+        /// same experiment [#46] the query's hidden flags switch on.
+        #[arg(long, hide = true)]
+        preview_headings: bool,
+        /// Send the anchor text of each target's own in-root links in its
+        /// preview. Hidden, the same experiment.
+        #[arg(long, hide = true)]
+        preview_leads: bool,
+        /// Name the pages the walk came through in the state. Hidden, the same
+        /// experiment; a single file has no walk, so the path is the empty one.
+        #[arg(long, hide = true)]
+        via_titles: bool,
+        /// Ask the link question about two hops rather than one. Hidden, the
+        /// same experiment.
+        #[arg(long, hide = true)]
+        two_hop_links: bool,
     },
 }
 
 impl Cli {
+    /// What the request carries about each link, as the hidden experiment flags
+    /// ask for it ([`Context`]). Every one of them is off by default, so a run
+    /// that names none sends the state that ships.
+    fn context(&self) -> Context {
+        Context {
+            headings: self.preview_headings,
+            leads: self.preview_leads,
+            via: self.via_titles,
+            two_hop: self.two_hop_links,
+            ..Context::default()
+        }
+    }
+
     /// The flags as the run wants them. The mode is the scorer's to name,
     /// because the scorer is what carries the criterion; it is filled in once
     /// one has been built, from `--criteria`'s file when there is one and
@@ -279,8 +328,20 @@ async fn main() {
             root,
             no_previews,
             no_cache,
+            preview_headings,
+            preview_leads,
+            via_titles,
+            two_hop_links,
         }) => {
-            if let Err(error) = score_file(&query, &file, root, !no_previews, no_cache).await {
+            let context = Context {
+                previews: !no_previews,
+                headings: preview_headings,
+                leads: preview_leads,
+                via: via_titles,
+                two_hop: two_hop_links,
+                ..Context::default()
+            };
+            if let Err(error) = score_file(&query, &file, root, context, no_cache).await {
                 fail(format!("{error:#}"));
             }
         }
@@ -314,7 +375,7 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
     };
 
     let mode = criterion(cli.mode, cli.criteria.as_deref()).unwrap_or_else(|message| fail(message));
-    let jev = scorer(&root)?.with_mode(mode);
+    let jev = cli.context().apply(scorer(&root)?).with_mode(mode);
     options.mode = jev.mode().name.to_string();
 
     let judge: Box<dyn Judge> = if cli.no_cache {
@@ -396,7 +457,7 @@ async fn score_file(
     query: &str,
     file: &Path,
     root: Option<PathBuf>,
-    previews: bool,
+    context: Context,
     no_cache: bool,
 ) -> anyhow::Result<()> {
     let root = root.unwrap_or_else(|| {
@@ -419,16 +480,16 @@ async fn score_file(
 
     let mut parsed = parse::parse(file, &root)?;
     parsed.links.retain(|link| !ignore.matched(&link.target));
-    let jev = scorer(&root)?.with_previews(previews);
+    let jev = context.apply(scorer(&root)?);
     let mode = jev.mode().clone();
 
     let (judgment, source) = if no_cache {
-        let outcome = jev.judge(query, &parsed).await?;
+        let outcome = jev.judge(query, &parsed, &[]).await?;
         (outcome.judgment, Source::Uncached(outcome.detail))
     } else {
         let cached = CachedScorer::from_env(jev)?;
         let dir = cached.dir().to_path_buf();
-        match cached.judge(query, &parsed).await? {
+        match cached.judge(query, &parsed, &[]).await? {
             Scored::Called { judgment, detail } => (judgment, Source::Call { dir, detail }),
             Scored::Reused { judgment, .. } => (judgment, Source::Entry(dir)),
         }
@@ -436,7 +497,7 @@ async fn score_file(
 
     print!(
         "{}",
-        report(query, &parsed, &judgment, &mode, previews, &source)
+        report(query, &parsed, &judgment, &mode, context.previews, &source)
     );
     Ok(())
 }

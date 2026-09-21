@@ -10,15 +10,15 @@ s1m ranks a wiki's pages for a query by walking its links, so an agent reads the
 | Price | $0.042 per million input tokens, output free |
 | Walk | `--threshold` 0.6, `--max-depth` 6, 8 frontier files a round |
 | Answers | `eval/cache` |
-| Requests | 567 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
-| Cost | $0.019224 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.123042 |
+| Requests | 1215 behind those answers; more than one per answer means a file whose sections and links did not fit one post |
+| Cost | $0.019224 for the gold set at `--max-files 10`, $0.019640 at `--max-files 25`; every answer this report used, at the list price above, $0.278838 |
 
 ## Headline
 
 - **Recall and precision at `--max-files 10`**: mean recall 0.64, mean precision 0.30 — 22 of the 39 wanted pages are in the list the agent opens, over 71 files returned, 3.5 a query — against 0.27 over everything the walk visited: 85 files judged, 71 of them earned a place, and the rest are what the JSON reports as `walked`. The budget is not what binds: the walk runs out of links above `--threshold` first, and `--max-files 25` visits 87 files for the same mean recall (0.64), 73 of which earn a place, so everything below is a statement about the link graph and the threshold, not about the budget.
 - **The keyword ranker finds more and reads far more**: recall 0.94 against s1m's 0.64, at 243070 tokens against 35771 — 6.8× the reading for 0.30 more of the wanted pages. On a wiki whose pages share their vocabulary with the queries, grep is the stronger recaller and s1m the cheaper reader.
 - **What an agent reads**: 35771 tokens for the returned ranges, against 62085 for the same files whole and 346160 for every page on every query. Reading the returned files whole costs 18% of the corpus's text; the section scores take 42% off that, and the ranking 90% off reading everything.
-- **What it costs**: $0.019224 for the gold set at `--max-files 10` — $0.000961 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.123042. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
+- **What it costs**: $0.019224 for the gold set at `--max-files 10` — $0.000961 a query, at 0.19 s an answer, $0.019640 at `--max-files 25`; every answer this report used, at the price above, $0.278838. The figures are the input tokens the answers spent, priced at the list rate in the header: the cache fixes the tokens, and a rate change re-prices every row, so a rerun reproduces them only while that constant stands.
 - **Where `--threshold` sits**: this report walked at 0.6. Against that walk, the swept thresholds move recall and reading by: 0.5: recall +0.08 and reading +41%; 0.6: recall +0.00 and reading +0%; 0.7: recall -0.18 and reading -27%; 0.8: recall -0.31 and reading -70%. The calibration says the same from the other side — the links the walk followed reach a wanted page 0.37 of the time, the ones it passed over 0.11, and 69 links clear the threshold and are still not followed.
 - **The frontmatter earns its tokens**: dropping it from the preview costs 0.18 of recall (0.64 → 0.46) for -44% of the input tokens, and dropping previews altogether costs 0.26. It is the larger half of what a preview buys, and `related:` is why — on the hub page it is what lifts the links to `dogfooding.md` and `node-version-and-types.md` over the threshold. [#10]'s worry that the frontmatter misleads is the wrong way round on this wiki.
 
@@ -229,6 +229,79 @@ Judging that one page under each policy is the only measurement here that is not
 
 `previews, no frontmatter` against the default, on this page: 4 of 14 links change whether the walk would follow them, and the mean scent moves by 0.21.
 `previews off` against the default, on this page: 3 of 14 links change whether the walk would follow them, and the mean scent moves by 0.21.
+
+## The link context experiment: headings, leads and the path
+
+A link is judged from one hop: the page it sits on, its anchor, its sentence and its heading, and the target's title, frontmatter and first paragraph. The failure analysis on a private wiki ([#36]) found the queries that reached nothing doing it two or three hops out, behind intermediate pages whose preview says nothing about what lies under them. [#46] measures four switches against that, each on its own and in the pairs the decision rule asks about, at `--max-files 10`:
+
+- **`+ headings`**: the target's own H2/H3 headings, in order, at most 40 of them and each cut at 80 characters.
+- **`+ leads_to`**: the anchor text of the target's own in-root links, in order, deduped, at most 30 and each cut at 60 characters — one hop of lookahead past the target.
+- **`+ via`**: the titles of the pages the walk came through, in order, at the top level of the state.
+- **`+ two-hop question`**: the link question reworded to ask what this link reaches directly or through the pages it links to, with the yes-criterion to match. The question is the only thing that changes; every state field is what it was.
+
+| Variant | Recall | Precision | Read (tok) | Input (tok) | Cost | Requests | Req/answer |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| what ships (default) | 0.64 | 0.30 | 35771 | 457709 | $0.019224 | 85 | 1.00 |
+| + headings | 0.72 | 0.33 | 39799 | 511642 | $0.021489 | 89 | 1.00 |
+| + leads_to | 0.70 | 0.28 | 38279 | 524890 | $0.022045 | 91 | 1.00 |
+| + via | 0.61 | 0.27 | 37470 | 474542 | $0.019931 | 85 | 1.00 |
+| + headings + leads_to | 0.69 | 0.29 | 47685 | 596166 | $0.025039 | 97 | 1.00 |
+| + two-hop question | 0.72 | 0.30 | 42042 | 544303 | $0.022861 | 105 | 1.00 |
+| + two-hop question + headings + leads_to | 0.83 | 0.26 | 68663 | 1057882 | $0.044431 | 181 | 1.00 |
+
+`Requests` is what the API was asked over the whole gold set and `Req/answer` the same over the files it judged, so 1.00 is a link table that fits one post: a variant above 1.00 is splitting pages the state budget no longer holds ([#37]). A `Requests` column that rose while `Req/answer` stayed at 1.00 is the other cost — a link the model now rates above `--threshold` is a page the walk visits and pays for, which is where a variant's recall comes from. The fullest variant asks 2.1× what ships does.
+
+Recall per query, the queries the shipped walk found least first:
+
+| Query | Gold | what ships (default) | + headings | + leads_to | + via | + headings + leads_to | + two-hop question | + two-hop question + headings + leads_to |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `flat-entities` | 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `index-tables` | 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 1.00 |
+| `upgrade-preserves` | 3 | 0.00 | 0.67 | 0.00 | 0.00 | 0.67 | 0.33 | 1.00 |
+| `wiki-log` | 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `ingest-summary` | 3 | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 0.33 | 1.00 |
+| `template-vars` | 3 | 0.33 | 0.67 | 1.00 | 0.67 | 0.67 | 1.00 | 1.00 |
+| `raw-immutable` | 2 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 |
+| `release-and-publish` | 2 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 | 0.50 |
+| `wiki-validation` | 2 | 0.50 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `what-is-it` | 3 | 0.67 | 0.67 | 0.67 | 0.67 | 0.67 | 0.67 | 0.67 |
+| `cli-dispatch` | 1 | 1.00 | 1.00 | 1.00 | 0.00 | 1.00 | 1.00 | 1.00 |
+| `compiled-cli-tests` | 2 | 1.00 | 1.00 | 1.00 | 0.50 | 0.50 | 1.00 | 1.00 |
+| `init-copies` | 2 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `init-scaffold` | 3 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `node-runtime-floor` | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `run-unit-tests` | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `source-layout` | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `types-alignment` | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `utils-fs` | 2 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| `wiki-code-sync` | 1 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 | 1.00 |
+| **mean** |  | **0.64** | **0.72** | **0.70** | **0.61** | **0.69** | **0.72** | **0.83** |
+
+Requests per query, the same order: what each variant asked of the API, where the split shows up.
+
+| Query | Gold | what ships (default) | + headings | + leads_to | + via | + headings + leads_to | + two-hop question | + two-hop question + headings + leads_to |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `flat-entities` | 2 | 1 | 1 | 1 | 1 | 1 | 1 | 1 |
+| `index-tables` | 2 | 1 | 1 | 1 | 1 | 1 | 1 | 8 |
+| `upgrade-preserves` | 3 | 1 | 4 | 1 | 1 | 4 | 3 | 8 |
+| `wiki-log` | 2 | 3 | 2 | 2 | 2 | 2 | 3 | 9 |
+| `ingest-summary` | 3 | 4 | 2 | 2 | 2 | 2 | 5 | 10 |
+| `template-vars` | 3 | 5 | 6 | 7 | 6 | 7 | 7 | 11 |
+| `raw-immutable` | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+| `release-and-publish` | 2 | 5 | 4 | 4 | 5 | 5 | 7 | 6 |
+| `wiki-validation` | 2 | 3 | 4 | 4 | 4 | 6 | 4 | 11 |
+| `what-is-it` | 3 | 11 | 11 | 11 | 11 | 11 | 11 | 11 |
+| `cli-dispatch` | 1 | 2 | 2 | 2 | 1 | 2 | 2 | 5 |
+| `compiled-cli-tests` | 2 | 4 | 4 | 6 | 3 | 3 | 4 | 11 |
+| `init-copies` | 2 | 7 | 7 | 8 | 7 | 9 | 8 | 11 |
+| `init-scaffold` | 3 | 11 | 11 | 12 | 11 | 11 | 11 | 11 |
+| `node-runtime-floor` | 1 | 2 | 2 | 3 | 2 | 5 | 3 | 11 |
+| `run-unit-tests` | 1 | 3 | 4 | 4 | 4 | 4 | 4 | 11 |
+| `source-layout` | 1 | 4 | 5 | 4 | 4 | 4 | 7 | 11 |
+| `types-alignment` | 1 | 3 | 3 | 3 | 4 | 3 | 5 | 11 |
+| `utils-fs` | 2 | 4 | 6 | 5 | 5 | 5 | 6 | 11 |
+| `wiki-code-sync` | 1 | 9 | 8 | 9 | 9 | 10 | 11 | 11 |
+| **total** |  | **85** | **89** | **91** | **85** | **97** | **105** | **181** |
 
 ## What these numbers are not
 

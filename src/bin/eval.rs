@@ -58,7 +58,7 @@ use serde::Deserialize;
 
 use s1m::cache::{CachedScorer, Scored};
 use s1m::ignore::Ignore;
-use s1m::jev::{self, JevDetail, JevScorer, Mode};
+use s1m::jev::{self, Context, JevDetail, JevScorer, Mode};
 use s1m::parse::{self, ParsedFile};
 use s1m::scorer::{FileJudgment, Scorer, ScorerError};
 use s1m::traverse::{Config, Failure, traverse};
@@ -84,21 +84,91 @@ const SWEEP: [f64; 4] = [0.5, 0.6, 0.7, 0.8];
 /// How many bins the calibration tables cut 0 to 1 into.
 const BINS: usize = 10;
 
-/// The preview policies the experiment compares: what ships, then each knob
-/// turned off on its own.
-const PREVIEWS: [Preview; 3] = [
-    Preview {
-        previews: true,
-        frontmatter: true,
-    },
-    Preview {
-        previews: true,
-        frontmatter: false,
-    },
-    Preview {
-        previews: false,
-        frontmatter: false,
-    },
+/// The link state that ships: a preview with the frontmatter, one hop, and
+/// none of the switches [#46] measures.
+///
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+const SHIPS: Context = Context {
+    previews: true,
+    frontmatter: true,
+    headings: false,
+    leads: false,
+    via: false,
+    two_hop: false,
+};
+
+/// The preview policies the experiment [#10] compares: what ships, then each
+/// knob turned off on its own.
+///
+/// [#10]: https://github.com/mikekelly/s1m/issues/10
+const PREVIEWS: [(&str, Context); 3] = [
+    ("previews on (default)", SHIPS),
+    (
+        "previews, no frontmatter",
+        Context {
+            frontmatter: false,
+            ..SHIPS
+        },
+    ),
+    (
+        "previews off",
+        Context {
+            previews: false,
+            ..SHIPS
+        },
+    ),
+];
+
+/// The variants [#46] measures, in the report's order: what ships, then each
+/// switch on its own, then the pair the decision rule asks about, then the
+/// two-hop link question and the pair it is asked alongside.
+///
+/// `via` is switched on its own and nowhere else: it names the pages the walk
+/// came through, which is a different question from what the target of a link
+/// holds, and the decision rule does not pair it with the rest.
+///
+/// [#46]: https://github.com/mikekelly/s1m/issues/46
+const CONTEXTS: [(&str, Context); 7] = [
+    ("what ships (default)", SHIPS),
+    (
+        "+ headings",
+        Context {
+            headings: true,
+            ..SHIPS
+        },
+    ),
+    (
+        "+ leads_to",
+        Context {
+            leads: true,
+            ..SHIPS
+        },
+    ),
+    ("+ via", Context { via: true, ..SHIPS }),
+    (
+        "+ headings + leads_to",
+        Context {
+            headings: true,
+            leads: true,
+            ..SHIPS
+        },
+    ),
+    (
+        "+ two-hop question",
+        Context {
+            two_hop: true,
+            ..SHIPS
+        },
+    ),
+    (
+        "+ two-hop question + headings + leads_to",
+        Context {
+            two_hop: true,
+            headings: true,
+            leads: true,
+            ..SHIPS
+        },
+    ),
 ];
 
 // ---------------------------------------------------------------- the command
@@ -571,13 +641,23 @@ struct Billed {
 /// the run spent has to be countable from outside it.
 #[async_trait]
 trait Bill: Send + Sync {
-    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError>;
+    async fn bill(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<Billed, ScorerError>;
 }
 
 #[async_trait]
 impl Bill for JevScorer {
-    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
-        let outcome = self.judge(query, file).await?;
+    async fn bill(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<Billed, ScorerError> {
+        let outcome = self.judge(query, file, via).await?;
         Ok(Billed {
             judgment: outcome.judgment,
             detail: outcome.detail,
@@ -588,8 +668,13 @@ impl Bill for JevScorer {
 
 #[async_trait]
 impl Bill for CachedScorer<JevScorer> {
-    async fn bill(&self, query: &str, file: &ParsedFile) -> Result<Billed, ScorerError> {
-        let scored = self.judge(query, file).await?;
+    async fn bill(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<Billed, ScorerError> {
+        let scored = self.judge(query, file, via).await?;
         let bought = scored.called();
         match scored {
             Scored::Reused { judgment, detail } | Scored::Called { judgment, detail } => {
@@ -633,8 +718,13 @@ impl Metered {
 
 #[async_trait]
 impl Scorer for Metered {
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        let billed = self.inner.bill(query, file).await?;
+    async fn score(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<FileJudgment, ScorerError> {
+        let billed = self.inner.bill(query, file, via).await?;
         self.lock().add(&billed.detail, billed.bought);
         Ok(billed.judgment)
     }
@@ -766,25 +856,6 @@ impl Run {
 
 // ------------------------------------------------------------------ the walk
 
-/// One preview policy: what a request carries about each link's target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Preview {
-    /// The target's title and first paragraph.
-    previews: bool,
-    /// Its frontmatter as well.
-    frontmatter: bool,
-}
-
-impl Preview {
-    fn label(&self) -> &'static str {
-        match (self.previews, self.frontmatter) {
-            (true, true) => "previews on (default)",
-            (true, false) => "previews, no frontmatter",
-            (false, _) => "previews off",
-        }
-    }
-}
-
 /// Where answers come from.
 enum Cache {
     /// `--no-cache`: every judgment is bought.
@@ -839,10 +910,10 @@ impl Env<'_> {
         &self,
         query: &Query,
         budget: usize,
-        preview: Preview,
+        context: Context,
         threshold: f64,
     ) -> Result<Run, String> {
-        let meter = self.scorer(query, preview)?;
+        let meter = self.scorer(query, context)?;
         // The entry is spelled the way a caller spells it — the root joined on,
         // `wiki/index.md` for a root of `wiki` — because that is what a walk
         // normalises against its root. Everything a walk hands back is relative
@@ -941,19 +1012,20 @@ impl Env<'_> {
         })
     }
 
-    /// The scorer one query needs: its mode's questions, the preview policy,
-    /// and the cache or none.
+    /// The scorer one query needs: its mode's questions, the link state the
+    /// variant asks for, and the cache or none.
     ///
     /// [`jev::ENDPOINT_VAR`] points the calls somewhere else, the way it does
     /// for the CLI — a proxy, or a fake server. The endpoint is part of the
     /// cache key, so a harness run against a proxy never reads the answers a run
     /// against the API stored, and the other way round.
-    fn scorer(&self, query: &Query, preview: Preview) -> Result<Metered, String> {
-        let mut jev = JevScorer::new(self.key.clone(), self.root)
-            .map_err(|error| format!("{}: {error}", query.id))?
-            .with_mode(query.mode()?)
-            .with_previews(preview.previews)
-            .with_preview_frontmatter(preview.frontmatter);
+    fn scorer(&self, query: &Query, context: Context) -> Result<Metered, String> {
+        let mut jev = context
+            .apply(
+                JevScorer::new(self.key.clone(), self.root)
+                    .map_err(|error| format!("{}: {error}", query.id))?,
+            )
+            .with_mode(query.mode()?);
         if let Some(endpoint) = std::env::var(jev::ENDPOINT_VAR)
             .ok()
             .filter(|endpoint| !endpoint.trim().is_empty())
@@ -1072,12 +1144,19 @@ struct Findings {
     grep: Vec<(usize, Vec<Run>)>,
     /// The sweep, at the smallest budget.
     sweep: Vec<(f64, Vec<Run>)>,
-    /// The preview experiment, at the smallest budget. The first is the run the
-    /// gold set already made; the other two are their own walks.
-    previews: Vec<(Preview, Vec<Run>)>,
+    /// The preview experiment, at the smallest budget, under the report's own
+    /// names. The first is the run the gold set already made; the other two are
+    /// their own walks.
+    previews: Vec<(&'static str, Vec<Run>)>,
+    /// The richer link-state variants of [#46], the same way: one walk per
+    /// variant at the smallest budget, the first of them the run the gold set
+    /// already made.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    contexts: Vec<(&'static str, Vec<Run>)>,
     /// One query's entry page under each preview policy: what each knob does to
     /// one page's link scents.
-    scents: Vec<(Preview, Vec<(PathBuf, f64)>)>,
+    scents: Vec<(&'static str, Vec<(PathBuf, f64)>)>,
     /// Which query and page those scents are.
     scents_of: Option<(String, PathBuf)>,
     /// Everything this report cost, experiment and sweep included.
@@ -1137,9 +1216,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for budget in &budgets {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env
-                .walk(query, *budget, PREVIEWS[0], args.threshold)
-                .await?;
+            let run = env.walk(query, *budget, SHIPS, args.threshold).await?;
             total.merge(&run.spent);
             runs.push(run);
         }
@@ -1163,25 +1240,26 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     for threshold in SWEEP {
         let mut runs = Vec::with_capacity(gold.queries.len());
         for query in &gold.queries {
-            let run = env.walk(query, tight, PREVIEWS[0], threshold).await?;
+            let run = env.walk(query, tight, SHIPS, threshold).await?;
             total.merge(&run.spent);
             runs.push(run);
         }
         sweep.push((threshold, runs));
     }
 
-    // The default preview policy is what the gold set already walked at the
-    // tight budget: re-walking it would be free, and would report no cost, so
-    // the run that paid for it is the one the experiment shows.
-    let mut previews = vec![(PREVIEWS[0], at[0].1.clone())];
-    for preview in PREVIEWS.iter().skip(1) {
-        let mut runs = Vec::with_capacity(gold.queries.len());
-        for query in &gold.queries {
-            let run = env.walk(query, tight, *preview, args.threshold).await?;
-            total.merge(&run.spent);
-            runs.push(run);
-        }
-        previews.push((*preview, runs));
+    // What ships is what the gold set already walked at the tight budget:
+    // re-walking it would be free, and would report no cost, so the run that
+    // paid for it is the one the experiment shows.
+    let mut previews = vec![(PREVIEWS[0].0, at[0].1.clone())];
+    // The link-state variants of #46, the first of them the same run again.
+    let mut contexts = vec![(CONTEXTS[0].0, at[0].1.clone())];
+    for (label, context) in PREVIEWS.iter().skip(1) {
+        let runs = experiment(&env, &gold, tight, *context, args.threshold, &mut total).await?;
+        previews.push((*label, runs));
+    }
+    for (label, context) in CONTEXTS.iter().skip(1) {
+        let runs = experiment(&env, &gold, tight, *context, args.threshold, &mut total).await?;
+        contexts.push((*label, runs));
     }
 
     // One page's links under each policy, which is the same question at the
@@ -1217,6 +1295,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
         grep,
         sweep,
         previews,
+        contexts,
         scents,
         scents_of,
         total,
@@ -1226,6 +1305,30 @@ async fn evaluate(args: &Args) -> Result<String, String> {
     .render())
 }
 
+/// One variant's walk over the whole gold set, at the tight budget: every
+/// query, in the gold set's own order, with what it spent added to the run's
+/// total.
+///
+/// The cache is what makes this cheap to repeat: a variant whose requests the
+/// committed cache holds is free and identical, and one it does not is bought
+/// and stored like any other answer.
+async fn experiment(
+    env: &Env<'_>,
+    gold: &Gold,
+    budget: usize,
+    context: Context,
+    threshold: f64,
+    total: &mut Spent,
+) -> Result<Vec<Run>, String> {
+    let mut runs = Vec::with_capacity(gold.queries.len());
+    for query in &gold.queries {
+        let run = env.walk(query, budget, context, threshold).await?;
+        total.merge(&run.spent);
+        runs.push(run);
+    }
+    Ok(runs)
+}
+
 /// One query's entry page, judged under each preview policy, the scent each
 /// policy gave each of its links, and what judging it cost — the one place the
 /// harness scores a file outside a walk, and so the one place that has to report
@@ -1233,7 +1336,7 @@ async fn evaluate(args: &Args) -> Result<String, String> {
 async fn scents(
     env: &Env<'_>,
     gold: &Gold,
-) -> Result<(Vec<(Preview, Vec<(PathBuf, f64)>)>, Spent), String> {
+) -> Result<(Vec<(&'static str, Vec<(PathBuf, f64)>)>, Spent), String> {
     let mut spent = Spent::default();
     let Some(query) = gold.queries.first() else {
         return Ok((Vec::new(), spent));
@@ -1241,14 +1344,14 @@ async fn scents(
     let page = parse::parse(env.root.join(query.entry()), env.root)
         .map_err(|error| format!("{}: {error}", query.entry))?;
     let mut table = Vec::new();
-    for preview in PREVIEWS {
-        let meter = env.scorer(query, preview)?;
-        let judgment = Scorer::score(&meter, &query.query, &page)
+    for (label, context) in PREVIEWS {
+        let meter = env.scorer(query, context)?;
+        let judgment = Scorer::score(&meter, &query.query, &page, &[])
             .await
             .map_err(|error| format!("{}: {error}", query.id))?;
         spent.merge(&meter.take());
         table.push((
-            preview,
+            label,
             judgment
                 .links
                 .iter()
@@ -1278,6 +1381,7 @@ impl Findings {
         self.calibration(out);
         self.the_threshold(out);
         self.the_preview_experiment(out);
+        self.the_link_context_experiment(out);
         self.limitations(out);
         self.the_cache(out);
     }
@@ -2028,11 +2132,11 @@ impl Findings {
                 "ms/answer",
             ],
         );
-        for (preview, runs) in &self.previews {
+        for (label, runs) in &self.previews {
             row(
                 out,
                 &[
-                    preview.label().to_string(),
+                    (*label).to_string(),
                     ratio(mean_recall(runs)),
                     ratio(mean_precision(runs)),
                     sum(runs, |run| run.score.read_tokens).to_string(),
@@ -2057,8 +2161,8 @@ impl Findings {
         );
         let _ = writeln!(out);
         let mut headers = vec!["Target".to_string()];
-        for (preview, _) in &self.scents {
-            headers.push(preview.label().to_string());
+        for (label, _) in &self.scents {
+            headers.push((*label).to_string());
         }
         head(out, &headers.iter().map(String::as_str).collect::<Vec<_>>());
         let links: Vec<PathBuf> = self
@@ -2093,7 +2197,7 @@ impl Findings {
         // what the walk reads.
         let default = self.scents.first();
         if let Some((_, decided)) = default {
-            for (preview, links) in self.scents.iter().skip(1) {
+            for (label, links) in self.scents.iter().skip(1) {
                 let changed = links
                     .iter()
                     .filter(|(target, scent)| {
@@ -2118,7 +2222,7 @@ impl Findings {
                     out,
                     "`{}` against the default, on this page: {} of {} links change whether the \
                      walk would follow them, and the mean scent moves by {:.2}.",
-                    preview.label(),
+                    label,
                     changed,
                     links.len(),
                     match moved.is_empty() {
@@ -2129,6 +2233,170 @@ impl Findings {
             }
             let _ = writeln!(out);
         }
+    }
+
+    /// The richer link state [#46] measures: what each switch adds to a link's
+    /// preview, what it costs in tokens and in requests, and what it finds.
+    ///
+    /// [#36]: https://github.com/mikekelly/s1m/issues/36
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    fn the_link_context_experiment(&self, out: &mut String) {
+        let _ = writeln!(
+            out,
+            "## The link context experiment: headings, leads and the path"
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "A link is judged from one hop: the page it sits on, its anchor, its sentence and its \
+             heading, and the target's title, frontmatter and first paragraph. The failure \
+             analysis on a private wiki ([#36]) found the queries that reached nothing doing it \
+             two or three hops out, behind intermediate pages whose preview says nothing about \
+             what lies under them. [#46] measures four switches against that, each on its own and \
+             in the pairs the decision rule asks about, at `--max-files {}`:",
+            self.budgets[0]
+        );
+        let _ = writeln!(out);
+        let _ = writeln!(
+            out,
+            "- **`+ headings`**: the target's own H2/H3 headings, in order, at most 40 of them and \
+             each cut at 80 characters.\n\
+             - **`+ leads_to`**: the anchor text of the target's own in-root links, in order, \
+             deduped, at most 30 and each cut at 60 characters — one hop of lookahead past the \
+             target.\n\
+             - **`+ via`**: the titles of the pages the walk came through, in order, at the top \
+             level of the state.\n\
+             - **`+ two-hop question`**: the link question reworded to ask what this link reaches \
+             directly or through the pages it links to, with the yes-criterion to match. The \
+             question is the only thing that changes; every state field is what it was."
+        );
+        let _ = writeln!(out);
+        head(
+            out,
+            &[
+                "Variant",
+                "Recall",
+                "Precision",
+                "Read (tok)",
+                "Input (tok)",
+                "Cost",
+                "Requests",
+                "Req/answer",
+            ],
+        );
+        for (label, runs) in &self.contexts {
+            row(
+                out,
+                &[
+                    (*label).to_string(),
+                    ratio(mean_recall(runs)),
+                    ratio(mean_precision(runs)),
+                    sum(runs, |run| run.score.read_tokens).to_string(),
+                    sum(runs, |run| run.spent.input_tokens).to_string(),
+                    usd(sum_cost(runs)),
+                    sum(runs, |run| run.spent.requests).to_string(),
+                    format!("{:.2}", requests_per_answer(runs)),
+                ],
+            );
+        }
+        let _ = writeln!(out);
+        // What the requests the variants asked come to against what ships: the
+        // one number that says what a richer state costs a walk this size.
+        let shipped = sum(&self.contexts[0].1, |run| run.spent.requests);
+        let combined = self
+            .contexts
+            .last()
+            .map(|(_, runs)| sum(runs, |run| run.spent.requests))
+            .unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "`Requests` is what the API was asked over the whole gold set and `Req/answer` the same \
+             over the files it judged, so 1.00 is a link table that fits one post: a variant above \
+             1.00 is splitting pages the state budget no longer holds ([#37]). A `Requests` column \
+             that rose while `Req/answer` stayed at 1.00 is the other cost — a link the model now \
+             rates above `--threshold` is a page the walk visits and pays for, which is where a \
+             variant's recall comes from. The fullest variant asks {:.1}× what ships does.",
+            match shipped {
+                0 => 0.0,
+                _ => combined as f64 / shipped as f64,
+            }
+        );
+        let _ = writeln!(out);
+
+        // Per query, the queries the shipped walk found least first: a mean over
+        // twenty queries hides the five that found nothing, which are the ones
+        // the experiment is about.
+        let mut order: Vec<usize> = (0..self.gold.queries.len()).collect();
+        let shipped = &self.contexts[0].1;
+        order.sort_by(|left, right| {
+            shipped[*left]
+                .score
+                .recall()
+                .partial_cmp(&shipped[*right].score.recall())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    self.gold.queries[*left]
+                        .id
+                        .cmp(&self.gold.queries[*right].id)
+                })
+        });
+
+        let _ = writeln!(
+            out,
+            "Recall per query, the queries the shipped walk found least first:"
+        );
+        let _ = writeln!(out);
+        let mut headers = vec!["Query".to_string(), "Gold".to_string()];
+        headers.extend(self.contexts.iter().map(|(label, _)| (*label).to_string()));
+        head(out, &headers.iter().map(String::as_str).collect::<Vec<_>>());
+        for &index in &order {
+            let mut cells = vec![
+                format!("`{}`", self.gold.queries[index].id),
+                shipped[index].score.gold.to_string(),
+            ];
+            cells.extend(
+                self.contexts
+                    .iter()
+                    .map(|(_, runs)| ratio(runs[index].score.recall())),
+            );
+            row(out, &cells);
+        }
+        let mut means = vec!["**mean**".to_string(), String::new()];
+        means.extend(
+            self.contexts
+                .iter()
+                .map(|(_, runs)| format!("**{}**", ratio(mean_recall(runs)))),
+        );
+        row(out, &means);
+        let _ = writeln!(out);
+
+        let _ = writeln!(
+            out,
+            "Requests per query, the same order: what each variant asked of the API, where the \
+             split shows up."
+        );
+        let _ = writeln!(out);
+        head(out, &headers.iter().map(String::as_str).collect::<Vec<_>>());
+        for &index in &order {
+            let mut cells = vec![
+                format!("`{}`", self.gold.queries[index].id),
+                shipped[index].score.gold.to_string(),
+            ];
+            cells.extend(
+                self.contexts
+                    .iter()
+                    .map(|(_, runs)| runs[index].spent.requests.to_string()),
+            );
+            row(out, &cells);
+        }
+        let mut totals = vec!["**total**".to_string(), String::new()];
+        totals.extend(
+            self.contexts
+                .iter()
+                .map(|(_, runs)| format!("**{}**", sum(runs, |run| run.spent.requests))),
+        );
+        row(out, &totals);
+        let _ = writeln!(out);
     }
 
     fn limitations(&self, out: &mut String) {
@@ -2382,6 +2650,21 @@ fn sum<T: std::iter::Sum<T>>(runs: &[Run], field: impl Fn(&Run) -> T) -> T {
 
 fn sum_cost(runs: &[Run]) -> f64 {
     runs.iter().map(|run| run.spent.cost_usd()).sum()
+}
+
+/// The requests the variant's answers took, per answer: what the split costs,
+/// where a preview that carries more per link pushes a page past one post.
+///
+/// One is a link table that fits the state budget whole, which is what a wiki
+/// of ordinary pages costs; a variant above one buys no extra judgment, it buys
+/// extra posts.
+fn requests_per_answer(runs: &[Run]) -> f64 {
+    let requests = sum(runs, |run| run.spent.requests);
+    let answers = sum(runs, |run| run.spent.served);
+    match answers {
+        0 => 0.0,
+        _ => requests as f64 / answers as f64,
+    }
 }
 
 fn mean_recall(runs: &[Run]) -> f64 {

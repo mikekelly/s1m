@@ -146,5 +146,19 @@ pub trait Scorer: Send + Sync {
     /// [`ParsedFile::links`] entry, each in that order, so the caller can pair
     /// them by index. `file.links` that point outside the root are still
     /// judged: the caller decides whether to follow them.
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError>;
+    ///
+    /// `via` is how the caller reached `file`, in the order it came: the entry
+    /// file first, the file that linked here last. Empty for a file the caller
+    /// named itself. A scorer may use it — [`crate::jev::JevScorer`] can name
+    /// those pages in the state, which is the `via` experiment of [#46] — or
+    /// ignore it; the judgment it returns is about `file` either way, and the
+    /// path is not part of what is judged.
+    ///
+    /// [#46]: https://github.com/mikekelly/s1m/issues/46
+    async fn score(
+        &self,
+        query: &str,
+        file: &ParsedFile,
+        via: &[PathBuf],
+    ) -> Result<FileJudgment, ScorerError>;
 }

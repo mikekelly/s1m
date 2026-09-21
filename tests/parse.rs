@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use s1m::parse::{FrontmatterField, Link, ParseError, ParsedFile, Section, parse, preview};
+use s1m::parse::{FrontmatterField, Link, ParseError, ParsedFile, Section, parse, preview, title};
 
 /// Every page in the fixture wiki. The line-range invariant runs over all of
 /// them, so a page missing from here is a page whose ranges stop being checked.
@@ -469,7 +469,7 @@ fn output_is_deterministic() {
 
 #[test]
 fn preview_returns_the_title_frontmatter_and_first_paragraph() {
-    let settlement = preview(root().join("payments/settlement.md")).unwrap();
+    let settlement = preview(root().join("payments/settlement.md"), root()).unwrap();
     assert_eq!(settlement.title, "Instant payout settlement");
     assert_eq!(
         settlement.first_paragraph.as_deref(),
@@ -484,7 +484,7 @@ fn preview_returns_the_title_frontmatter_and_first_paragraph() {
     );
 
     // The frontmatter and the H1 are not the first paragraph.
-    let ledger = preview(root().join("notes/ledger.md")).unwrap();
+    let ledger = preview(root().join("notes/ledger.md"), root()).unwrap();
     assert_eq!(ledger.title, "Ledger");
     assert_eq!(
         ledger.first_paragraph.as_deref(),
@@ -492,11 +492,72 @@ fn preview_returns_the_title_frontmatter_and_first_paragraph() {
     );
 
     // Preview falls back to the file name for the title too.
-    let cutoffs = preview(root().join("payments/cutoffs.md")).unwrap();
+    let cutoffs = preview(root().join("payments/cutoffs.md"), root()).unwrap();
     assert_eq!(cutoffs.title, "cutoffs");
     assert_eq!(
         cutoffs.first_paragraph.as_deref(),
         Some("Cutoffs are 16:00 UTC on business days. See settlement.")
+    );
+}
+
+#[test]
+fn preview_carries_the_headings_and_the_in_root_link_text() {
+    let readme = preview(root().join("payments/README.md"), root()).unwrap();
+
+    // H2s and the H3 under one of them, in the file's own order. The H1 is the
+    // title the preview already carries.
+    assert_eq!(readme.title, "Payments");
+    assert_eq!(
+        readme.headings,
+        ["Instant payouts", "Windows", "Settlement"],
+        "the page's own parts, in order"
+    );
+
+    // Every link's anchor text, in document order. The fenced block's
+    // `[not a link](whatever.md)` was never a link, and the anchor the page
+    // repeats is left here for the caller to drop: this is what the page says,
+    // not what a request can afford.
+    assert_eq!(
+        readme.leads,
+        ["payouts", "ledger", "cutoffs", "ten minute", "cutoffs"]
+    );
+
+    // A link that leaves the root is not part of what the page leads on with; a
+    // broken one that stays inside it is, because the text names a target.
+    let index = preview(root().join("index.md"), root()).unwrap();
+    assert!(
+        index.leads.contains(&"missing page".to_string()),
+        "an in-root link to a page that is not there is still a lead"
+    );
+    assert!(
+        !index.leads.contains(&"outside the root".to_string()),
+        "and a link out of the root is not: {:?}",
+        index.leads
+    );
+}
+
+#[test]
+fn title_is_the_name_the_reading_list_would_give_a_file() {
+    // The frontmatter title, the first H1, then the file name: the same string
+    // `preview` gives, and the same one the walk's `via` path is spelled with.
+    assert_eq!(
+        title(root().join("notes/ledger.md")).unwrap(),
+        "Ledger",
+        "the frontmatter title wins"
+    );
+    assert_eq!(
+        title(root().join("payments/README.md")).unwrap(),
+        "Payments",
+        "else the first H1"
+    );
+    assert_eq!(
+        title(root().join("payments/cutoffs.md")).unwrap(),
+        "cutoffs",
+        "else the file's own name"
+    );
+    assert!(
+        title(root().join("notes/nowhere.md")).is_err(),
+        "and a file that is not there is not a title"
     );
 }
 
