@@ -22,7 +22,7 @@ use crate::gold::{Gold, Query};
 use crate::ledger::{self, Entry, Id, Ledger};
 use crate::reading;
 use crate::report::Method;
-use crate::row::{Key, Row};
+use crate::row::{Key, Row, asked_for};
 use crate::wiki;
 
 /// The file every run appends to, under `--out`.
@@ -731,19 +731,6 @@ fn measure(options: &Options, wiki: &str, query: &Query, job: &Job, rows: &[Row]
         models: measured.models,
         detail: Some(measured.detail),
     }
-}
-
-/// The model a run of this condition was asked for: the one named on the
-/// command line, on a condition that runs an agent.
-///
-/// An s1m run takes a threshold rather than a model and buys judgments from an
-/// API this harness does not choose the model for, so it is the same run
-/// whatever `--model` says. Naming a model for a pass must not make its `s1m`
-/// runs another pass's runs, on the row or in the ledger.
-fn asked_for(condition: &str, model: Option<&str>) -> Option<String> {
-    crate::row::agent_condition(condition)
-        .then(|| model.map(str::to_string))
-        .flatten()
 }
 
 /// What one run produced: the numbers a report averages, the raw half it does

@@ -113,7 +113,9 @@ against, so a resumed pass on an old directory does not buy it all again — but
 row is at the tier it names, so `--model haiku` into a directory full of sonnet
 rows owes every one of them rather than reporting them all measured and buying
 nothing. A condition that runs no agent has no tier: an `s1m` row is the same run
-whatever the pass names.
+whatever the pass names. The report keeps the tiers apart for the same reason the
+pass does: one directory holding one condition at two models is two rows (see
+[What the numbers mean](#what-the-numbers-mean)).
 
 A run is written to the ledger when it is *bought* and again when it has been
 measured. A purchase with no completion is a run that was paid for and whose row
@@ -324,6 +326,13 @@ those models by run, and the method table names the tier measured. Leaving
   agent, they are scored on the files it *said* it relied on; the files it
   actually opened are scored separately under `read_recall` and
   `read_precision`, and the two sets are not the same.
+- **A results row is a condition and the tier it was asked for**, so a
+  directory holding one condition measured at two models has two rows —
+  `explore` (asked for `haiku`) beside `explore` (asked for `sonnet`) — rather
+  than one average of both. The tier named is the model the pass asked for
+  (`--model`); what actually answered is the method table's *Models measured*,
+  and the two are not always the same. A condition that runs no agent takes no
+  tier and stays one row.
 - **`relied_parsed`** is 0 when the agent answered without the list of files it
   was asked for. That run is still scored, and it scores zero, so the report
   prints the count of unparsed answers beside the failure count: a condition

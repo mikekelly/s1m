@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::aggregate::{Aggregates, Group};
+use crate::aggregate::{Aggregates, Condition, Group};
 use crate::graph::{self, GraphStats};
 use crate::row::Row;
 use serde::{Deserialize, Serialize};
@@ -260,13 +260,24 @@ fn models(aggregates: &Aggregates) -> String {
     }
 }
 
-/// Whether any measured condition runs an agent: the two whose runs are on a
-/// model, and so the only ones an agent model row is about.
+/// Whether any measured group runs an agent: the two whose runs are on a model,
+/// and so the only ones an agent model row is about. It is asked of the group
+/// rather than of the key it is filed under, which for a tiered condition names
+/// the tier too.
 fn agents_ran(aggregates: &Aggregates) -> bool {
     aggregates
         .conditions
-        .keys()
-        .any(|condition| crate::row::agent_condition(condition))
+        .iter()
+        .any(|(key, group)| crate::row::agent_condition(condition_of(key, group)))
+}
+
+/// The condition a group is: its own name, or — on an aggregates file written
+/// before the pair was recorded — the condition it is filed under.
+fn condition_of<'a>(key: &'a str, group: &'a Condition) -> &'a str {
+    match group.condition.is_empty() {
+        true => key,
+        false => &group.condition,
+    }
 }
 
 /// The cut of the wiki the rows were measured against. Rows from more than one
@@ -327,7 +338,7 @@ fn results_section(out: &mut String, aggregates: &Aggregates) -> Result<(), Stri
     head.extend(columns.iter().map(|(_, title)| (*title).to_string()));
     table_head(out, &head);
     for (name, condition) in &aggregates.conditions {
-        let mut cells = vec![format!("`{}`", safe(name)?), runs(&condition.overall)];
+        let mut cells = vec![condition_cell(name, condition)?, runs(&condition.overall)];
         cells.extend(
             columns
                 .iter()
@@ -381,7 +392,7 @@ fn per_query_section(out: &mut String, aggregates: &Aggregates) -> Result<(), St
             let mut cells = vec![
                 format!("`{}`", safe(id)?),
                 safe(&query.category)?.to_string(),
-                format!("`{}`", safe(name)?),
+                condition_cell(name, condition)?,
             ];
             cells.extend(columns.iter().map(|(metric, _)| cell(&query.group, metric)));
             table_row(out, &cells);
@@ -448,6 +459,11 @@ fn caveats_section(out: &mut String) {
          in it. The wiki revision it names is a hash of the pages the walk \
          reads; rows measured against more than one cut are named as more than \
          one, and which row came from which cut is in the raw rows.",
+        "The results table is a row per condition and tier, so a directory \
+         holding one condition measured at two models is two rows and not one \
+         average of both. The tier a row names is the model its pass asked for; \
+         what actually answered is counted in the method table, and the two are \
+         not always the same.",
         "A run is recorded when it is bought and its row when it has been \
          measured, so *Runs* counts both: a directory with more runs bought than \
          rows holds a run that was paid for and never measured, and one with more \
@@ -455,6 +471,17 @@ fn caveats_section(out: &mut String) {
          own and not a new purchase.",
     ] {
         out.push_str(&format!("- {caveat}\n"));
+    }
+}
+
+/// The condition as a table names it: the condition, and the model it was asked
+/// for where a pass named one. One directory can hold one condition measured at
+/// two tiers, and each is a row of its own, so a row has to say which it is.
+fn condition_cell(key: &str, group: &Condition) -> Result<String, String> {
+    let name = safe(condition_of(key, group))?;
+    match &group.model {
+        Some(model) => Ok(format!("`{name}` (asked for `{}`)", safe(model)?)),
+        None => Ok(format!("`{name}`")),
     }
 }
 
@@ -1049,6 +1076,118 @@ mod tests {
         .expect("a report");
         assert!(report.contains("—"), "{report}");
     }
+    /// One directory can hold one condition measured at two tiers, and the
+    /// results table has a row per tier: the mix the method table names has to
+    /// be separable, or the average is of two experiments.
+    #[test]
+    fn one_condition_at_two_tiers_is_two_rows_in_the_results_table() {
+        let at = |model: &str, measured: &str, repeat: usize, recall: f64| Row {
+            repeat,
+            model_asked_for: Some(model.to_string()),
+            models: vec![measured.to_string()],
+            ..row("one", "how-to", "explore", recall)
+        };
+        let rows = vec![
+            at("sonnet", "claude-sonnet-5", 0, 1.0),
+            at("sonnet", "claude-sonnet-5", 1, 0.0),
+            at("haiku", "claude-haiku-4-5", 0, 1.0),
+        ];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+
+        let line = |tier: &str| {
+            report
+                .lines()
+                .find(|line| line.starts_with(&format!("| `explore` (asked for `{tier}`)")))
+                .unwrap_or_else(|| panic!("no `{tier}` row:\n{report}"))
+                .to_string()
+        };
+        // By hand: sonnet's two runs average 0.50, haiku's one is 1.00.
+        assert!(line("sonnet").starts_with("| `explore` (asked for `sonnet`) | 2 | 0.50 ± 0.71 |"));
+        assert!(line("haiku").starts_with("| `explore` (asked for `haiku`) | 1 | 1.00 |"));
+
+        // And the per-query table splits the same way.
+        assert!(
+            report.contains("| `one` | how-to | `explore` (asked for `haiku`) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains("| `one` | how-to | `explore` (asked for `sonnet`) |"),
+            "{report}"
+        );
+
+        // The method table still knows an agent ran: a tiered group is an agent
+        // condition asked for a model, and not a condition no one has heard of.
+        assert!(
+            report.contains("| Agent model | `haiku, sonnet` |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(
+                "| Models measured | `claude-haiku-4-5` (1 run), `claude-sonnet-5` (2 runs) |"
+            ),
+            "{report}"
+        );
+
+        // A directory whose rows were all asked for the same tier is one row
+        // with the counts it always had, and that row names the tier: a row is
+        // a (condition, tier) pair, and this is which.
+        let single = vec![at("sonnet", "claude-sonnet-5", 0, 1.0)];
+        let report =
+            render(&aggregate(&single), None, &Method::from_rows(&single)).expect("a report");
+        assert!(
+            report.contains("| `explore` (asked for `sonnet`) | 1 |"),
+            "{report}"
+        );
+
+        // A directory whose pass named no model is the bare condition, as it
+        // has always been.
+        let silent = vec![row("one", "how-to", "explore", 1.0)];
+        let report = render(&aggregate(&silent), None, &method()).expect("a report");
+        assert!(report.contains("| `explore` | 1 |"), "{report}");
+        assert!(!report.contains("(asked for"), "{report}");
+    }
+
+    /// The aggregates of a directory an earlier pass wrote hold the condition
+    /// alone, as the key: that directory's table is the one it always rendered.
+    #[test]
+    fn aggregates_from_before_the_tier_pair_render_the_row_they_always_did() {
+        let rows = vec![
+            row("one", "how-to", "explore", 1.0),
+            row("one", "how-to", "s1m", 0.5),
+        ];
+        let mut json = serde_json::to_value(aggregate(&rows)).expect("json");
+        for group in json["conditions"]
+            .as_object_mut()
+            .expect("a map of groups")
+            .values_mut()
+        {
+            let group = group.as_object_mut().expect("a group");
+            group.remove("condition");
+            group.remove("model");
+        }
+        let aggregates: crate::aggregate::Aggregates =
+            serde_json::from_value(json).expect("an aggregates file from before the pair");
+        let report = render(&aggregates, None, &method()).expect("a report");
+        assert!(report.contains("| `explore` | 1 |"), "{report}");
+        assert!(report.contains("| `s1m` | 1 |"), "{report}");
+        assert!(!report.contains("(asked for"), "{report}");
+    }
+
+    /// A tier is a label out of a file this process did not write, and it is
+    /// printed, so it goes through the same gate as every other label.
+    #[test]
+    fn a_crafted_aggregates_file_cannot_name_a_tier() {
+        let at = |model: &str| {
+            aggregate(&[Row {
+                model_asked_for: Some(model.to_string()),
+                ..row("one", "how-to", "explore", 1.0)
+            }])
+        };
+        let error = render(&at("notes/private.md"), None, &method()).expect_err("a tier as a path");
+        assert!(error.contains("looks like a path"), "{error}");
+        assert!(render(&at("haiku"), None, &method()).is_ok());
+    }
+
     /// The method is read back from the rows, not from the command that wrote
     /// them: a pass that resumes a directory describes the rows in it.
     #[test]

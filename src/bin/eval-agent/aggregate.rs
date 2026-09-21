@@ -1,10 +1,11 @@
-//! The rows, reduced to numbers keyed by query id, category and condition.
+//! The rows, reduced to numbers keyed by query id, category, condition and
+//! tier.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::row::Row;
+use crate::row::{Row, asked_for};
 
 /// One metric over a set of runs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -27,7 +28,7 @@ pub struct Group {
     pub metrics: BTreeMap<String, Stat>,
 }
 
-/// One query's runs under one condition.
+/// One query's runs under one condition at one tier.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryGroup {
     pub category: String,
@@ -35,8 +36,22 @@ pub struct QueryGroup {
     pub group: Group,
 }
 
+/// One condition's runs at one tier: one cell of the results table.
+///
+/// A directory can hold one condition measured at two models, and a mean over
+/// both would be a mean over two experiments. A condition that runs no agent
+/// has no tier — it is the same run whatever a pass names — and stays one cell.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Condition {
+    /// The condition, as `--conditions` spells it. Empty on a group read from
+    /// an aggregates file written before the pair was, whose key names it.
+    #[serde(default)]
+    pub condition: String,
+    /// The model these runs were asked for, `None` where the pass named none or
+    /// the condition runs no agent. What actually answered is
+    /// [`Aggregates::models`], which is another question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(flatten)]
     pub overall: Group,
     pub by_query: BTreeMap<String, QueryGroup>,
@@ -62,6 +77,9 @@ pub struct Aggregates {
     /// them. Only `run` knows, and only it fills this in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bought: Option<usize>,
+    /// Distinct conditions, and the tiers each was asked for: one entry per
+    /// `(condition, model)`, so a condition measured at two models is two
+    /// cells. Keyed by [`filed_under`].
     pub conditions: BTreeMap<String, Condition>,
     /// How the runs were made, filled in by the runner: flags and constants,
     /// never a path or a query.
@@ -72,6 +90,12 @@ pub struct Aggregates {
 /// Reduces the rows to numbers. Rows that failed are counted and left out of
 /// every average: a run that errored has no recall, and averaging it as zero
 /// would make a broken harness look like a bad method.
+///
+/// A group is a condition and the model it was asked for. One directory can
+/// hold one condition measured at two models — a screening pass at a cheaper
+/// tier beside the one it screens — and a mean over both would be a mean over
+/// two experiments: what a report has to show beside each other is the two
+/// tiers, so they are two cells.
 pub fn aggregate(rows: &[Row]) -> Aggregates {
     let mut queries = std::collections::BTreeSet::new();
     let mut models: BTreeMap<String, usize> = BTreeMap::new();
@@ -86,7 +110,7 @@ pub fn aggregate(rows: &[Row]) -> Aggregates {
             wiki.insert(row.wiki.clone());
         }
         conditions
-            .entry(row.condition.clone())
+            .entry(filed_under(&row.condition, row.model_asked_for.as_deref()))
             .or_default()
             .push(row);
     }
@@ -94,6 +118,11 @@ pub fn aggregate(rows: &[Row]) -> Aggregates {
     let conditions = conditions
         .into_iter()
         .map(|(name, rows)| {
+            // Every row of a group was filed by its own condition and tier, so
+            // the first one's are the group's.
+            let first = rows[0];
+            let condition = first.condition.clone();
+            let model = asked_for(&condition, first.model_asked_for.as_deref());
             let mut by_query: BTreeMap<String, Vec<&Row>> = BTreeMap::new();
             let mut by_category: BTreeMap<String, Vec<&Row>> = BTreeMap::new();
             for row in &rows {
@@ -104,6 +133,8 @@ pub fn aggregate(rows: &[Row]) -> Aggregates {
                     .push(row);
             }
             let condition = Condition {
+                condition,
+                model,
                 overall: group(&rows),
                 by_query: by_query
                     .into_iter()
@@ -133,6 +164,17 @@ pub fn aggregate(rows: &[Row]) -> Aggregates {
         bought: None,
         conditions,
         method: None,
+    }
+}
+
+/// The key a set of runs is filed under: the condition, and the model it was
+/// asked for where there was one. A condition that runs no agent takes no tier,
+/// so it is one entry — `s1m` — whatever a pass named, and an agent condition is
+/// `explore` where none was named and `explore@haiku` where one was.
+fn filed_under(condition: &str, model: Option<&str>) -> String {
+    match asked_for(condition, model) {
+        Some(model) => format!("{condition}@{model}"),
+        None => condition.to_string(),
     }
 }
 
@@ -272,6 +314,97 @@ mod tests {
             ..row("one", "how-to", "explore", 0, 1.0)
         }]);
         assert!(aggregates.wiki.is_empty(), "{:?}", aggregates.wiki);
+    }
+
+    /// One directory can hold one condition measured at two tiers, and the
+    /// report has a cell per tier: averaging them into one would hide the thing
+    /// the second pass was bought for.
+    #[test]
+    fn one_condition_at_two_tiers_is_two_groups() {
+        let rows = vec![
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "explore", 0, 1.0)
+            },
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "explore", 1, 1.0)
+            },
+            Row {
+                model_asked_for: Some("haiku".to_string()),
+                models: vec!["claude-haiku-4-5".to_string()],
+                ..row("one", "how-to", "explore", 0, 0.0)
+            },
+            // A condition that runs no agent takes no tier, and keeps one
+            // group whatever a row says: `s1m` here carries a model only a
+            // version that did not normalise it could have written.
+            Row {
+                model_asked_for: Some("haiku".to_string()),
+                ..row("one", "how-to", "s1m", 0, 0.5)
+            },
+        ];
+
+        let aggregates = aggregate(&rows);
+        assert_eq!(
+            aggregates.conditions.len(),
+            3,
+            "{:?}",
+            aggregates.conditions.keys().collect::<Vec<_>>()
+        );
+        let group = |condition: &str, model: Option<&str>| {
+            aggregates
+                .conditions
+                .values()
+                .find(|group| group.condition == condition && group.model.as_deref() == model)
+                .unwrap_or_else(|| panic!("no `{condition}` group asked for {model:?}"))
+        };
+
+        // The sonnet rows are one cell, over their own runs, and the haiku row
+        // is another: neither is averaged into the other.
+        let sonnet = group("explore", Some("sonnet"));
+        assert_eq!((sonnet.overall.runs, sonnet.overall.failed), (2, 0));
+        assert_eq!(sonnet.overall.metrics["recall"].mean, 1.0);
+        assert_eq!(sonnet.by_query["one"].group.metrics["recall"].n, 2);
+        assert_eq!(sonnet.by_category["how-to"].runs, 2);
+
+        let haiku = group("explore", Some("haiku"));
+        assert_eq!(haiku.overall.runs, 1);
+        assert_eq!(haiku.overall.metrics["recall"].mean, 0.0);
+
+        assert_eq!(group("s1m", None).overall.runs, 1);
+
+        // The tiers survive the file the report is rendered from.
+        let text = serde_json::to_string(&aggregates).expect("json");
+        assert_eq!(
+            serde_json::from_str::<Aggregates>(&text).expect("json"),
+            aggregates
+        );
+
+        // A directory whose rows all name one tier is one group, as it was.
+        let one_tier = vec![
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "how-to", "explore", 0, 1.0)
+            },
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "how-to", "explore", 1, 0.0)
+            },
+        ];
+        let aggregates = aggregate(&one_tier);
+        assert_eq!(aggregates.conditions.len(), 1);
+        assert_eq!(
+            aggregates
+                .conditions
+                .values()
+                .next()
+                .expect("the one group")
+                .overall
+                .runs,
+            2
+        );
     }
 
     #[test]
