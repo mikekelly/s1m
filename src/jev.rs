@@ -130,7 +130,8 @@ const FRONTMATTER_LIMIT: usize = 1_200;
 /// [#46]: https://github.com/mikekelly/s1m/issues/46
 const HEADINGS: usize = 40;
 
-/// One heading of a preview, cut to this many characters.
+/// One heading of a preview, cut to this many characters and told so in the
+/// text, the way [`clamp`] tells every other part of a preview it was cut.
 const HEADING_LIMIT: usize = 80;
 
 /// The links a preview carries at most, by their anchor text, from the target's
@@ -138,7 +139,8 @@ const HEADING_LIMIT: usize = 80;
 /// ([`JevScorer::with_preview_leads`]).
 const LEADS: usize = 30;
 
-/// One lead anchor of a preview, cut to this many characters.
+/// One lead anchor of a preview, cut to this many characters and told so in the
+/// text, the way [`clamp`] tells every other part of a preview it was cut.
 const LEAD_LIMIT: usize = 60;
 
 /// Room left over in a post for what holds it together — the braces, the
@@ -452,12 +454,12 @@ struct PreviewState {
     frontmatter: Option<Vec<FrontmatterField>>,
     first_paragraph: Option<String>,
     /// The target's H2/H3 headings, in order, at most [`HEADINGS`] of them and
-    /// each at most [`HEADING_LIMIT`] characters. `None` when the run leaves
+    /// each cut at [`HEADING_LIMIT`] characters. `None` when the run leaves
     /// them out ([`JevScorer::with_preview_headings`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     headings: Option<Vec<String>>,
     /// The anchor text of the target's own in-root links, in order, deduped, at
-    /// most [`LEADS`] of them and each at most [`LEAD_LIMIT`] characters.
+    /// most [`LEADS`] of them and each cut at [`LEAD_LIMIT`] characters.
     /// `None` when the run leaves them out
     /// ([`JevScorer::with_preview_leads`]).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1481,7 +1483,7 @@ fn required_key(value: Option<String>) -> Result<String, ScorerError> {
 }
 
 /// The headings a preview carries: the target's own, in order, at most
-/// [`HEADINGS`] of them and each clamped at [`HEADING_LIMIT`].
+/// [`HEADINGS`] of them and each cut at [`HEADING_LIMIT`] characters.
 fn headings(headings: Vec<String>) -> Vec<String> {
     headings
         .into_iter()
@@ -1492,7 +1494,7 @@ fn headings(headings: Vec<String>) -> Vec<String> {
 
 /// The lead anchors a preview carries: the target's in-root link text, in
 /// order, with an anchor that repeats an earlier one left out, at most [`LEADS`]
-/// of them and each clamped at [`LEAD_LIMIT`].
+/// of them and each cut at [`LEAD_LIMIT`] characters.
 ///
 /// A page names the same target in its opening sentence, its overview table and
 /// its "see also"; the model reading one anchor three times learns nothing the
