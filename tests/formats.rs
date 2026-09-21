@@ -20,6 +20,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use s1m::cache::Cacheable;
 use s1m::cli::{self, Options, Uncached};
 use s1m::format::Format;
 use s1m::parse::{ParsedFile, relative_to_root};
@@ -172,6 +173,12 @@ const ANSWERS: &[(&str, Answer)] = &[
 ];
 
 /// The model, in place of Jev: the table above, and nothing else.
+///
+/// It is [`Cacheable`] as well as a [`Scorer`] because the run below is the
+/// CLI's, and the judge the CLI takes is one of its two: a request the cache
+/// would key, and the call that answers it. Nothing here is stored — the fake
+/// keeps no state and answers from its table either way — and nothing is asked
+/// of the request beyond the page it names.
 struct Fake {
     root: PathBuf,
 }
@@ -182,12 +189,10 @@ impl Fake {
             root: PathBuf::from(ROOT),
         }
     }
-}
 
-#[async_trait::async_trait]
-impl Scorer for Fake {
-    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
-        assert_eq!(query, QUERY, "the run's query reaches the scorer");
+    /// What the table says about one page: the relevance, a score per section
+    /// and a scent per link.
+    fn answer(&self, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
         let page = relative_to_root(&self.root, &file.path);
         let page = page.to_string_lossy().into_owned();
         let Some((_, answer)) = ANSWERS.iter().find(|(name, _)| *name == page) else {
@@ -230,6 +235,52 @@ impl Scorer for Fake {
                 .collect(),
             links,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl Scorer for Fake {
+    async fn score(&self, query: &str, file: &ParsedFile) -> Result<FileJudgment, ScorerError> {
+        assert_eq!(query, QUERY, "the run's query reaches the scorer");
+        self.answer(file)
+    }
+}
+
+/// The request the CLI's judge builds for a page: the page itself, which is all
+/// the fake's answer depends on. The query is asserted here because this is where
+/// a run's query arrives — the run goes through [`Uncached`], which builds the
+/// request and calls [`Cacheable::call`] rather than [`Scorer::score`].
+#[async_trait::async_trait]
+impl Cacheable for Fake {
+    type Request = PathBuf;
+    /// What a call cost: nothing the tests read, so nothing is reported.
+    type Detail = ();
+
+    fn request(&self, query: &str, file: &ParsedFile) -> Result<PathBuf, ScorerError> {
+        assert_eq!(query, QUERY, "the run's query reaches the scorer");
+        Ok(file.path.clone())
+    }
+
+    fn key(&self, request: &PathBuf) -> Result<Vec<u8>, ScorerError> {
+        Ok(request.as_os_str().as_encoded_bytes().to_vec())
+    }
+
+    async fn call(
+        &self,
+        _request: &PathBuf,
+        file: &ParsedFile,
+    ) -> Result<(FileJudgment, ()), ScorerError> {
+        Ok((self.answer(file)?, ()))
+    }
+
+    /// One request per page: this fake never splits one.
+    fn posts(&self, _request: &PathBuf) -> usize {
+        1
+    }
+
+    /// Nothing in the fake's accounting is a duration.
+    fn latency(_detail: &()) -> std::time::Duration {
+        std::time::Duration::ZERO
     }
 }
 

@@ -15,7 +15,9 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::parse::ParsedFile;
 use crate::scorer::{FileJudgment, Scorer, ScorerError};
+use crate::trace::Trace;
 
 /// The variable that puts the cache somewhere else, so a caller — or a test —
 /// does not have to write to `~/.cache`.
@@ -75,6 +78,20 @@ pub trait Cacheable: Scorer {
         request: &Self::Request,
         file: &ParsedFile,
     ) -> Result<(FileJudgment, Self::Detail), ScorerError>;
+
+    /// How many requests one built request is: one, unless the file's sections
+    /// and links did not fit the API's state budget in one and it was split
+    /// across posts.
+    ///
+    /// What a trace reports as one `requested` event per post
+    /// ([`crate::trace`]), which is why it is asked before the call rather
+    /// than read off [`Cacheable::Detail`]: the requests happen when they are
+    /// sent.
+    fn posts(&self, request: &Self::Request) -> usize;
+
+    /// How long the call that produced `detail` took: what a trace reports as
+    /// an answer's `latency_ms`, now or when it was bought.
+    fn latency(detail: &Self::Detail) -> Duration;
 }
 
 /// One file's answer, and whether the API was called for it.
@@ -151,6 +168,11 @@ pub struct CachedScorer<S: Cacheable> {
     calls: AtomicU64,
     /// Answers served from disk.
     hits: AtomicU64,
+    /// The run's trace, when one was asked for: this is the one place that
+    /// knows both what was sent and whether the answer was bought or served, so
+    /// it is where a trace is told of `requested` and `answered`
+    /// ([`crate::trace`]).
+    trace: Option<Arc<Trace>>,
 }
 
 impl<S: Cacheable> CachedScorer<S> {
@@ -183,12 +205,29 @@ impl<S: Cacheable> CachedScorer<S> {
             dir,
             calls: AtomicU64::new(0),
             hits: AtomicU64::new(0),
+            trace: None,
         })
+    }
+
+    /// Reports this scorer's requests and answers to `trace`, when there is
+    /// one ([`crate::trace`]): what was sent for each file, and what came back
+    /// with it, whether it was bought or served from the entries. Without this
+    /// the cache is invisible to a trace, and a replayed walk has no answers in
+    /// it.
+    pub fn with_trace(mut self, trace: Option<Arc<Trace>>) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// The directory the entries go in.
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The run's trace, when one was asked for: the walk reports its own
+    /// events to the same one ([`crate::cli::Judge::trace`]).
+    pub fn trace(&self) -> Option<&Trace> {
+        self.trace.as_deref()
     }
 
     /// How many calls reached the scorer: one per miss, so the real API calls a
@@ -211,16 +250,25 @@ impl<S: Cacheable> CachedScorer<S> {
         file: &ParsedFile,
     ) -> Result<Scored<S::Detail>, ScorerError> {
         let request = self.inner.request(query, file)?;
+        if let Some(trace) = &self.trace {
+            trace.requested(&file.path, self.inner.posts(&request));
+        }
         let key = self.key(&request)?;
 
         if let Some((judgment, detail)) = self.load(&key) {
             self.hits.fetch_add(1, Ordering::Relaxed);
+            if let Some(trace) = &self.trace {
+                trace.answered(&file.path, S::latency(&detail), true, &judgment);
+            }
             return Ok(Scored::Reused { judgment, detail });
         }
 
         let (judgment, detail) = self.inner.call(&request, file).await?;
         self.calls.fetch_add(1, Ordering::Relaxed);
         self.store(&key, &judgment, &detail);
+        if let Some(trace) = &self.trace {
+            trace.answered(&file.path, S::latency(&detail), false, &judgment);
+        }
         Ok(Scored::Called { judgment, detail })
     }
 
@@ -383,6 +431,19 @@ mod tests {
         ) -> Result<(FileJudgment, u64), ScorerError> {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Ok((answer(request), request.len() as u64))
+        }
+
+        /// One request, which is what this fake always sends: a page that does
+        /// not fit one post is a real scorer's business, and it is tested
+        /// there.
+        fn posts(&self, _request: &String) -> usize {
+            1
+        }
+
+        /// The fake's accounting is a length rather than a duration, so there
+        /// is no latency in it to report.
+        fn latency(_detail: &u64) -> Duration {
+            Duration::ZERO
         }
     }
 
