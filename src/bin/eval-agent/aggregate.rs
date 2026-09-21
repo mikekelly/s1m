@@ -48,6 +48,20 @@ pub struct Condition {
 pub struct Aggregates {
     /// Distinct queries any condition ran.
     pub queries: usize,
+    /// The models the measured work ran on, by how many runs each: the tier the
+    /// numbers were measured at, which is a label like a query id and not a
+    /// detail.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, usize>,
+    /// The wiki revisions the rows were measured against, one entry per
+    /// distinct revision. More than one is a directory that mixed two cuts of a
+    /// wiki, and a report says so rather than naming one of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wiki: Vec<String>,
+    /// How many runs were bought for this directory, as the ledger recorded
+    /// them. Only `run` knows, and only it fills this in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bought: Option<usize>,
     pub conditions: BTreeMap<String, Condition>,
     /// How the runs were made, filled in by the runner: flags and constants,
     /// never a path or a query.
@@ -60,9 +74,17 @@ pub struct Aggregates {
 /// would make a broken harness look like a bad method.
 pub fn aggregate(rows: &[Row]) -> Aggregates {
     let mut queries = std::collections::BTreeSet::new();
+    let mut models: BTreeMap<String, usize> = BTreeMap::new();
+    let mut wiki = std::collections::BTreeSet::new();
     let mut conditions: BTreeMap<String, Vec<&Row>> = BTreeMap::new();
     for row in rows {
         queries.insert(row.query_id.clone());
+        for model in &row.models {
+            *models.entry(model.clone()).or_default() += 1;
+        }
+        if !row.wiki.is_empty() {
+            wiki.insert(row.wiki.clone());
+        }
         conditions
             .entry(row.condition.clone())
             .or_default()
@@ -106,6 +128,9 @@ pub fn aggregate(rows: &[Row]) -> Aggregates {
 
     Aggregates {
         queries: queries.len(),
+        models,
+        wiki: wiki.into_iter().collect(),
+        bought: None,
         conditions,
         method: None,
     }
@@ -157,14 +182,20 @@ fn stat(values: &[f64]) -> Stat {
 mod tests {
     use super::*;
 
+    /// The revision these rows were measured against.
+    const WIKI: &str = "sha256:0f1e2d3c";
+
     fn row(id: &str, category: &str, condition: &str, repeat: usize, recall: f64) -> Row {
         Row {
             query_id: id.to_string(),
             category: category.to_string(),
             condition: condition.to_string(),
             repeat,
+            wiki: WIKI.to_string(),
             ok: true,
             metrics: BTreeMap::from([("recall".to_string(), recall)]),
+            model_asked_for: None,
+            models: Vec::new(),
             detail: Some(serde_json::json!({"query": "the query text"})),
         }
     }
@@ -198,6 +229,49 @@ mod tests {
         assert_eq!(explore.by_query["two"].group.metrics["recall"].sd, None);
         assert_eq!(explore.by_category["reference"].metrics["recall"].mean, 0.0);
         assert_eq!(aggregates.conditions["s1m"].overall.runs, 1);
+    }
+
+    /// The models and the wiki revisions reach the aggregates: they are what a
+    /// report names the tier and the cut by, and they belong to the rows rather
+    /// than to the invocation that wrote them.
+    #[test]
+    fn the_models_and_the_revisions_reach_the_aggregates() {
+        let rows = vec![
+            Row {
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "explore", 0, 1.0)
+            },
+            Row {
+                models: vec![
+                    "claude-sonnet-5".to_string(),
+                    "claude-haiku-4-5".to_string(),
+                ],
+                ..row("one", "how-to", "explore", 1, 0.0)
+            },
+            Row {
+                wiki: "sha256:other".to_string(),
+                ..row("one", "how-to", "s1m", 0, 0.5)
+            },
+        ];
+        let aggregates = aggregate(&rows);
+        assert_eq!(aggregates.models["claude-sonnet-5"], 2);
+        assert_eq!(aggregates.models["claude-haiku-4-5"], 1);
+        assert_eq!(
+            aggregates.wiki,
+            vec![WIKI.to_string(), "sha256:other".to_string()],
+            "one entry per cut the rows were measured against"
+        );
+        assert_eq!(
+            aggregates.bought, None,
+            "only `run` knows what a pass bought"
+        );
+
+        // A row from before revisions were recorded adds nothing to the cut.
+        let aggregates = aggregate(&[Row {
+            wiki: String::new(),
+            ..row("one", "how-to", "explore", 0, 1.0)
+        }]);
+        assert!(aggregates.wiki.is_empty(), "{:?}", aggregates.wiki);
     }
 
     #[test]

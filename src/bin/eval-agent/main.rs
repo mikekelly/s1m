@@ -6,14 +6,16 @@
 //! - `graph-stats --wiki <dir> --out <dir>` — what the wiki's link graph looks
 //!   like, as numbers.
 //! - `run --wiki <dir> --gold <file> --out <dir>` — every query under every
-//!   condition, one JSONL row a run, reduced to `aggregates.json`.
+//!   condition, one JSONL row a run, reduced to `aggregates.json`. Resumable,
+//!   and priced before it buys anything: see [`run`].
 //! - `report --out <dir>` — the committed half: a markdown report of numbers.
 //!
 //! The split is the point. `--out` holds the raw rows, which name files and
 //! quote queries, and is never committed. The report is rendered from the
-//! aggregates alone, which hold numbers, query ids and category labels — and
-//! [`report::render`] refuses a label that looks like a path or reads like a
-//! question. See `eval/agent/README.md`.
+//! aggregates alone, which hold numbers, query ids, category labels, the models
+//! measured and the revision of the wiki the runs were measured against — a
+//! content hash and not a page. [`report::render`] refuses a label that looks
+//! like a path or reads like a question. See `eval/agent/README.md`.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -25,12 +27,14 @@ mod explore;
 mod gold;
 mod graph;
 mod hook;
+mod ledger;
 mod reading;
 mod report;
 mod row;
 mod run;
 #[cfg(test)]
 mod testkit;
+mod wiki;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -66,7 +70,7 @@ struct RunArgs {
     #[arg(long, value_delimiter = ',')]
     queries: Vec<String>,
     /// How many times each query is measured under each condition.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 1)]
     repeats: usize,
     /// Which conditions to measure.
     #[arg(long, value_delimiter = ',', default_value = "explore,s1m,s1m-agent")]
@@ -75,6 +79,22 @@ struct RunArgs {
     /// directory under --out.
     #[arg(long)]
     cache_dir: Option<PathBuf>,
+    /// Print what the runs that are owed are expected to cost, priced by what
+    /// runs of the same condition have cost before, and buy nothing.
+    #[arg(long)]
+    estimate: bool,
+    /// Run even when that estimate is above the limit this harness spends
+    /// without being told; the estimate and the limit are printed either way.
+    #[arg(long)]
+    yes: bool,
+    /// Re-run the runs this directory recorded as failed, and nothing else.
+    #[arg(long)]
+    retry_failed: bool,
+    /// The ledger of what has been bought, shared by every run directory so
+    /// that a second --out cannot buy what the first one already has. Defaults
+    /// to `$S1M_LEDGER`, else a file under `$XDG_DATA_HOME`, else under `$HOME`.
+    #[arg(long)]
+    ledger: Option<PathBuf>,
     /// The page a query with no `entry` of its own starts from. Repeat it for
     /// a wiki with several ways in; the default is the `index.md` convention.
     #[arg(long, default_values_t = [String::from("index.md")])]
@@ -162,6 +182,10 @@ fn dispatch(command: Command) -> Result<(), String> {
             repeats,
             conditions,
             cache_dir,
+            estimate,
+            yes,
+            retry_failed,
+            ledger,
             entry,
             model,
             s1m,
@@ -177,6 +201,10 @@ fn dispatch(command: Command) -> Result<(), String> {
             repeats,
             conditions,
             cache_dir,
+            estimate,
+            yes,
+            retry_failed,
+            ledger,
             entry,
             model,
             s1m: s1m.unwrap_or_else(beside_me),

@@ -9,8 +9,11 @@
 //! label that looks like a path or reads like a sentence stops the report
 //! rather than appearing in it.
 
+use std::collections::BTreeSet;
+
 use crate::aggregate::{Aggregates, Group};
 use crate::graph::{self, GraphStats};
+use crate::row::Row;
 use serde::{Deserialize, Serialize};
 
 /// How a run was made: flags and constants, never a path or a query.
@@ -32,6 +35,56 @@ pub struct Method {
     #[serde(default)]
     pub thoroughness: String,
     pub chars_per_token: usize,
+}
+
+impl Method {
+    /// The method the rows describe.
+    ///
+    /// A resumed pass writes aggregates for every row in its directory, the
+    /// ones an earlier pass made included, so what the table says about them
+    /// has to be read back from them: the conditions, the repeats and the model
+    /// asked for are the rows' own, and a pass that adds five runs to a
+    /// directory does not get to rewrite the provenance of the other three
+    /// hundred. The flags, the prompts and the thoroughness are constants of
+    /// this harness rather than anything a row holds, and stay constants.
+    pub fn from_rows(rows: &[Row]) -> Method {
+        let conditions: Vec<String> = rows
+            .iter()
+            .map(|row| row.condition.clone())
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        // The design the rows came from: a pass interrupted after two of its
+        // three repeats says two, and a directory two passes wrote into says
+        // the longer of them.
+        let repeats = rows.iter().map(|row| row.repeat + 1).max().unwrap_or(0);
+        // Rows that agree on the model asked for are the method; rows that
+        // disagree are a directory two passes measured into, and naming both
+        // beats naming one of them.
+        let asked: BTreeSet<&String> = rows
+            .iter()
+            .filter_map(|row| row.model_asked_for.as_ref())
+            .collect();
+        let claude_model = match asked.len() {
+            0 => crate::run::DEFAULT_MODEL.to_string(),
+            _ => asked
+                .iter()
+                .map(|model| model.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        };
+        Method {
+            repeats,
+            conditions,
+            claude_model,
+            claude_flags: crate::run::method_flags(),
+            s1m_flags: crate::run::s1m_flags(),
+            explore_prompt: crate::run::EXPLORE_PROMPT.to_string(),
+            s1m_agent_prompt: crate::run::S1M_AGENT_PROMPT.to_string(),
+            thoroughness: crate::run::THOROUGHNESS.to_string(),
+            chars_per_token: crate::reading::CHARS_PER_TOKEN,
+        }
+    }
 }
 
 /// The longest a label may be before it is treated as prose.
@@ -62,6 +115,7 @@ pub fn render(
     // Everything below is rendered from files this process did not write, so
     // every string in them is checked before any of it is printed.
     check(method)?;
+    check_aggregates(aggregates)?;
     if let Some(stats) = stats {
         check_stats(stats)?;
     }
@@ -101,15 +155,28 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         "| Conditions | {} |\n",
         method.conditions.join(", ")
     ));
-    // A run that named no model is a run whose models Claude Code chose, and
-    // the subagent's may not be the parent's; the rows record what answered.
-    out.push_str(&match method.claude_model.as_str() {
-        crate::run::DEFAULT_MODEL => "| Agent model | Claude Code's own: no \
-             `--model` flag was passed, so the parent and its subagent each \
-             took their default |\n"
-            .to_string(),
-        model => format!("| Agent model | `{model}` |\n"),
-    });
+    // The tier the numbers were measured at, which is not the same question as
+    // what was asked for: the Explore agent inherits the session's model, and
+    // the rows are where that is written down.
+    let models = models(aggregates);
+    if agents_ran(aggregates) {
+        // A run that named no model is a run whose models Claude Code chose,
+        // and the subagent's may not be the parent's; the rows record what
+        // answered.
+        out.push_str(&match method.claude_model.as_str() {
+            crate::run::DEFAULT_MODEL => "| Agent model | Claude Code's own: no \
+                 `--model` flag was passed, so the parent and its subagent each \
+                 took their default |\n"
+                .to_string(),
+            model => format!("| Agent model | `{model}` |\n"),
+        });
+        out.push_str(&format!("| Models measured | {models} |\n"));
+    } else {
+        // No agent ran, so there is no model to name and nothing answered:
+        // saying what Claude Code would have used would be saying it about a
+        // run that was never made.
+        out.push_str(&format!("| Agent model | {models} |\n"));
+    }
     out.push_str(&format!(
         "| Agent flags | {} |\n",
         flags(&method.claude_flags)
@@ -125,6 +192,28 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         "| Agent tokens | returned characters at {} a token |\n",
         method.chars_per_token
     ));
+    out.push_str(&format!(
+        "| Wiki revision | {} |\n",
+        revisions(&aggregates.wiki)
+    ));
+    if let Some(bought) = aggregates.bought {
+        let measured = measured_runs(aggregates);
+        out.push_str(&format!(
+            "| Runs | {bought} bought, {measured} measured |\n"
+        ));
+        // Only one direction of difference means a missing measurement: a
+        // retried run appends a row of its own for a run the ledger holds one
+        // entry for, so more rows than purchases says the opposite, and is left
+        // to the caveats rather than called a missing run here.
+        if bought > measured {
+            out.push_str(&format!(
+                "\n{bought} runs were bought for this directory and {measured} rows \
+                 are in it. A run is recorded before it is paid for and its row \
+                 after it is measured, so a purchase with no row is a run that was \
+                 bought and left unmeasured.\n"
+            ));
+        }
+    }
     out.push_str(
         "\nThe Explore agent is dispatched by the parent, and on this build it \
          inherits the session's model rather than declaring one of its own: \
@@ -144,6 +233,63 @@ fn method_section(out: &mut String, method: &Method, aggregates: &Aggregates) {
         out.push_str(&quote(&method.s1m_agent_prompt));
     }
     out.push('\n');
+}
+
+/// The tier the numbers were measured at, by how many runs each: read back from
+/// the rows rather than from the flag, so it is what answered and not what was
+/// asked for. A condition that runs an agent whose rows name no model says so,
+/// instead of leaving the reader to guess from the flag.
+fn models(aggregates: &Aggregates) -> String {
+    if !aggregates.models.is_empty() {
+        return aggregates
+            .models
+            .iter()
+            .map(|(model, runs)| {
+                format!(
+                    "`{model}` ({runs} run{})",
+                    if *runs == 1 { "" } else { "s" }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+    }
+    if agents_ran(aggregates) {
+        "not recorded".to_string()
+    } else {
+        "none: no agent condition ran".to_string()
+    }
+}
+
+/// Whether any measured condition runs an agent: the two whose runs are on a
+/// model, and so the only ones an agent model row is about.
+fn agents_ran(aggregates: &Aggregates) -> bool {
+    aggregates
+        .conditions
+        .keys()
+        .any(|condition| crate::row::agent_condition(condition))
+}
+
+/// The cut of the wiki the rows were measured against. Rows from more than one
+/// cut are the thing this cannot unpick, and it says so rather than naming one
+/// of them as though it were all of them.
+fn revisions(revisions: &[String]) -> String {
+    match revisions {
+        [] => "not recorded".to_string(),
+        [one] => format!("`{one}`"),
+        many => format!(
+            "more than one: the rows were measured against {} cuts",
+            many.len()
+        ),
+    }
+}
+
+/// How many runs produced a row, over every condition.
+fn measured_runs(aggregates: &Aggregates) -> usize {
+    aggregates
+        .conditions
+        .values()
+        .map(|condition| condition.overall.runs)
+        .sum()
 }
 
 /// The flags as a reader would type them, back-quoted one by one.
@@ -297,6 +443,16 @@ fn caveats_section(out: &mut String) {
         "The two conditions are not the same shape of work: s1m returns a \
          reading list and answers nothing, the agent reads until it can answer. \
          The `s1m-agent` condition is the one that compares like with like.",
+        "The method table is read back from the rows and not from the command \
+         that wrote them, so a pass that resumes a directory describes the rows \
+         in it. The wiki revision it names is a hash of the pages the walk \
+         reads; rows measured against more than one cut are named as more than \
+         one, and which row came from which cut is in the raw rows.",
+        "A run is recorded when it is bought and its row when it has been \
+         measured, so *Runs* counts both: a directory with more runs bought than \
+         rows holds a run that was paid for and never measured, and one with more \
+         rows than runs holds a retried run, whose second attempt is a row of its \
+         own and not a new purchase.",
     ] {
         out.push_str(&format!("- {caveat}\n"));
     }
@@ -363,8 +519,12 @@ fn nothing_to_report(group: &Group, metric: &str) -> bool {
 
 /// A number at the precision it means something: money to six places, rates to
 /// two, and anything counted in tokens or milliseconds whole. A cost of a tenth
-/// of a cent is a real number and must not print as zero.
-fn number(value: f64) -> String {
+/// of a cent is a real number and must not print as zero — which is every cost
+/// this harness has, the free conditions included.
+///
+/// Shared with the estimate the runner prints, so that what a report calls a
+/// cost and what a pass calls one are written the same way.
+pub fn number(value: f64) -> String {
     if value != 0.0 && value.abs() < 0.01 {
         return format!("{value:.6}");
     }
@@ -408,6 +568,43 @@ fn check(method: &Method) -> Result<(), String> {
     template(&method.explore_prompt, &["<query>", "<entry>"])?;
     if !method.s1m_agent_prompt.is_empty() {
         template(&method.s1m_agent_prompt, &["<query>", "<files>"])?;
+    }
+    Ok(())
+}
+
+/// The aggregates, as a file gave them. The models and the wiki revisions are
+/// the two strings in them a report may print, and they go through the same
+/// gate as every other label: they come from a file this process did not write.
+fn check_aggregates(aggregates: &Aggregates) -> Result<(), String> {
+    for revision in &aggregates.wiki {
+        revision_label(revision)?;
+    }
+    for model in aggregates.models.keys() {
+        safe(model)?;
+    }
+    Ok(())
+}
+
+/// A wiki revision is something this harness writes and nobody else's file
+/// chooses the shape of: a prefix and a hex digest. Anything else is refused
+/// rather than printed.
+fn revision_label(revision: &str) -> Result<(), String> {
+    let refused = || {
+        format!(
+            "{revision:?} is not a wiki revision: a report names one as this \
+             harness writes it, `sha256:<hex>` or `git:<hex>`"
+        )
+    };
+    let Some((prefix, digest)) = revision.split_once(':') else {
+        return Err(refused());
+    };
+    if !["sha256", "git"].contains(&prefix)
+        || !(6..=64).contains(&digest.len())
+        || !digest
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err(refused());
     }
     Ok(())
 }
@@ -488,13 +685,20 @@ mod tests {
     use crate::row::Row;
     use std::collections::BTreeMap;
 
+    /// The revision these rows were measured against, in the shape this
+    /// harness writes one.
+    const WIKI: &str = "sha256:0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0";
+
     fn row(id: &str, category: &str, condition: &str, recall: f64) -> Row {
         Row {
             query_id: id.to_string(),
             category: category.to_string(),
             condition: condition.to_string(),
             repeat: 0,
+            wiki: WIKI.to_string(),
             ok: true,
+            model_asked_for: None,
+            models: Vec::new(),
             metrics: BTreeMap::from([
                 ("recall".to_string(), recall),
                 ("precision".to_string(), 0.5),
@@ -844,5 +1048,197 @@ mod tests {
         )
         .expect("a report");
         assert!(report.contains("—"), "{report}");
+    }
+    /// The method is read back from the rows, not from the command that wrote
+    /// them: a pass that resumes a directory describes the rows in it.
+    #[test]
+    fn the_method_is_read_back_from_the_rows() {
+        let rows = vec![
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "how-to", "explore", 1.0)
+            },
+            Row {
+                repeat: 1,
+                model_asked_for: Some("sonnet".to_string()),
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "explore", 0.0)
+            },
+        ];
+        let method = Method::from_rows(&rows);
+        assert_eq!(method.conditions, vec!["explore".to_string()]);
+        assert_eq!(method.repeats, 2, "two repeats were made");
+        assert_eq!(method.claude_model, "sonnet");
+        // The flags and the prompts are the harness's, not the rows'.
+        assert_eq!(method.claude_flags, crate::run::method_flags());
+        assert_eq!(method.explore_prompt, crate::run::EXPLORE_PROMPT);
+
+        // Rows that disagree about the model name both rather than one.
+        let rows = vec![
+            Row {
+                model_asked_for: Some("sonnet".to_string()),
+                ..row("one", "how-to", "explore", 1.0)
+            },
+            Row {
+                model_asked_for: Some("haiku".to_string()),
+                ..row("one", "how-to", "explore", 1.0)
+            },
+        ];
+        assert_eq!(Method::from_rows(&rows).claude_model, "haiku, sonnet");
+
+        // Nothing measured is nothing described, and no model was asked for.
+        let empty = Method::from_rows(&[]);
+        assert_eq!((empty.repeats, empty.conditions.len()), (0, 0));
+        assert_eq!(empty.claude_model, crate::run::DEFAULT_MODEL);
+    }
+
+    /// The method table names the tier that answered and the cut of the wiki the
+    /// rows were measured against, both read back from the rows.
+    #[test]
+    fn the_method_table_names_the_tier_and_the_revision_measured() {
+        let rows = vec![
+            Row {
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "explore", 1.0)
+            },
+            Row {
+                models: vec!["claude-sonnet-5".to_string()],
+                ..row("one", "how-to", "s1m-agent", 0.5)
+            },
+        ];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Models measured | `claude-sonnet-5` (2 runs) |"),
+            "{report}"
+        );
+        assert!(
+            report.contains(&format!("| Wiki revision | `{WIKI}` |")),
+            "{report}"
+        );
+
+        // No agent ran: there is no tier to name, and saying what Claude Code
+        // would have used would be saying it about a run that was never made.
+        let rows = vec![row("one", "how-to", "s1m", 1.0)];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Agent model | none: no agent condition ran |"),
+            "{report}"
+        );
+        assert!(!report.contains("Models measured"), "{report}");
+
+        // An agent ran and its rows named no model: not recorded, rather than
+        // a claim that none was used.
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Models measured | not recorded |"),
+            "{report}"
+        );
+    }
+
+    /// Rows measured against two cuts of a wiki are the one thing a report
+    /// cannot unpick, and it says so rather than naming one of them.
+    #[test]
+    fn a_directory_that_mixed_two_cuts_says_so() {
+        let rows = vec![
+            row("one", "how-to", "explore", 1.0),
+            Row {
+                wiki: "sha256:1111222233334444555566667777888899990000aaaabbbbccccddddeeeeffff"
+                    .to_string(),
+                ..row("one", "how-to", "explore", 0.0)
+            },
+        ];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains(
+                "| Wiki revision | more than one: the rows were measured against 2 cuts |"
+            ),
+            "{report}"
+        );
+
+        // A row from before revisions were recorded says that, too.
+        let rows = vec![Row {
+            wiki: String::new(),
+            ..row("one", "how-to", "explore", 1.0)
+        }];
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Wiki revision | not recorded |"),
+            "{report}"
+        );
+    }
+
+    /// Runs bought and rows measured are two counts of the same ledger, and a
+    /// directory with more of the first is one whose record is incomplete.
+    #[test]
+    fn the_report_says_what_was_bought_beside_what_was_measured() {
+        let rows = vec![row("one", "how-to", "s1m", 1.0)];
+        let mut aggregates = aggregate(&rows);
+        aggregates.bought = Some(3);
+        let report = render(&aggregates, None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Runs | 3 bought, 1 measured |"),
+            "{report}"
+        );
+        assert!(report.contains("left unmeasured"), "{report}");
+
+        // In step with each other, there is nothing to explain.
+        aggregates.bought = Some(1);
+        let report = render(&aggregates, None, &Method::from_rows(&rows)).expect("a report");
+        assert!(
+            report.contains("| Runs | 1 bought, 1 measured |"),
+            "{report}"
+        );
+        assert!(!report.contains("left unmeasured"), "{report}");
+
+        // More rows than purchases is the other direction: a run retried after
+        // it failed is a second row and not a second purchase, and calling that
+        // a missing measurement would say the opposite of what happened.
+        let retried = vec![
+            row("one", "how-to", "s1m", 0.0),
+            row("one", "how-to", "s1m", 1.0),
+        ];
+        let mut twice = aggregate(&retried);
+        twice.bought = Some(1);
+        let report = render(&twice, None, &Method::from_rows(&retried)).expect("a report");
+        assert!(
+            report.contains("| Runs | 1 bought, 2 measured |"),
+            "{report}"
+        );
+        assert!(!report.contains("left unmeasured"), "{report}");
+
+        // A directory whose aggregates predate the ledger does not claim one.
+        let report = render(&aggregate(&rows), None, &Method::from_rows(&rows)).expect("a report");
+        assert!(!report.contains(" bought, "), "{report}");
+    }
+
+    /// The models and the revisions in the aggregates are strings from a file
+    /// this process did not write, and go through the same gate as everything
+    /// else a report prints.
+    #[test]
+    fn a_crafted_aggregates_file_cannot_name_a_model_or_a_revision() {
+        let rows = vec![row("one", "how-to", "explore", 1.0)];
+        let mut aggregates = aggregate(&rows);
+
+        aggregates.models = BTreeMap::from([("notes/private.md".to_string(), 1)]);
+        assert!(render(&aggregates, None, &method()).is_err());
+        aggregates.models = BTreeMap::from([("claude-sonnet-5".to_string(), 1)]);
+        assert!(render(&aggregates, None, &method()).is_ok());
+
+        for bad in [
+            "/home/someone/wiki",
+            "the wiki as of yesterday",
+            "sha256:zzzz",
+            "sha256:abc",
+            "md5:0f1e2d3c",
+        ] {
+            aggregates.wiki = vec![bad.to_string()];
+            assert!(
+                render(&aggregates, None, &method()).is_err(),
+                "{bad:?} was printed"
+            );
+        }
+        aggregates.wiki = vec!["sha256:0f1e2d3c".to_string(), "git:abcdef1".to_string()];
+        assert!(render(&aggregates, None, &method()).is_ok());
     }
 }
