@@ -42,8 +42,7 @@ real pages is in [docs/spike-notes.md](spike-notes.md).
 macOS and Linux install a prebuilt binary, with no Rust toolchain:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
+curl -LsSf https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
 ```
 
 `latest` selects a *release*, and the installer that release carries is pinned to it: it fetches
@@ -71,8 +70,7 @@ needs: `s1m --version` answers `s1m 0.1.0` in it.
 Pin the version by fetching that release's installer instead of `latest`'s:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
+curl -LsSf https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
 ```
 
 A platform the release does not carry is refused before anything is downloaded, with exit 1 and
@@ -83,7 +81,9 @@ $ sh s1m-installer.sh
 ERROR: there isn't a download for your platform x86_64-unknown-freebsd
 ```
 
-Windows is not supported, and neither is any Linux the archives were not built for.
+Windows is not supported, and neither is any Linux the archives were not built for. The two
+Linux archives are built on Ubuntu 22.04 runners, so a Linux whose glibc is older than 2.35 is
+refused the same way: `System glibc version … is too old`, and then the message above.
 
 ### The archives directly
 

@@ -43,8 +43,7 @@ associative trails through linked documents.
 # macOS or Linux, no Rust toolchain: the installer detects the platform,
 # checks the archive against its SHA-256, and writes `s1m` to $XDG_BIN_HOME,
 # or to ~/.local/bin when that is unset. It never needs sudo.
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
+curl -LsSf https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
 
 # Run it on the wiki vendored in this repository. No API key needed: the answers
 # are in the committed cache, which is why the run reports 0 calls.
@@ -59,8 +58,7 @@ Two other ways in, for anyone who would rather not pipe a script into a shell. P
 the installer is pinned to the release it came from, and resolves nothing through `latest`:
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
+curl -LsSf https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
 ```
 
 Or take the archive for your platform and its `.sha256` from the
