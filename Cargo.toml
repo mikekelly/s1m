@@ -5,7 +5,14 @@ edition = "2024"
 rust-version = "1.85"
 description = "Reads local markdown files and ranks them for a query, so an agent opens only what matters."
 license = "MIT"
+repository = "https://github.com/mikekelly/s1m"
 publish = false
+
+# `publish = false` hides the binary from `dist`, which releases it as prebuilt
+# archives and a shell installer instead (#81); which binaries those archives
+# carry is in dist-workspace.toml.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 anyhow = "1.0.104"
@@ -20,3 +27,8 @@ serde_json = "1.0.151"
 sha2 = "0.10"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "time"] }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

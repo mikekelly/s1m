@@ -764,9 +764,8 @@ mod tests {
     #[test]
     fn the_page_needs_nothing_but_itself() {
         let dir = TempDir::new("player-standalone");
-        let page = Run::read(&walked(&dir))
-            .expect("the trace should read")
-            .render();
+        let trace = walked(&dir);
+        let page = Run::read(&trace).expect("the trace should read").render();
 
         assert!(page.starts_with("<!doctype html>"), "a whole page");
         assert!(!page.contains("/*__S1M_RUN__*/"), "the hole is filled");
@@ -787,7 +786,7 @@ mod tests {
         assert!(page.contains("id=\"run\""), "the records are in the page");
         assert_eq!(
             page,
-            Run::read(&walked(&dir)).expect("again").render(),
+            Run::read(&trace).expect("again").render(),
             "the same trace is the same page"
         );
     }
