@@ -2,11 +2,11 @@
 
 **High-efficiency knowledge recall from an LLM wiki, powered by Jev.**
 
-Give s1m a question and a page to start from. For that question, Jev judges each page the walk
-reaches — how relevant it is, which of its sections matter, and which of its links are worth
-following — and the walk takes the strongest link next. It reads a few pages of the wiki, not
-all of it, and stops when nothing promising is left. What comes back is a ranked reading list:
-the files and line ranges worth opening to answer that question.
+Point s1m at an LLM wiki with a query. Starting from the page you name, it uses Jev's judgement
+to decide which of the page's links are worth following for that query, travels the knowledge
+base along them, and records the documents and sections that are useful as it goes. When no
+promising link is left it stops, and what it hands back is that record: a ranked reading list
+of files and line ranges, ready for an agent to open.
 
 [![CI](https://github.com/mikekelly/s1m/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mikekelly/s1m/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
