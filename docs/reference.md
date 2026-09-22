@@ -314,7 +314,9 @@ S1M_CACHE_DIR=eval/cache s1m --trace run.jsonl \
 s1m play run.jsonl
 ```
 
-![A run played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](player.png)
+![A run played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](player.gif)
+
+The recording above is that page playing the same trace, stepped an event at a time.
 
 The page is the walk in the order it happened. A file appears when the walk pops it — dashed while
 it waits on the frontier, dropped when a budget took it first — and carries its relevance, its

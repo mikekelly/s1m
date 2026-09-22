@@ -207,8 +207,9 @@ walk did as it did it, and `s1m play run.jsonl` draws that trace as one page: th
 as the walk pops them, the links it followed beside the ones it passed over, the reading list
 filling in, and the evidence for any file a click away. It is a local file — no server, no
 request, nothing fetched — and [the reference](docs/reference.md#playing-a-trace) has the rest.
+The recording below is that page playing the run above, a trace event at a time.
 
-![The run above, played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](docs/player.png)
+![The run above, played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](docs/player.gif)
 
 ## The reference, area by area
 
