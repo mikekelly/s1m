@@ -7,9 +7,10 @@
 //! since the same request does not come back bit-for-bit identical — a repeat
 //! run answered from the cache instead of the API.
 //!
-//! The pages scored are public and committed — the vendored wiki in
-//! `eval/wikis/llm-wiki-manager/` and this repository's own plan — so the runs
-//! the notes describe can be repeated.
+//! The pages scored are committed — the vendored wiki in
+//! `eval/wikis/llm-wiki-manager/`, this repository's own plan, and the fixture
+//! page written for the cap test — so the runs the notes describe can be
+//! repeated.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -285,27 +286,52 @@ async fn a_hub_page_too_big_for_one_request_is_split_and_answered() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// The page over the content cap, written for the test below and named for what
+/// it is: no document that has to stay true decides whether the cap is still
+/// tested. The README this used to be stopped being over the cap when [#75]
+/// moved the reference out of it ([#77]).
+///
+/// [#75]: https://github.com/mikekelly/s1m/issues/75
+/// [#77]: https://github.com/mikekelly/s1m/issues/77
+const OVERSIZED: &str = "tests/fixtures/oversized-page.md";
+
 /// A page over the content cap is judged in full ([#53]): the whole page goes
 /// to the API — the tail in a post of its own — and the section written past
 /// the cap is read for what it says instead of being judged from its heading.
 ///
-/// The page is this repository's own README, which is public and committed and
-/// over the cap on its own; its last section is "Development", so a query about
-/// running the tests is a query about the tail the cap used to cut.
+/// The page is [`OVERSIZED`], which is over the cap on its own and whose last
+/// section is "Development", opening past the cap, so a query about running the
+/// tests is a query about the tail the cap used to cut.
 ///
 /// [#53]: https://github.com/mikekelly/s1m/issues/53
 #[tokio::test]
 async fn a_page_over_the_content_cap_is_judged_in_full() {
-    let root = repo();
+    let root = repo().join("tests/fixtures");
     let Some(scorer) = live_scorer(&root) else {
         return;
     };
-    let file = page(&root, "README.md");
-    let source = fs::read_to_string(root.join("README.md")).expect("the README");
+    let file = page(&root, "oversized-page.md");
+    let source = fs::read_to_string(repo().join(OVERSIZED)).expect("the fixture");
     assert!(
         source.chars().count() > 40_000,
         "the page has to be over the cap the split works to for this to test it: {} characters",
         source.chars().count()
+    );
+    // And the section the query is about has to open past that cap, or the
+    // answer could come from a page the cap never cut.
+    let tail = file
+        .sections
+        .iter()
+        .find(|section| section.heading.as_deref() == Some("Development"))
+        .expect("the fixture's last section is Development");
+    let before: usize = source
+        .lines()
+        .take(tail.lines[0] - 1)
+        .map(|line| line.chars().count() + 1)
+        .sum();
+    assert!(
+        before > 40_000,
+        "the fixture's Development has to open past the cap to be the tail the cap cut: {before} characters"
     );
 
     let outcome = scorer
@@ -324,12 +350,12 @@ async fn a_page_over_the_content_cap_is_judged_in_full() {
         outcome.detail.questions,
         outcome.detail.requests
     );
-    // The tail is judged as text: the last section of the README opens past the
+    // The tail is judged as text: the last section of the page opens past the
     // cap, and it is the one this query is about.
     let development = section(&outcome.judgment, "Development");
     assert!(
         development > 0.5,
-        "the README's last section is what the query asks for, and it scored {development}"
+        "the fixture's last section is what the query asks for, and it scored {development}"
     );
 }
 
