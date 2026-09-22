@@ -26,8 +26,7 @@
 //!
 //! A trace holds the paths of whatever wiki it was made over and the query it
 //! was made for, and the page holds the trace. Both are artifacts of the run,
-//! to be kept where the run's own `--out` directory is kept and never
-//! committed.
+//! to be kept where an eval's `--out` directory is kept and never committed.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -163,13 +162,13 @@ enum Record {
 
 /// What a run cost, in the numbers the page's header reports.
 ///
-/// The walk's own accounting and not the reading list's: `files` counts the
-/// visits, so a file a round put back on the frontier is counted once, and
-/// `bought` against `cached` says what the run paid for rather than what it
+/// The walk's own accounting and not the reading list's: `files` counts files
+/// and not visits, so a file a round put back on the frontier is one of them,
+/// and `bought` against `cached` says what the run paid for rather than what it
 /// looked at.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Summary {
-    /// Files the walk visited: one per `result` record, counted once each.
+    /// Files the walk visited: the distinct paths of its `result` records.
     pub files: usize,
     /// Turns a file took off the frontier. More than [`Summary::files`] when a
     /// round's own answers overtook a file it had popped and put it back.

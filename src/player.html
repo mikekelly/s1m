@@ -245,7 +245,7 @@ function node(path) {
   if (!found) {
     found = {
       path: path, name: nameOf(path), dir: dirOf(path),
-      depth: null, score: null, via: [], first: null, pop: null,
+      depth: null, score: null, via: [], first: null, pop: null, pops: [],
       answer: null, result: null, dropped: null, requests: 0,
     };
     nodes.set(path, found);
@@ -262,6 +262,13 @@ EVENTS.forEach(function (record, at) {
   switch (record.event) {
     case "popped": {
       const n = node(record.path);
+      // A file can be popped more than once — a round's own answers can
+      // overtake one it popped, and the walk puts it back on the frontier — and
+      // each pop has its own path score and depth. They are all kept, so the
+      // paint can show the pop in effect at the step on screen rather than the
+      // last one the walk will make; `score`, `depth` and `via` stay the last
+      // pop's, which is the visit the detail panel reports.
+      n.pops.push({ at: at, score: record.path_score, depth: record.depth });
       n.depth = record.depth;
       n.score = record.path_score;
       n.via = record.via || [];
@@ -286,11 +293,17 @@ EVENTS.forEach(function (record, at) {
       const from = node(record.source);
       if (to.depth === null) to.depth = (from.depth === null ? 0 : from.depth) + 1;
       if (to.first === null) to.first = at;
+      // A trace that is not whole — one a caller filtered, or one whose source
+      // records are an event kind this player does not know — can name a file
+      // that has no record of its own. The edge is drawn from it either way, so
+      // its box is shown rather than left invisible under the line.
+      if (from.first === null) from.first = at;
       admissions.push({ source: record.source, target: record.target, scent: record.scent, at: at });
       break;
     }
     case "pruned": {
       const from = node(record.source);
+      if (from.first === null) from.first = at;
       if (record.reason === "beam" || record.reason === "max-files") {
         const to = node(record.target);
         if (to.depth === null) to.depth = (from.depth === null ? 0 : from.depth) + 1;
@@ -444,7 +457,7 @@ nodes.forEach(function (n) {
 
   box.addEventListener("click", function () { select(n.path); });
   layer.appendChild(box);
-  nodeElements.set(n.path, { node: n, box: box, chip: chip, value: value, fill: fill, strip: strip, ticks: [] });
+  nodeElements.set(n.path, { node: n, box: box, chip: chip, value: value, fill: fill, depth: depth, strip: strip, ticks: [] });
 });
 
 ticks.forEach(function (tick) {
@@ -530,7 +543,7 @@ function spelling(reason) {
   return String(reason).replace(/-/g, " ");
 }
 
-function select(path) {
+function select(path, from) {
   selected = path;
   nodeElements.forEach(function (held, key) {
     held.box.classList.toggle("selected", key === path);
@@ -538,19 +551,28 @@ function select(path) {
   listRows.forEach(function (held) {
     held.row.classList.toggle("selected", held.entry.record.path === path);
   });
-  edgeElements.forEach(function (held) {
-    const mine = held.edge.source === path || held.edge.target === path;
-    held.path.style.strokeWidth = mine ? "2.6" : (held.edge.kind === "followed"
-      ? (1 + 2.2 * held.edge.scent).toFixed(2) : "1.2");
-    held.path.style.opacity = mine ? "0.85" : "";
-    held.label.style.opacity = mine ? "1" : "";
-  });
   detail.replaceChildren();
   if (!path) {
     detail.appendChild(element("p", "quiet", "Pick a file — on the crawl or in the list — to see how the walk reached it and what earned it its place."));
+    paint();
     return;
   }
   const n = nodes.get(path);
+  if (!n) {
+    // A file only a passed-over link names: the walk never queued it, so there
+    // is no box to highlight and nothing in the trace about it but the link
+    // that offered it.
+    detail.appendChild(element("h3", null, path));
+    const offered = from === undefined ? null
+      : prunings.find(function (prune) { return prune.source === from && prune.target === path; });
+    detail.appendChild(element("p", "quiet", offered
+      ? "Offered by " + from + " and " + spelling(offered.reason)
+        + (offered.scent === null || offered.scent === undefined ? "" : " at " + offered.scent.toFixed(2))
+        + ": the walk never queued it, so the trace holds nothing else about it."
+      : "The walk never queued this file: the trace holds nothing about it but the record that names it."));
+    paint();
+    return;
+  }
   const answered = answerOf(n);
   detail.appendChild(element("h3", null, path));
 
@@ -641,12 +663,16 @@ function select(path) {
       row.appendChild(element("td", "s", link.scent === null || link.scent === undefined
         ? "—" : link.scent.toFixed(2)));
       row.appendChild(element("td", "v", link.reason ? spelling(link.reason) : "followed"));
-      row.addEventListener("click", function () { select(link.target); });
+      row.addEventListener("click", function () { select(link.target, path); });
       body.appendChild(row);
     });
     table.appendChild(body);
     detail.appendChild(table);
   }
+  // Every edge's width, colour and label belong to the paint, so selecting
+  // repaints rather than setting the same three properties a second time and
+  // getting one of them wrong.
+  paint();
 }
 
 function answerOf(n) { return n.answer === null ? null : EVENTS[n.answer]; }
@@ -684,7 +710,8 @@ function describe(record) {
       (record.cached ? " (from the cache)" : "");
     case "admitted": return "followed " + record.source + " → " + record.target +
       " at " + record.scent.toFixed(2);
-    case "pruned": return "passed over " + record.target + " (" + spelling(record.reason) + ")";
+    case "pruned": return (record.reason === "beam" || record.reason === "max-files"
+      ? "dropped " : "passed over ") + record.target + " (" + spelling(record.reason) + ")";
     case "result": return "visited " + record.path + (record.earned_a_place ? " — in the list" : "");
     default: return record.event;
   }
@@ -702,14 +729,19 @@ function paint() {
     held.box.classList.toggle("dropped", dropped);
     const answered = n.answer !== null && n.answer <= step;
     held.box.classList.toggle("answered", answered);
+    // The pop in effect at this step, not the last one the file will take: a
+    // file popped twice shows the score and depth it arrived at the first time
+    // until the second pop reaches it.
+    const pop = n.pops.filter(function (each) { return each.at <= step; }).pop();
+    held.depth.textContent = pop ? "d" + pop.depth : "";
     if (answered) {
       const relevance = EVENTS[n.answer].relevance;
       held.value.textContent = relevance.toFixed(2);
       held.value.classList.remove("none");
       held.fill.style.width = (relevance * 100).toFixed(1) + "%";
     } else {
-      held.value.textContent = popped && n.score !== null ? n.score.toFixed(2) : "·";
-      held.value.classList.toggle("none", !popped);
+      held.value.textContent = pop ? pop.score.toFixed(2) : "·";
+      held.value.classList.toggle("none", !pop);
       held.fill.style.width = "0%";
     }
     const resulted = n.result !== null && n.result <= step;
@@ -721,11 +753,13 @@ function paint() {
   });
 
   edgeElements.forEach(function (held) {
+    const mine = held.edge.source === selected || held.edge.target === selected;
     const visible = held.edge.at <= step;
-    held.path.style.opacity = visible ? (held.edge.source === selected || held.edge.target === selected
-      ? "0.85" : (held.edge.kind === "followed" ? String(0.25 + 0.6 * held.edge.scent) : "0.35")) : "0";
-    held.label.style.opacity = visible && (held.edge.source === selected || held.edge.target === selected
-      || held.edge.at === step) ? "1" : "0";
+    held.path.style.strokeWidth = mine ? "2.6" : (held.edge.kind === "followed"
+      ? (1 + 2.2 * held.edge.scent).toFixed(2) : "1.2");
+    held.path.style.opacity = visible ? (mine ? "0.85"
+      : (held.edge.kind === "followed" ? String(0.25 + 0.6 * held.edge.scent) : "0.35")) : "0";
+    held.label.style.opacity = visible && (mine || held.edge.at === step) ? "1" : "0";
   });
 
   nodeElements.forEach(function (held) {
@@ -789,7 +823,14 @@ document.getElementById("back").addEventListener("click", function () { stop(); 
 document.getElementById("speed").addEventListener("change", function () {
   if (playing) { clearTimeout(timer); timer = setTimeout(advance, interval()); }
 });
-scrub.addEventListener("input", function () { stop(); go(Number(scrub.value)); });
+// The value is read before `stop()`, which paints and puts the range back to
+// the step on screen: read after it, every drag would ask to go where the run
+// already is and the scrubber would never move anything.
+scrub.addEventListener("input", function () {
+  const to = Number(scrub.value);
+  stop();
+  go(to);
+});
 document.addEventListener("keydown", function (event) {
   // A control the reader is on keeps its own keys: space on a button is that
   // button, and the arrows on the scrubber are the scrubber.
@@ -868,7 +909,13 @@ document.addEventListener("keydown", function (event) {
   order.forEach(function (reason) {
     if (!counts.has(reason)) return;
     any = true;
-    legend.appendChild(element("div", "key", spelling(reason) + " × " + counts.get(reason)));
+    // A path a budget dropped is not a link the walk passed over: the link was
+    // followed, and what became of the path it queued is the dropped file's own
+    // box, which says so. The two are counted apart so no reader goes looking
+    // for a tick that was never drawn.
+    const dropped = reason === "beam" || reason === "max-files";
+    legend.appendChild(element("div", "key", spelling(reason) + " × " + counts.get(reason) +
+      (dropped ? " (a queued path a budget dropped)" : "")));
   });
   if (!any) legend.appendChild(element("div", "key", "every link it judged was followed"));
 })();
