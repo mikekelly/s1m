@@ -190,9 +190,6 @@ pub struct Summary {
     /// [`Summary::files`]: a file a round put back on the frontier and visited
     /// twice earns one place.
     pub earned: usize,
-    /// What the calls that were bought took together. Not the wall time when
-    /// they overlapped, and not counting an answer that came off the disk.
-    pub latency_ms: u64,
     /// The last record's `t_ms`: how long the walk took on the clock.
     pub duration_ms: u64,
 }
@@ -358,7 +355,6 @@ fn summarise(records: &[Record]) -> Summary {
         passed_over: 0,
         dropped: 0,
         earned: 0,
-        latency_ms: 0,
         duration_ms: 0,
     };
     let mut files = BTreeSet::new();
@@ -376,16 +372,14 @@ fn summarise(records: &[Record]) -> Summary {
             }
             Record::Answered {
                 t_ms,
-                latency_ms,
-                cached,
+                cached: from_cache,
                 ..
             } => {
                 summary.answered += 1;
-                if *cached {
+                if *from_cache {
                     summary.cached += 1;
                 } else {
                     summary.bought += 1;
-                    summary.latency_ms += latency_ms;
                 }
                 summary.duration_ms = summary.duration_ms.max(*t_ms);
             }
@@ -623,15 +617,11 @@ mod tests {
         assert_eq!(summary.passed_over, 1, "the link under the threshold");
         assert_eq!(summary.dropped, 1, "the path the file budget dropped");
         assert_eq!(summary.earned, 1);
-        assert_eq!(
-            summary.latency_ms, 200,
-            "what the call that was bought took"
-        );
         assert_eq!(run.dropped_line(), None);
     }
 
-    /// A cached answer is not work this run did: it is counted as cached, and
-    /// its latency stays the call that bought it.
+    /// A cached answer is not work this run did: it is counted as cached, not
+    /// as bought.
     #[test]
     fn a_cached_answer_is_not_what_the_run_paid_for() {
         let dir = TempDir::new("player-cached");
@@ -650,11 +640,6 @@ mod tests {
         assert_eq!(run.summary().answered, 1);
         assert_eq!(run.summary().cached, 1);
         assert_eq!(run.summary().bought, 0);
-        assert_eq!(
-            run.summary().latency_ms,
-            0,
-            "the call that bought it was another run's"
-        );
         assert_eq!(run.summary().duration_ms, 1);
     }
 
