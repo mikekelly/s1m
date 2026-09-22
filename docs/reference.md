@@ -45,9 +45,9 @@ macOS and Linux install a prebuilt binary, with no Rust toolchain:
 curl -LsSf https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
 ```
 
-`latest` selects a *release*, and the installer that release carries is pinned to it: it fetches
-its archive from `releases/download/v0.1.0`, never from `latest`, so what you install cannot
-drift underneath you. In order, the installer
+`latest` names GitHub's newest release that is not marked a prerelease, and the installer that
+release carries is pinned to it: it fetches its archive from `releases/download/v0.1.0`, never
+from `latest`, so what you install cannot drift underneath you. In order, the installer
 
 | | |
 | --- | --- |
@@ -83,7 +83,13 @@ ERROR: there isn't a download for your platform x86_64-unknown-freebsd
 
 Windows is not supported, and neither is any Linux the archives were not built for. The two
 Linux archives are built on Ubuntu 22.04 runners, so a Linux whose glibc is older than 2.35 is
-refused the same way: `System glibc version … is too old`, and then the message above.
+refused before anything is downloaded too, with exit 1:
+
+```text
+$ sh s1m-installer.sh
+System glibc version (`2.31') is too old; checking alternatives
+ERROR: no compatible downloads were found for your platform x86_64-unknown-linux-gnu
+```
 
 ### The archives directly
 
