@@ -134,6 +134,12 @@ flowchart TD
   C --> D["ranked reading list<br/>paths, line ranges, scores, and the link path that reached each one"]
 ```
 
+The walk judges a round at a time: up to eight files at once, waiting for the slowest of them
+rather than for their sum, so a run costs one round trip per round and not one per file. Rounds
+are one after another — a round's answers are what queue the next round's files — so a run
+costs about as many round trips as the deepest path it follows has hops. That round size is a
+concurrency cap, not a budget: what the walk visits is what a file-at-a-time walk would visit.
+
 The walk stops when the budgets run out or no link is left above the threshold. A file earns a
 place on its own — relevance at or above `--threshold`, or at least one section at or above it —
 and every other file it passed through is reported under `walked`, so the walk stays

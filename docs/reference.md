@@ -739,7 +739,7 @@ the CLI, so they can be driven directly from tests:
 | `jev::Mode` | The criterion a run judges by: its `name`, the file question and its Score levels, the section and link questions and what counts as yes and no for each. Three consts — `ABOUT`, `USEFUL_FOR` (the default) and `ANSWERS` — and `Mode::custom(name, criterion)` for a `--criteria` file, whose wording is the caller's |
 | `cache::Cacheable` | What a scorer implements to be cacheable: build the request, give the cache the bytes an answer depends on, send the request and say what it cost — that accounting is stored with the answer |
 | `cache::CachedScorer` | That cache in front of any scorer, same `Scorer` trait: `judge` returns `Scored::Called { judgment, detail }` or `Scored::Reused { judgment, detail }` — the detail is what the answer cost, now or when it was bought — and `calls()` and `hits()` count what reached the API and what came off the disk |
-| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth`, `threshold` and `fanout` budgets, and under `config.ignore`, which drops a matched entry file before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns every file it visited with its relevance, the scent that reached them, the `via` path, their sections (the parser's ranges, in document order) and the outgoing links it judged; `VisitedFile::earns_a_place(threshold)` is the one question the reading list asks of them |
+| `traverse::traverse(config, scorer)` | Async: best-first walk of the link graph over a frontier keyed by path score — the product of the link scents on the best path to a file — under the `max_files`, `max_depth` and `threshold` budgets, under `fanout`, which is a concurrency cap rather than a budget on the list, and under `config.ignore`, which drops a matched entry file before anything is parsed and takes a matched link target out of the file before it is scored. One future per file per round, joined, so a round costs one round trip. Returns every file it visited with its relevance, the scent that reached them, the `via` path, their sections (the parser's ranges, in document order) and the outgoing links it judged; `VisitedFile::earns_a_place(threshold)` is the one question the reading list asks of them |
 | `cli::Options` | One run's flags — the query, the entry files, the root and the budgets — with no defaults of their own: the plan's defaults live on the CLI flags that carry them |
 | `cli::run(options, judge)` | The whole pipeline: read the entry files, walk with the injected `Judge`, and return the plan's `ReadingList`, or an error naming what stopped it. Paths come back joined onto the root, spelled the way the entry files were |
 | `cli::Judge` | What the CLI needs of a scorer beyond scoring: `scorer()` for the walk and `calls()` for the count the reading list publishes. `CachedScorer` implements it with the cache's own miss count, `cli::Uncached` counts every score for `--no-cache`, and the CLI tests' fake is a third |
@@ -755,11 +755,18 @@ Traversal takes its `entries` against the same base as `parse`, and every path i
 `path`, `via` and link targets — is spelled relative to `root`, so `root.join(path)` is the
 file to read. `cli::run` joins the root back on, which is why the reading list spells paths the
 way the entry files were given. The walk is async because the scorer is: a round joins one
-future per file, and the caller brings the runtime. Ties on path score are broken by path, the
-round's answers are collected in the order they were asked for however they come back, and the
-reading list is sorted by relevance: the same query on the same files gives the same result,
-whatever the answers' latency. A file that cannot be parsed or scored is reported in `failed`
-and does not end the walk.
+future per file, so up to `fanout` files are judged at once and a round costs one round trip
+rather than one per file. `fanout` is 8, a constant in `main.rs` with no flag behind it, and it
+is a concurrency cap and nothing else — the reading list is the one a file-at-a-time walk would
+produce. Rounds are one after another, because a round's answers are what queue the next
+round's files, so a run pays about as many round trips as the deepest path it follows has hops,
+waiting for its slowest file each time. A file a round's own answers overtook goes back on the
+frontier with the answer already bought for it and is visited when it is the best path again, so
+no file is asked about twice. The caller brings the runtime. Ties on path score are broken by
+path, the round's answers are collected in the order they were asked for however they come back,
+and the reading list is sorted by relevance: the same query on the same files gives the same
+result, whatever the answers' latency. A file that cannot be parsed or scored is reported in
+`failed` and does not end the walk.
 
 `tests/fixtures/wiki/` is a small wiki covering each link form, nested headings, a link out of
 the root and a broken link; `tests/parse.rs` asserts the sections' line ranges against it and
