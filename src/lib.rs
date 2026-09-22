@@ -10,6 +10,7 @@ pub mod format;
 pub mod ignore;
 pub mod jev;
 pub mod parse;
+pub mod player;
 pub mod scorer;
 pub mod trace;
 pub mod traverse;

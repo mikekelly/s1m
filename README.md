@@ -220,6 +220,14 @@ worth reading. `release.md` is the best page and the entry follows the link at 0
 is visited once, along the best path found to it. What each mark means is in
 [Output formats](docs/reference.md#output-formats).
 
+That is the walk as a tree; the same run plays back. `s1m --trace run.jsonl …` writes what the
+walk did as it did it, and `s1m play run.jsonl` draws that trace as one page: the files appearing
+as the walk pops them, the links it followed beside the ones it passed over, the reading list
+filling in, and the evidence for any file a click away. It is a local file — no server, no
+request, nothing fetched — and [the reference](docs/reference.md#playing-a-trace) has the rest.
+
+![The run above, played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](docs/player.png)
+
 ## The reference, area by area
 
 Everything below is in [`docs/reference.md`](docs/reference.md), one click away and complete.
@@ -240,6 +248,10 @@ the interface: the preview ablations, `--scorer choice` with its share cut and i
 
 **[The trace of a run](docs/reference.md#the-trace-of-a-run)** — `--trace FILE`, one JSON object
 per line, every event and its fields, and what a replay can and cannot conclude from it.
+
+**[Playing a trace](docs/reference.md#playing-a-trace)** — `s1m play TRACE` draws that trace as
+one self-contained HTML page: the crawl, the links the walk passed over and why, the reading list
+filling in, and the evidence for any file a click away.
 
 **[Output formats](docs/reference.md#output-formats)** — `json` to parse, `md` to read or paste,
 `tree` for the walk itself, with the three marks a link can carry and what both views round.

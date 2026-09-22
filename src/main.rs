@@ -23,6 +23,7 @@ use s1m::format::Format;
 use s1m::ignore::{self, Ignore};
 use s1m::jev::{self, ChoiceScorer, Context, JevDetail, JevScorer, KeepRule, Mode, Wording};
 use s1m::parse::{self, ParsedFile};
+use s1m::player;
 use s1m::scorer::{FileJudgment, LinkJudgment, ScorerError, SectionJudgment};
 use s1m::trace::Trace;
 use s1m::traverse::Admission;
@@ -124,6 +125,14 @@ page that was judged. A page that was judged and earned no place is not an error
 either: it is under `walked`, with the links it offered. Only a run that judged
 nothing at all — an entry file whose judgment failed with nothing else reached —
 is 2.
+
+A trace of a run can be drawn again: `s1m --trace run.jsonl ...` writes what the
+walk did as it did it, and `s1m play run.jsonl` turns that file into one page —
+the crawl, the links it passed over and why, and the reading list filling in —
+with a control for every step of it. The page is one file with the trace inside
+it, so it opens from the disk and asks nothing of the network; a trace holds the
+paths of the wiki it was made over and the query it was made for, so neither it
+nor the page belongs in a commit or on an issue.
 
 A hidden debug view of one file is still here: `s1m score-file <query> <file>`
 prints a file's relevance, what the call cost, a score per section and a scent
@@ -386,6 +395,30 @@ impl FormatArg {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Play a trace of a walk back as one page: what the run did, in the order
+    /// it did it, and why each file in the reading list is in it.
+    ///
+    /// `--trace FILE` writes what a walk did as it happens, one JSON object per
+    /// line; this draws that file. The page is a replay — the files as they
+    /// come off the frontier, the links as they are judged, what was passed
+    /// over and why, and the list filling in — and every file on it can be
+    /// opened for the path that reached it, the scent of each hop and the
+    /// scores that earned it its place.
+    ///
+    /// It is one file, with the player and the trace inside it: no server, no
+    /// request, no asset beside it. Open it from the disk, keep it beside the
+    /// trace, and do not commit or attach either of them — a trace holds the
+    /// paths of the wiki it was made over and the query it was made for.
+    Play {
+        /// The trace a run left behind: `s1m --trace FILE <query>
+        /// <entry-file...>` writes one.
+        #[arg(value_name = "TRACE")]
+        trace: PathBuf,
+        /// Where the page goes: the trace's own path with `.html` when this is
+        /// not given, and stdout for `-`.
+        #[arg(long, value_name = "FILE")]
+        out: Option<PathBuf>,
+    },
     /// Score one file against a query with Jev and print a table.
     ///
     /// Hidden: a debug view of the spike in
@@ -495,6 +528,24 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Command::Play { trace, out }) => match player::play(&trace, out.as_deref()) {
+            Ok(played) => {
+                // A trace whose last record was half written is a run that was
+                // killed, and the page is of everything before it: say so
+                // rather than let the difference go unmentioned.
+                if let Some(line) = played.run.dropped_line() {
+                    eprintln!(
+                        "s1m: line {line} of {} was not written whole, so the page ends \
+                         before it",
+                        trace.display()
+                    );
+                }
+                if let Some(page) = played.path {
+                    println!("wrote {}", page.display());
+                }
+            }
+            Err(error) => fail(error),
+        },
         Some(Command::ScoreFile {
             query,
             file,
@@ -561,7 +612,7 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
         ScorerArg::Noul => {
             let jev = context.apply(scorer(&root)?).with_mode(mode);
             options.mode = jev.mode().name.to_string();
-            cached(jev, cli.no_cache, trace)?
+            cached(jev, cli.no_cache, trace.clone())?
         }
         ScorerArg::Choice => {
             // The file's own judgment is made with the state that ships; only
@@ -573,9 +624,17 @@ async fn query(cli: &Cli) -> Result<i32, cli::Error> {
                     ..context
                 });
             options.mode = choice.mode().name.to_string();
-            cached(choice, cli.no_cache, trace)?
+            cached(choice, cli.no_cache, trace.clone())?
         }
     };
+
+    // The trace's own first record: what this run was asked. Nothing else in
+    // the walk knows it — the reading list is written to stdout and the trace
+    // is what a player has — and it goes down once the criterion has a name and
+    // before the first file is read.
+    if let Some(trace) = &trace {
+        trace.started(&options.query, &options.mode);
+    }
 
     let list = cli::run(&options, judge.as_ref()).await?;
     print!("{}", cli.format.format().render(&list));
