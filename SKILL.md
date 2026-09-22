@@ -34,11 +34,14 @@ tells you where to read.
 ## Install
 
 ```bash
-cargo install --git https://github.com/mikekelly/s1m
+# macOS or Linux, prebuilt, no Rust toolchain: $XDG_BIN_HOME, else ~/.local/bin
+curl -LsSf https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
+
 export TYPESAFE_API_KEY=...        # see .env.example in the repository
 ```
 
-Stable Rust (1.85+) is the only requirement. From a checkout, `cargo build --release` leaves the
+Or from source, which needs stable Rust (1.85+): `cargo install --git
+https://github.com/mikekelly/s1m`, or `cargo build --release` in a checkout, which leaves the
 binary at `target/release/s1m`.
 
 ## One command
