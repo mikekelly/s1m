@@ -16,9 +16,7 @@ line ranges, ready for an agent to open.
 
 | | How it finds a page | What that costs |
 | --- | --- | --- |
-| `grep` | Matches the wording you typed | The page that says it in other words, and the link structure the authors built |
-| Embedding search | Matches meaning, against an index | An index to build and to keep in sync with the wiki |
-| Letting the agent browse | Opens pages until it finds the right one | The context window — spent on what is a string of quick relevance calls |
+| LLM agent exploring | Opens pages until it finds the right one | The context window — spent on what is a string of quick relevance calls |
 | **s1m** | Judges meaning *and* follows the links: one small judgment per file the walk reaches, per section and per link, best-first | One cheap judgment per file the walk visits — and it returns line ranges, not whole pages |
 
 The last two of those have been measured against each other: 20 labelled queries on one
@@ -31,24 +29,8 @@ runs; s1m's cold figures are the 20 runs that were measured cold.
 | Claude Code **Explore**, sonnet ([row](eval/PRIVATE_WIKI_REPORT.md#results)) | 60 | 0.85 | 0.17 | $0.29 | 78 s | ~310k read |
 | **s1m** at today's defaults ([row](eval/PRIVATE_WIKI_REPORT.md#reading-the-numbers)) | 60 warm, 20 cold | 0.87 | 0.21 | $0.03 cold, $0 warm | 1.9 s cold, 0.2 s warm | ~15k handed to the agent |
 
-One wiki, one machine, one network — and the sonnet Explore baseline's parent session read the
-wiki itself as well as dispatching the subagent, so that row's cost and wall time include a
-parent that explored too. The two are also not the same shape of work: s1m returns a reading
-list and answers nothing, while the agent reads until it can answer. What else these numbers
-are not is in the report's own
-[caveats](eval/PRIVATE_WIKI_REPORT.md#caveats).
-
-> **Status: milestones 2, 3 and 4.** The CLI walks a real wiki and returns the plan's reading
-> list — as JSON, as `md` or as `tree`, every result carrying the line ranges worth reading — on
-> top of the parser, the Jev judgment, the best-first walk, the cache, the three relevance
-> criteria and the per-section ranges. Milestone 3's numbers are in
-> [`eval/REPORT.md`](eval/REPORT.md); milestone 4 is the packaging around all of it, and what
-> each piece is and which issue built it is in
-> [the reference](docs/reference.md#what-it-is-built-on).
-
 The name is short for **System 1 memex** — after Vannevar Bush's memex, which followed
-associative trails through linked documents. It is pronounced "sim", and it is not a simulator:
-what it reads is a folder of files, and what it returns is a list of what to open.
+associative trails through linked documents.
 
 ## Quickstart
 
