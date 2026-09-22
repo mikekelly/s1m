@@ -2,10 +2,11 @@
 
 **High-efficiency knowledge recall from an LLM wiki, powered by Jev.**
 
-s1m reads a folder of linked markdown, judges every file, section and link with Jev, a fast
-judgment model, and returns the files and line ranges worth opening, most relevant first — so an
-LLM agent opens only what matters. You give it a query and one or more entry pages; it hands
-back which files to open, which lines inside them, and the link path that reached each one.
+Give s1m a question and a page to start from. For that question, Jev judges each page the walk
+reaches — how relevant it is, which of its sections matter, and which of its links are worth
+following — and the walk takes the strongest link next. It reads a few pages of the wiki, not
+all of it, and stops when nothing promising is left. What comes back is a ranked reading list:
+the files and line ranges worth opening to answer that question.
 
 [![CI](https://github.com/mikekelly/s1m/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mikekelly/s1m/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -16,7 +17,7 @@ back which files to open, which lines inside them, and the link path that reache
 | `grep` | Matches the wording you typed | The page that says it in other words, and the link structure the authors built |
 | Embedding search | Matches meaning, against an index | An index to build and to keep in sync with the wiki |
 | Letting the agent browse | Opens pages until it finds the right one | The context window — spent on what is a string of quick relevance calls |
-| **s1m** | Judges meaning *and* follows the links: one small judgment per file, per section and per link, best-first | One cheap judgment per file the walk visits — and it returns line ranges, not whole pages |
+| **s1m** | Judges meaning *and* follows the links: one small judgment per file the walk reaches, per section and per link, best-first | One cheap judgment per file the walk visits — and it returns line ranges, not whole pages |
 
 The last two of those have been measured against each other: 20 labelled queries on one
 1,933-page wiki, in [`eval/PRIVATE_WIKI_REPORT.md`](eval/PRIVATE_WIKI_REPORT.md). Every cell is
@@ -125,7 +126,7 @@ file exits 2.
 
 ```mermaid
 flowchart TD
-  A["entry files<br/>the pages you name"] --> B["one judgment per file<br/>a relevance for the page, a score per heading section, a scent per outgoing link"]
+  A["entry files<br/>the pages you name"] --> B["one judgment per file the walk reaches<br/>a relevance for the page, a score per heading section, a scent per outgoing link"]
   B --> C["best-first walk<br/>follow the strongest links first, under --threshold, --max-files and --max-depth"]
   C -->|"next file"| B
   C --> D["ranked reading list<br/>paths, line ranges, scores, and the link path that reached each one"]
