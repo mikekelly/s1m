@@ -770,3 +770,10 @@ Not measured here: the private wiki the issue counts three pages over 40k charac
 numbers above are a generated page and two pages of this repository, which is enough to show the
 split, its cost and that the API takes it — not enough to say what it does to a wiki's recall.
 
+The second run is what the live cap test stands behind, and the page it scores since
+[#77](https://github.com/mikekelly/s1m/issues/77) is `tests/fixtures/oversized-page.md` — written
+for the test, over the cap, its last section `Development` opening past it — rather than the
+README, which [#75](https://github.com/mikekelly/s1m/issues/75) left under the cap by moving the
+reference into `docs/reference.md`. The command above is kept as what was measured on 2026-09-21;
+to repeat the measurement, run it against the fixture page.
+
