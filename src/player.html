@@ -879,6 +879,15 @@ document.addEventListener("keydown", function (event) {
 
 // --------------------------------------------------------------- the frame
 
+// One without the other looks wrong: 33 calls of a couple of hundred
+// milliseconds each cannot have happened in two seconds — except that they did,
+// because a round asks about up to eight files at once. The two figures sit
+// side by side, and the note on them says why the larger one is not the longer
+// run.
+const OVERLAPPING = "The calls' own durations, added up. A round asks about up to eight files "
+  + "at once, so they overlap: this is what the judgments cost, and the wall time is what the "
+  + "run took.";
+
 (function head() {
   const started = RUN.started;
   const title = document.getElementById("title");
@@ -900,16 +909,18 @@ document.addEventListener("keydown", function (event) {
   const s = RUN.summary;
   const stats = document.getElementById("stats");
   const figures = [
-    [String(s.files), s.files === 1 ? "file visited" : "files visited"],
-    [String(s.requests), s.requests === 1 ? "request" : "requests"],
-    [s.bought + " / " + s.cached, "bought / cached"],
-    [s.earned + " / " + s.files, "in the list"],
-    [String(s.followed), "links followed"],
-    [String(s.passed_over + s.dropped), "passed over"],
-    [s.duration_ms + " ms", "wall time"],
+    [String(s.files), s.files === 1 ? "file visited" : "files visited", null],
+    [String(s.requests), s.requests === 1 ? "request" : "requests", null],
+    [s.bought + " / " + s.cached, "bought / cached", null],
+    [s.earned + " / " + s.files, "in the list", null],
+    [String(s.followed), "links followed", null],
+    [String(s.passed_over + s.dropped), "passed over", null],
+    [s.latency_ms + " ms", "in calls", OVERLAPPING],
+    [s.duration_ms + " ms", "wall time", OVERLAPPING],
   ];
   figures.forEach(function (figure) {
     const cell = document.createElement("div");
+    if (figure[2]) cell.title = figure[2];
     cell.appendChild(element("dt", null, figure[1]));
     cell.appendChild(element("dd", null, figure[0]));
     stats.appendChild(cell);
