@@ -30,7 +30,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::parse::relative_to_root;
 use crate::scorer::{FileJudgment, LinkJudgment, SectionJudgment};
@@ -109,6 +109,28 @@ impl Trace {
     /// reading list: what a `result` record reports as `earned_a_place`.
     pub fn threshold(&self) -> f64 {
         self.threshold
+    }
+
+    /// The run's own record, written once before anything is read: what was
+    /// asked, how it is judged, and the cutoff a `result` record is read
+    /// against.
+    ///
+    /// The other records say what the walk did; this one says what it was for,
+    /// which is the one thing a reader cannot derive from the rest — a player
+    /// has the entry files from the pops at depth 0 and the list's verdicts
+    /// from the `result` records, and no way at all to know the query
+    /// ([#73](https://github.com/mikekelly/s1m/issues/73)). A trace without it
+    /// is a trace of a run from before the record existed, and reads as a walk
+    /// with no query.
+    ///
+    /// [#73]: https://github.com/mikekelly/s1m/issues/73
+    pub fn started(&self, query: &str, mode: &str) {
+        self.record(Event::Started {
+            t_ms: self.now(),
+            query,
+            mode,
+            threshold: self.threshold,
+        });
     }
 
     /// A file the walk took off the frontier, entries and all: the entry files
@@ -273,6 +295,18 @@ impl Trace {
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 enum Event<'a> {
+    /// The run the walk was for: `started`, the first record of a trace.
+    ///
+    /// `query` is the caller's own words as the request carried them, `mode` is
+    /// the criterion the reading list reports — a mode's name, or the path of
+    /// the `--criteria` file that replaced it — and `threshold` is the same
+    /// number the trace was told for its `result` records.
+    Started {
+        t_ms: u64,
+        query: &'a str,
+        mode: &'a str,
+        threshold: f64,
+    },
     /// The walk took a file off the frontier: `popped`.
     Popped {
         t_ms: u64,
@@ -344,8 +378,9 @@ enum Event<'a> {
 /// One vocabulary, two documents: a `pruned` record in the trace and a link's
 /// `reason` in the reading list spell the same reasons the same way, hyphenated
 /// the way the CLI's own values are (`useful-for`), so a reader comparing them
-/// never meets two names for one thing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+/// never meets two names for one thing. [`crate::player`] reads them back,
+/// which is what `Deserialize` is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Reason {
     /// Its scent did not clear the walk's floor

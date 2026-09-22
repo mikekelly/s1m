@@ -958,19 +958,23 @@ fn records(path: &Path) -> Vec<Value> {
 }
 
 /// Those records as `(event, what it is about)`: the path for a record about a
-/// file, and `source -> target` for one about a link.
+/// file, `source -> target` for one about a link, and the query for the record
+/// the run itself writes.
 fn events(records: &[Value]) -> Vec<(String, String)> {
     records
         .iter()
         .map(|record| {
             let event = record["event"].as_str().expect("an event name").to_string();
-            let what = match record["path"].as_str() {
-                Some(path) => path.to_string(),
-                None => format!(
+            let what = if event == "started" {
+                record["query"].as_str().expect("a query").to_string()
+            } else if let Some(path) = record["path"].as_str() {
+                path.to_string()
+            } else {
+                format!(
                     "{} -> {}",
                     record["source"].as_str().expect("a source"),
                     record["target"].as_str().expect("a target")
-                ),
+                )
             };
             (event, what)
         })
@@ -1186,6 +1190,7 @@ fn a_trace_is_written_as_the_walk_goes() {
     assert_eq!(
         events(&cold),
         [
+            ("started", QUERY),
             ("popped", "entry.md"),
             ("requested", "entry.md"),
             ("answered", "entry.md"),
@@ -1203,6 +1208,18 @@ fn a_trace_is_written_as_the_walk_goes() {
         ]
         .map(|(event, what)| (event.to_string(), what.to_string())),
         "the walk's own order: one visit at a time, entries first"
+    );
+
+    // The run's own record is the first line of the file and the only place the
+    // trace says what was asked: a player has the entry files from the pops at
+    // depth 0 and the list's verdicts from the `result` records, and no other
+    // way to know the query or the cutoff.
+    assert_eq!(cold[0]["query"], QUERY, "what the run was asked");
+    assert_eq!(cold[0]["mode"], "useful-for", "how it was judged");
+    assert_eq!(cold[0]["threshold"], 0.6, "the cutoff the walk ran under");
+    assert!(
+        cold[0]["t_ms"].as_u64().expect("a time") <= cold[1]["t_ms"].as_u64().expect("a time"),
+        "the record is written before the first file is read"
     );
 
     let answered: Vec<&Value> = cold
@@ -1253,6 +1270,113 @@ fn a_trace_that_cannot_be_written_exits_2_without_a_call() {
     let error = stderr(&output);
     assert!(error.contains("trace"), "{error}");
     assert_eq!(api.answered(), 0, "the run stopped before its first call");
+}
+
+/// A run traced through the binary plays back through it: the page lands beside
+/// the trace unless `--out` says otherwise, it is one file with the records in
+/// it, and it says what the run was asked — which the trace's own first record
+/// is the only place that is written down.
+#[test]
+fn a_traced_run_plays_back_as_one_page() {
+    let api = FakeApi::new(3.0, 0.9, 0.7);
+    let cache = Cache::new();
+    let trace = cache.dir.join("run.jsonl");
+
+    let walked = run_with(
+        &[QUERY, ENTRY, "--trace", trace.to_str().expect("a path")],
+        &api,
+        &cache,
+    );
+    assert_eq!(walked.status.code(), Some(0), "{}", stderr(&walked));
+
+    let played = run(&["play", trace.to_str().expect("a path")]);
+    let page = cache.dir.join("run.html");
+    assert_eq!(played.status.code(), Some(0), "{}", stderr(&played));
+    assert_eq!(
+        stdout(&played),
+        format!("wrote {}\n", page.display()),
+        "the page lands beside the trace, and the run says where"
+    );
+    assert!(played.stderr.is_empty(), "{}", stderr(&played));
+
+    let html = fs::read_to_string(&page).expect("the page should be written");
+    assert!(html.starts_with("<!doctype html>"), "a whole page");
+    assert_eq!(
+        html.matches("<script").count(),
+        2,
+        "the records, and the player"
+    );
+    assert!(
+        html.contains(r#""query":"what is there to read""#),
+        "the run's own record is in the page"
+    );
+    assert!(
+        html.contains(r#""threshold":0.6"#) && html.contains(r#""mode":"useful-for""#),
+        "so is how it was judged"
+    );
+    assert!(
+        html.contains(r#""files":3"#) && html.contains(r#""followed":2"#),
+        "and what it cost: three files visited, two links followed"
+    );
+    assert!(
+        html.contains(r#""earned_a_place""#),
+        "the visits and what the list made of them"
+    );
+    for request in ["src=\"http", "href=\"http", "url(http", "fetch("] {
+        assert!(!html.contains(request), "nothing to fetch: {request}");
+    }
+
+    // `--out -` is the page on stdout, for a caller that would rather pipe it
+    // than have a file beside the trace.
+    let piped = run(&["play", trace.to_str().expect("a path"), "--out", "-"]);
+    assert_eq!(piped.status.code(), Some(0), "{}", stderr(&piped));
+    assert_eq!(stdout(&piped), html, "the same page, on stdout");
+}
+
+/// A trace from before the run wrote its own record still plays: the page says
+/// what it can — the crawl and the list — and names itself after the file it
+/// was drawn from. A file that is not a trace is the caller's mistake, named in
+/// one line.
+#[test]
+fn a_trace_without_the_runs_own_record_plays_and_a_file_that_is_not_one_exits_2() {
+    let cache = Cache::new();
+    let bare = cache.dir.join("bare.jsonl");
+    fs::write(
+        &bare,
+        concat!(
+            "{\"event\":\"popped\",\"t_ms\":4,\"path\":\"index.md\",\"path_score\":1.0,",
+            "\"depth\":0,\"via\":[]}\n",
+            "{\"event\":\"result\",\"t_ms\":9,\"path\":\"index.md\",\"relevance\":0.72,",
+            "\"earned_a_place\":true}\n",
+        ),
+    )
+    .expect("the fixture trace should be writable");
+
+    let output = run(&["play", bare.to_str().expect("a path")]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let html = fs::read_to_string(bare.with_extension("html")).expect("a page");
+    assert!(
+        html.contains(r#""started":null"#),
+        "no run record, and the page still draws the walk"
+    );
+    assert!(html.contains(r#""files":1"#), "one file visited");
+
+    let missing = run(&["play", "tests/fixtures/cli/gone.jsonl"]);
+    assert_eq!(missing.status.code(), Some(2));
+    assert!(missing.stdout.is_empty());
+    let error = stderr(&missing);
+    assert!(error.contains("gone.jsonl"), "{error}");
+    assert_eq!(error.lines().count(), 1, "one line: {error}");
+
+    let prose = cache.dir.join("prose.txt");
+    fs::write(&prose, "# Notes\n\nA page of prose.\n").expect("the fixture should be writable");
+    let not_a_trace = run(&["play", prose.to_str().expect("a path")]);
+    assert_eq!(not_a_trace.status.code(), Some(2));
+    assert!(
+        stderr(&not_a_trace).contains("line 1"),
+        "named: {}",
+        stderr(&not_a_trace)
+    );
 }
 
 /// A section the model scored below `--threshold` is dropped from the file's

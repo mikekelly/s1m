@@ -1,9 +1,9 @@
 # s1m reference
 
 Everything the [README](../README.md) leaves out: install in full, the reading list's shape,
-every flag including the hidden ones, the trace, the output formats, the relevance criteria,
-what is sent about each link, `.s1mignore`, the cache, the evaluation harness, the library and
-the development commands.
+every flag including the hidden ones, the trace and the player that draws one, the output
+formats, the relevance criteria, what is sent about each link, `.s1mignore`, the cache, the
+evaluation harness, the library and the development commands.
 
 ## What it is built on
 
@@ -271,6 +271,7 @@ which is how `via` and a link's target are spelled within a run.
 
 | `event` | Fields | What it is |
 | --- | --- | --- |
+| `started` | `query`, `mode`, `threshold` | The run the walk was for, written before the first file is read: the query as the request carried it, the criterion the reading list reports — a mode's name, or the `--criteria` file's path — and the cutoff the walk ran under. The one thing a replay cannot derive from the rest, since a reading list is printed and not stored ([#73](https://github.com/mikekelly/s1m/issues/73)). A trace from before this record existed has none, and plays without it. |
 | `popped` | `path`, `path_score`, `depth`, `via` | The walk took the file off the frontier. The entry files come first, at path score 1, depth 0 and no `via`; every other path carries the score, depth and `via` of the best path found to the file. |
 | `requested` | `path`, `post_index` | One request for the file, once per post: a page whose sections and links do not fit one request is asked about in several, and each is a record of its own, in the order they were sent. |
 | `answered` | `path`, `latency_ms`, `relevance`, `cached`, `sections`, `links` | The scorer's answer: the file's relevance, a score per heading section and a scent per link, each as the scorer gave it. `cached` is `true` when the answer came off the disk, and `latency_ms` is what the call that bought it took — whenever that was, so a warm replay can be told from a cold one. |
@@ -296,8 +297,51 @@ jq -c 'select(.event == "admitted" or .event == "result")' run.jsonl | head -3
 The trace is not part of the walk's determinism, and does not have to be: `t_ms` and `latency_ms`
 are the run's real timings, and the order a round's answers come back in is the network's. What
 the reading list promises — the files visited and the order they rank in — is the same with the
-flag as without it. The player that draws one is a thing of its own, and not part of this
-([#57](https://github.com/mikekelly/s1m/issues/57)).
+flag as without it. What draws one is [`s1m play`](#playing-a-trace), which is
+[#73](https://github.com/mikekelly/s1m/issues/73) on top of this.
+
+### Playing a trace
+
+`s1m play run.jsonl` turns a trace back into the run it was: one HTML page beside the trace, with
+the player and the records inside it. Nothing is fetched — no server, no stylesheet, no image
+next to it — so it opens from the disk with the network unplugged, `--out FILE` puts it
+somewhere else, and `--out -` writes it to stdout.
+
+```bash
+S1M_CACHE_DIR=eval/cache s1m --trace run.jsonl \
+  "how do I cut a release and publish the package" \
+  eval/wikis/llm-wiki-manager/wiki/index.md
+s1m play run.jsonl
+```
+
+![A run played back: the files the walk reached by depth, the reading list beside them, and the evidence for the file selected in it](player.png)
+
+The page is the walk in the order it happened. A file appears when the walk pops it — dashed while
+it waits on the frontier, dropped when a budget took it first — and carries its relevance, its
+depth and the sections the model scored, green where a section cleared `--threshold`. A link the
+walk followed is an edge, coloured and thickened by the scent it was followed at; the links it
+passed over are the marks along each file's bottom edge, coloured the same way and counted under
+the canvas by reason, which is what makes the passed-over half of a run visible rather than
+implied.
+
+Play, step and the scrubber move the run along by event rather than by wall clock — a warm run's
+whole trace spans about 20 ms, so equal time per event is the only way to watch one — and the
+clock shows the real `t_ms` of whatever is on screen all the same.
+
+The panel beside it is the question a reading list answers without evidence. It lists the files the
+walk visited in the order it found them, marks the ones that earned a place, and says what earned
+it: its relevance, or the section that cleared the cut. Selecting any file — in that list, on the
+crawl, or among the links another file offered — opens its evidence: the path that reached it with
+the scent of every hop, the path score it arrived at, its relevance, whether the answer was bought
+or served from the cache and what the call took, each section with its line range and score, and
+every link it offered with what the walk did about it — followed, or the rule that queued nothing.
+A link whose target the walk never queued names a file the trace holds nothing about, and the
+panel says that rather than nothing at all.
+
+A trace holds the paths of the wiki it was made over and the query it was made for, so it and the
+page drawn from it are local artifacts of the run, like an eval's `--out` directory: keep them
+where the run is, and do not commit them or attach them to an issue. Rendering a page asks
+nothing of the network, the cache or the API key — it reads the trace and writes one file.
 
 ### Output formats
 

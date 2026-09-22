@@ -1,0 +1,889 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>s1m — a run's traversal</title>
+<style>
+  :root {
+    --ink: #1b1f24;
+    --muted: #6b7280;
+    --quiet: #9aa3af;
+    --line: #e4e7ec;
+    --paper: #fcfcfd;
+    --panel: #ffffff;
+    --earned: #15803d;
+    --waiting: #b45309;
+    --dropped: #b91c1c;
+    --shadow: 0 1px 2px rgba(16, 24, 40, 0.06), 0 1px 3px rgba(16, 24, 40, 0.1);
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    display: flex;
+    flex-direction: column;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+  header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 24px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel);
+  }
+  header h1 {
+    margin: 0;
+    font-size: 17px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  header h1 .quiet { font-weight: 400; }
+  header p { margin: 3px 0 0; color: var(--muted); font-size: 12.5px; }
+  header p b { font-weight: 600; color: var(--ink); }
+  .stats { display: flex; gap: 22px; margin: 2px 0 0; }
+  .stats div { text-align: right; }
+  .stats dt { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--quiet); }
+  .stats dd { margin: 1px 0 0; font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  main { flex: 1; display: grid; grid-template-columns: minmax(0, 1fr) 372px; min-height: 0; }
+
+  .stage { display: flex; flex-direction: column; min-width: 0; border-right: 1px solid var(--line); }
+  .scroll { flex: 1; overflow: auto; min-height: 0; background:
+      radial-gradient(circle at 1px 1px, #eceef2 1px, transparent 0) 0 0 / 22px 22px; }
+  .canvas { position: relative; }
+  .canvas svg { position: absolute; inset: 0; overflow: visible; }
+  .node {
+    position: absolute;
+    width: 210px;
+    padding: 7px 9px 0;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 9px;
+    box-shadow: var(--shadow);
+    cursor: pointer;
+    transition: opacity 140ms ease, border-color 140ms ease, transform 140ms ease;
+  }
+  .node.gone { opacity: 0; pointer-events: none; transform: translateY(3px); }
+  .node.waiting { border-style: dashed; border-color: #d9c9a5; background: #fffdf7; }
+  .node.dropped { border-style: dashed; border-color: #e9c9c9; }
+  .node.now { border-color: #111827; box-shadow: 0 0 0 3px rgba(17, 24, 39, 0.09); }
+  .node.selected { border-color: #2563eb; box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.16); }
+  .node .top { display: flex; align-items: baseline; gap: 6px; }
+  .node .name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; }
+  .node .chip { font-size: 9.5px; text-transform: uppercase; letter-spacing: 0.04em; padding: 1px 5px;
+    border-radius: 999px; background: #f2f4f7; color: var(--muted); white-space: nowrap; }
+  .node.result .chip { background: #dcfce7; color: var(--earned); }
+  .node.waiting .chip { background: #fef3c7; color: var(--waiting); }
+  .node.dropped .chip { background: #fee2e2; color: var(--dropped); }
+  .node .dir { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 10.5px; color: var(--quiet); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .node .dir:empty { display: none; }
+  .node .score { display: flex; align-items: center; gap: 6px; margin-top: 4px; height: 13px; }
+  .node .value { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--ink); }
+  .node .value.none { color: var(--quiet); font-weight: 400; }
+  .node .depth { font-size: 10px; color: var(--quiet); }
+  .bar { flex: 1; height: 4px; border-radius: 2px; background: #eef0f4; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: #16a34a; transition: width 200ms ease; }
+  .node .ticks { display: flex; align-items: flex-end; gap: 2px; height: 13px; margin: 4px -9px 0;
+    padding: 0 9px 4px; overflow: hidden; border-top: 1px solid #f1f3f7; }
+  .tick { width: 3px; height: 8px; border-radius: 1px; flex: none; }
+  .tick.now { height: 12px; width: 4px; }
+
+  .controls { border-top: 1px solid var(--line); background: var(--panel); padding: 8px 12px 10px; }
+  .transport { display: flex; align-items: center; gap: 8px; }
+  button, select {
+    font: inherit; font-size: 12.5px; color: var(--ink); background: #fff;
+    border: 1px solid var(--line); border-radius: 7px; padding: 4px 9px; cursor: pointer;
+  }
+  button:hover { border-color: #cfd4dc; }
+  button.primary { background: #111827; border-color: #111827; color: #fff; min-width: 74px; font-weight: 600; }
+  #scrub { flex: 1; accent-color: #111827; }
+  #clock { font-size: 12px; color: var(--muted); min-width: 250px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; margin-top: 8px;
+    font-size: 11px; color: var(--muted); }
+  .legend .key { display: flex; align-items: center; gap: 5px; }
+  .legend .swatch { width: 9px; height: 9px; border-radius: 2px; flex: none; }
+  .legend .ramp { display: flex; align-items: center; gap: 6px; }
+  .legend .ramp .strip { position: relative; width: 96px; height: 7px; border-radius: 4px;
+    background: linear-gradient(90deg, hsl(215 62% 58%), hsl(180 62% 50%), hsl(145 62% 44%)); }
+  .legend .ramp .strip .cut { position: absolute; top: -3px; width: 1px; height: 13px; background: #111827; }
+
+  .panels { display: flex; flex-direction: column; min-height: 0; background: var(--panel); }
+  .panel { display: flex; flex-direction: column; min-height: 0; border-bottom: 1px solid var(--line); }
+  .panel:last-child { border-bottom: 0; flex: 1; }
+  .panel > h2 {
+    margin: 0; padding: 9px 14px 7px; font-size: 11px; text-transform: uppercase;
+    letter-spacing: 0.06em; color: var(--quiet); font-weight: 600;
+    display: flex; justify-content: space-between; gap: 8px;
+  }
+  .panel > h2 .note { text-transform: none; letter-spacing: 0; font-weight: 400; }
+  .list { overflow: auto; padding: 2px 8px 10px; max-height: 40vh; }
+  .row { display: flex; align-items: baseline; gap: 8px; padding: 5px 7px; border-radius: 7px;
+    cursor: pointer; transition: opacity 120ms ease; }
+  .row.gone { opacity: 0; pointer-events: none; }
+  .row:hover { background: #f6f7f9; }
+  .row.selected { background: #eff5ff; }
+  .row .n { font-size: 11px; color: var(--quiet); font-variant-numeric: tabular-nums; width: 14px; flex: none; }
+  .row .what { flex: 1; min-width: 0; }
+  .row .p { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .why { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .r { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11.5px; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .row.earned .r { color: var(--earned); font-weight: 600; }
+  .detail { overflow: auto; padding: 4px 14px 16px; }
+  .detail h3 { margin: 6px 0 4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12.5px; word-break: break-all; }
+  .detail h4 { margin: 14px 0 5px; font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.05em;
+    color: var(--quiet); }
+  .detail .quiet { color: var(--muted); font-size: 12.5px; }
+  .facts { display: flex; flex-wrap: wrap; gap: 5px 6px; }
+  .fact { font-size: 11px; background: #f3f4f6; border-radius: 999px; padding: 2px 8px; color: var(--ink); }
+  .fact.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .fact.good { background: #dcfce7; color: var(--earned); }
+  .fact.warn { background: #fef3c7; color: var(--waiting); }
+  .fact.bad { background: #fee2e2; color: var(--dropped); }
+  .chain { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px;
+    line-height: 1.7; word-break: break-all; }
+  .chain .hop { color: var(--muted); }
+  .chain .at { font-weight: 600; }
+  .sect { display: flex; gap: 8px; align-items: baseline; font-size: 12px; padding: 2px 0; }
+  .sect .head { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sect .lines { color: var(--quiet); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .sect .r { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px;
+    font-variant-numeric: tabular-nums; }
+  .sect.under { opacity: 0.55; }
+  .sect.earning .r { color: var(--earned); font-weight: 600; }
+  table.links { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+  table.links td { padding: 2px 0; vertical-align: top; }
+  table.links td.t { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    word-break: break-all; }
+  table.links td.s { width: 42px; text-align: right; font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--muted); }
+  table.links td.v { width: 100px; text-align: right; color: var(--muted); white-space: nowrap; }
+  table.links tr.followed td.v { color: var(--earned); }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1 id="title">A walk</h1>
+    <p id="subtitle"></p>
+  </div>
+  <dl class="stats" id="stats"></dl>
+</header>
+<main>
+  <section class="stage">
+    <div class="scroll" id="scroll">
+      <div class="canvas" id="canvas">
+        <svg id="edges"></svg>
+        <div id="nodes"></div>
+      </div>
+    </div>
+    <div class="controls">
+      <div class="transport">
+        <button id="restart" title="Restart (Home)">&#8634;</button>
+        <button id="back" title="Back one event (Left)">&#9664;</button>
+        <button id="play" class="primary" title="Play or pause (Space)">&#9654; Play</button>
+        <button id="forward" title="Forward one event (Right)">&#9654;</button>
+        <label class="quiet" style="font-size:12px;color:var(--muted)">speed
+          <select id="speed">
+            <option value="0.5">0.5&times;</option>
+            <option value="1" selected>1&times;</option>
+            <option value="2">2&times;</option>
+            <option value="4">4&times;</option>
+          </select>
+        </label>
+        <input id="scrub" type="range" min="0" max="0" value="0" step="1">
+        <span id="clock" class="mono"></span>
+      </div>
+      <div class="legend" id="legend"></div>
+    </div>
+  </section>
+  <aside class="panels">
+    <section class="panel">
+      <h2>The reading list <span class="note" id="list-note"></span></h2>
+      <div class="list" id="list"></div>
+    </section>
+    <section class="panel">
+      <h2>Why it is here</h2>
+      <div class="detail" id="detail"></div>
+    </section>
+  </aside>
+</main>
+<script id="run" type="application/json">/*__S1M_RUN__*/</script>
+<script>
+"use strict";
+
+const RUN = JSON.parse(document.getElementById("run").textContent);
+const EVENTS = RUN.records || [];
+
+// ---------------------------------------------------------------- the model
+//
+// One pass over the records in the order the walk wrote them. A file is a node
+// from the moment it is queued or popped; a link is an edge when its target is
+// a node and a tick under its source when it is not, which is why the two kinds
+// of pruning are sorted out after every node is known.
+
+const nodes = new Map();
+const admissions = [];
+const prunings = [];
+let requests = new Map();
+
+function node(path) {
+  let found = nodes.get(path);
+  if (!found) {
+    found = {
+      path: path, name: nameOf(path), dir: dirOf(path),
+      depth: null, score: null, via: [], first: null, pop: null,
+      answer: null, result: null, dropped: null, requests: 0,
+    };
+    nodes.set(path, found);
+  }
+  return found;
+}
+
+function nameOf(path) { const at = path.lastIndexOf("/"); return at < 0 ? path : path.slice(at + 1); }
+function dirOf(path) { const at = path.lastIndexOf("/"); return at < 0 ? "" : path.slice(0, at); }
+
+let current = null;
+EVENTS.forEach(function (record, at) {
+  current = record;
+  switch (record.event) {
+    case "popped": {
+      const n = node(record.path);
+      n.depth = record.depth;
+      n.score = record.path_score;
+      n.via = record.via || [];
+      if (n.pop === null) n.pop = at;
+      if (n.first === null) n.first = at;
+      break;
+    }
+    case "requested": {
+      const n = node(record.path);
+      n.requests += 1;
+      if (n.first === null) n.first = at;
+      break;
+    }
+    case "answered": {
+      const n = node(record.path);
+      n.answer = at;
+      if (n.first === null) n.first = at;
+      break;
+    }
+    case "admitted": {
+      const to = node(record.target);
+      const from = node(record.source);
+      if (to.depth === null) to.depth = (from.depth === null ? 0 : from.depth) + 1;
+      if (to.first === null) to.first = at;
+      admissions.push({ source: record.source, target: record.target, scent: record.scent, at: at });
+      break;
+    }
+    case "pruned": {
+      const from = node(record.source);
+      if (record.reason === "beam" || record.reason === "max-files") {
+        const to = node(record.target);
+        if (to.depth === null) to.depth = (from.depth === null ? 0 : from.depth) + 1;
+        if (to.first === null) to.first = at;
+        if (to.dropped === null) to.dropped = at;
+      }
+      prunings.push({
+        source: record.source, target: record.target, scent: record.scent,
+        reason: record.reason, at: at,
+      });
+      break;
+    }
+    case "result": {
+      const n = node(record.path);
+      n.result = at;
+      n.earned = record.earned_a_place;
+      n.relevance = record.relevance;
+      if (n.first === null) n.first = at;
+      break;
+    }
+  }
+});
+
+// A link whose target is a file of this walk is an edge between two boxes; one
+// whose target never became a file is a tick under the box that offered it.
+const edges = admissions.map(function (it) {
+  return { source: it.source, target: it.target, scent: it.scent, at: it.at, kind: "followed" };
+});
+const ticks = [];
+prunings.forEach(function (prune) {
+  if (nodes.has(prune.target) && !(prune.reason === "beam" || prune.reason === "max-files")) {
+    edges.push({
+      source: prune.source, target: prune.target, scent: prune.scent,
+      at: prune.at, kind: "passed", reason: prune.reason,
+    });
+  } else if (prune.reason !== "beam" && prune.reason !== "max-files") {
+    ticks.push(prune);
+  }
+});
+
+// --------------------------------------------------------------- layout
+
+const NODE_W = 210, NODE_H = 72, STEP_X = 300, STEP_Y = 90, PAD = 26;
+
+const columns = new Map();
+nodes.forEach(function (n) {
+  const depth = n.depth === null ? 0 : n.depth;
+  if (!columns.has(depth)) columns.set(depth, []);
+  columns.get(depth).push(n);
+});
+let width = 0, height = 0;
+const depths = Array.from(columns.keys()).sort(function (a, b) { return a - b; });
+depths.forEach(function (depth) {
+  const column = columns.get(depth);
+  column.sort(function (a, b) { return (a.first || 0) - (b.first || 0); });
+  column.forEach(function (n, row) {
+    n.x = PAD + depth * STEP_X;
+    n.y = PAD + row * STEP_Y;
+    width = Math.max(width, n.x + NODE_W);
+    height = Math.max(height, n.y + NODE_H);
+  });
+});
+width += PAD;
+height += PAD;
+
+// ------------------------------------------------------------- the canvas
+
+const canvas = document.getElementById("canvas");
+const svg = document.getElementById("edges");
+const layer = document.getElementById("nodes");
+canvas.style.width = width + "px";
+canvas.style.height = height + "px";
+svg.setAttribute("width", width);
+svg.setAttribute("height", height);
+svg.setAttribute("viewBox", "0 0 " + width + " " + height);
+
+function element(tag, className, text) {
+  const made = document.createElement(tag);
+  if (className) made.className = className;
+  if (text !== undefined && text !== null) made.textContent = text;
+  return made;
+}
+
+function scentColor(scent) {
+  if (scent === null || scent === undefined) return "#cbd5e1";
+  const s = Math.max(0, Math.min(1, scent));
+  const hue = 215 - 70 * s;
+  const light = 58 - 14 * s;
+  return "hsl(" + hue.toFixed(0) + " 62% " + light.toFixed(0) + "%)";
+}
+
+const edgeElements = [];
+edges.forEach(function (edge) {
+  const from = nodes.get(edge.source), to = nodes.get(edge.target);
+  if (!from || !to) return;
+  const x1 = from.x + NODE_W, y1 = from.y + NODE_H / 2;
+  const x2 = to.x, y2 = to.y + NODE_H / 2;
+  const bend = Math.max(40, (x2 - x1) / 2);
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+  path.setAttribute("d", "M" + x1 + " " + y1 + "C" + (x1 + bend) + " " + y1 + "," +
+    (x2 - bend) + " " + y2 + "," + x2 + " " + y2);
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", edge.kind === "followed" ? scentColor(edge.scent) : "#c4cad3");
+  path.setAttribute("stroke-width", edge.kind === "followed" ? (1 + 2.2 * edge.scent).toFixed(2) : "1.2");
+  path.setAttribute("stroke-linecap", "round");
+  if (edge.kind !== "followed") path.setAttribute("stroke-dasharray", "4 4");
+  path.style.opacity = "0";
+  svg.appendChild(path);
+  const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+  label.setAttribute("x", (x1 + x2) / 2);
+  label.setAttribute("y", (y1 + y2) / 2 - 4);
+  label.setAttribute("text-anchor", "middle");
+  label.setAttribute("font-size", "10");
+  label.setAttribute("font-family", "ui-monospace, Menlo, monospace");
+  label.setAttribute("fill", "#6b7280");
+  label.textContent = edge.scent === null || edge.scent === undefined
+    ? "no scent" : edge.scent.toFixed(2);
+  label.style.opacity = "0";
+  svg.appendChild(label);
+  edgeElements.push({ edge: edge, path: path, label: label });
+});
+
+const nodeElements = new Map();
+nodes.forEach(function (n) {
+  const box = element("div", "node");
+  box.style.left = n.x + "px";
+  box.style.top = n.y + "px";
+  box.title = n.path;
+  box.s1m = n;
+
+  const top = element("div", "top");
+  top.appendChild(element("span", "name", n.name));
+  const chip = element("span", "chip");
+  top.appendChild(chip);
+  box.appendChild(top);
+  box.appendChild(element("div", "dir", n.dir));
+
+  const score = element("div", "score");
+  const value = element("span", "value none", "·");
+  const bar = element("span", "bar");
+  const fill = document.createElement("i");
+  bar.appendChild(fill);
+  const depth = element("span", "depth", n.depth === null ? "" : "d" + n.depth);
+  score.appendChild(value);
+  score.appendChild(bar);
+  score.appendChild(depth);
+  box.appendChild(score);
+
+  const strip = element("div", "ticks");
+  box.appendChild(strip);
+
+  box.addEventListener("click", function () { select(n.path); });
+  layer.appendChild(box);
+  nodeElements.set(n.path, { node: n, box: box, chip: chip, value: value, fill: fill, strip: strip, ticks: [] });
+});
+
+ticks.forEach(function (tick) {
+  const held = nodeElements.get(tick.source);
+  if (!held) return;
+  const mark = element("span", "tick");
+  mark.style.background = scentColor(tick.scent);
+  mark.title = tick.target + " — " + (tick.scent === null ? "no scent" : tick.scent.toFixed(2)) +
+    " — " + spelling(tick.reason);
+  held.strip.appendChild(mark);
+  held.ticks.push({ tick: tick, mark: mark });
+});
+// The band says what it is on hover: a row of marks with no label is one more
+// thing to work out.
+nodeElements.forEach(function (held) {
+  if (!held.ticks.length) return;
+  held.box.title = held.node.path + " — " + held.ticks.length +
+    (held.ticks.length === 1 ? " link offered and passed over" : " links offered and passed over");
+});
+
+// The reading list, in the order the walk found the files. It is not the list's
+// own order — that is by relevance, and it is the one the `--format` views
+// print — because what this page draws is how the list was gathered.
+const results = EVENTS.map(function (record, at) {
+  return record.event === "result" ? { record: record, at: at } : null;
+}).filter(Boolean);
+// A file the walk visited more than once — a round's answers can overtake one
+// it popped, and it is put back on the frontier — is one place in the reading
+// list, so the list here holds one row per file: the row the file first
+// appeared at, saying that it came round again.
+const visits = new Map();
+results.forEach(function (entry) {
+  visits.set(entry.record.path, (visits.get(entry.record.path) || 0) + 1);
+});
+const listRows = new Map();
+const listed = new Set();
+const listPanel = document.getElementById("list");
+results.forEach(function (entry, index) {
+  const path = entry.record.path;
+  if (listed.has(path)) return;
+  listed.add(path);
+  const position = listed.size;
+  const held = node(path);
+  const answered = answerOf(held);
+  const cut = threshold();
+  const row = element("div", "row");
+  if (entry.record.earned_a_place) row.classList.add("earned");
+  row.appendChild(element("span", "n", String(position)));
+  const what = element("div", "what");
+  what.appendChild(element("div", "p", path));
+  const why = [];
+  const best = answered && answered.sections && answered.sections.length
+    ? answered.sections.reduce(function (a, b) { return b.score > a.score ? b : a; })
+    : null;
+  const cleared = best !== null && cut !== null && best.score >= cut;
+  if (entry.record.earned_a_place) {
+    why.push(cleared
+      ? "in the reading list · " + (best.heading || "its first lines") + " at " + best.score.toFixed(2)
+      : (cut === null ? "in the reading list" : "in the reading list · on relevance alone"));
+  } else {
+    why.push("walked, not read");
+    if (best !== null && cut !== null) {
+      why.push("best section " + best.score.toFixed(2) + ", under the cut " + cut.toFixed(2));
+    }
+  }
+  if ((visits.get(path) || 1) > 1) why.push("visited " + visits.get(path) + " times");
+  what.appendChild(element("div", "why", why.join(" · ")));
+  row.appendChild(what);
+  row.appendChild(element("span", "r", entry.record.relevance.toFixed(2)));
+  row.addEventListener("click", function () { select(path); });
+  listPanel.appendChild(row);
+  listRows.set(path, { entry: entry, row: row });
+});
+
+// --------------------------------------------------------------- the detail
+
+let selected = null;
+const detail = document.getElementById("detail");
+
+function threshold() { return RUN.started ? RUN.started.threshold : null; }
+
+function spelling(reason) {
+  return String(reason).replace(/-/g, " ");
+}
+
+function select(path) {
+  selected = path;
+  nodeElements.forEach(function (held, key) {
+    held.box.classList.toggle("selected", key === path);
+  });
+  listRows.forEach(function (held) {
+    held.row.classList.toggle("selected", held.entry.record.path === path);
+  });
+  edgeElements.forEach(function (held) {
+    const mine = held.edge.source === path || held.edge.target === path;
+    held.path.style.strokeWidth = mine ? "2.6" : (held.edge.kind === "followed"
+      ? (1 + 2.2 * held.edge.scent).toFixed(2) : "1.2");
+    held.path.style.opacity = mine ? "0.85" : "";
+    held.label.style.opacity = mine ? "1" : "";
+  });
+  detail.replaceChildren();
+  if (!path) {
+    detail.appendChild(element("p", "quiet", "Pick a file — on the crawl or in the list — to see how the walk reached it and what earned it its place."));
+    return;
+  }
+  const n = nodes.get(path);
+  const answered = answerOf(n);
+  detail.appendChild(element("h3", null, path));
+
+  const facts = element("div", "facts");
+  facts.appendChild(element("span", "fact", "depth " + (n.depth === null ? "?" : n.depth)));
+  facts.appendChild(element("span", "fact mono", "path score " + (n.score === null ? "?" : n.score.toFixed(2))));
+  if (n.dropped !== null) facts.appendChild(element("span", "fact bad", "dropped: a budget stopped it"));
+  else if (n.pop === null) facts.appendChild(element("span", "fact warn", "queued, never popped"));
+  if (n.result !== null) {
+    facts.appendChild(element("span", "fact " + (n.earned ? "good" : ""),
+      n.earned ? "in the reading list" : "walked, not read"));
+  }
+  detail.appendChild(facts);
+
+  const chain = element("h4", null, "Arrived by");
+  detail.appendChild(chain);
+  const walked = element("div", "chain");
+  if (!n.via.length) {
+    walked.appendChild(element("span", "hop",
+      n.depth === 0 || n.depth === null
+        ? "an entry file: the walk started here"
+        : "no path to it is in the trace"));
+  } else {
+    const hops = n.via.concat([path]);
+    hops.forEach(function (hop, index) {
+      const held = nodes.get(hop);
+      if (index > 0) {
+        const hopEdge = edges.find(function (e) {
+          return e.source === hops[index - 1] && e.target === hop && e.kind === "followed";
+        });
+        walked.appendChild(element("span", "hop",
+          " —" + (hopEdge ? hopEdge.scent.toFixed(2) : "?") + "→ "));
+      }
+      walked.appendChild(element("span", "at", hop));
+      walked.appendChild(element("span", "hop",
+        " (" + (held && held.score !== null ? held.score.toFixed(2) : "?") + ")"));
+    });
+  }
+  detail.appendChild(walked);
+
+  if (answered) {
+    const scoring = element("h4", null, "What the model said");
+    detail.appendChild(scoring);
+    const facts2 = element("div", "facts");
+    facts2.appendChild(element("span", "fact mono", "relevance " + answered.relevance.toFixed(2)));
+    facts2.appendChild(element("span", "fact", n.requests +
+      (n.requests === 1 ? " request" : " requests")));
+    facts2.appendChild(element("span", "fact" + (answered.cached ? "" : " good"),
+      answered.cached
+        ? "served from the cache (" + answered.latency_ms + " ms when it was bought)"
+        : "bought in " + answered.latency_ms + " ms"));
+    detail.appendChild(facts2);
+
+    if (answered.sections && answered.sections.length) {
+      detail.appendChild(element("h4", null, "Sections"));
+      const cut = threshold();
+      answered.sections.forEach(function (section) {
+        const earning = n.earned && cut !== null && section.score >= cut;
+        const row = element("div", "sect" + (earning ? " earning" : (cut !== null && section.score < cut ? " under" : "")));
+        row.appendChild(element("span", "head", section.heading || "(before the first heading)"));
+        row.appendChild(element("span", "lines", "lines " + section.lines[0] + "–" + section.lines[1]));
+        row.appendChild(element("span", "r", section.score.toFixed(2)));
+        detail.appendChild(row);
+      });
+    }
+  } else {
+    detail.appendChild(element("p", "quiet", "The walk never judged this file: "
+      + (n.dropped !== null ? "it was queued and a budget stopped it before its turn."
+        : "it was popped and could not be judged.")));
+  }
+
+  // The links the file offered, and what the walk did about each: the same
+  // records the reading list builds a result's `links` from. A path a budget
+  // dropped is not one of them — the link was followed, and what became of the
+  // path it queued is the dropped file's own story — so those records stay out.
+  const offered = prunings.filter(function (prune) {
+    return prune.source === path && prune.reason !== "beam" && prune.reason !== "max-files";
+  }).concat(admissions.filter(function (admit) { return admit.source === path; }));
+  offered.sort(function (a, b) { return a.at - b.at; });
+  if (offered.length) {
+    detail.appendChild(element("h4", null, "Links it offered (" + offered.length + ")"));
+    const table = element("table", "links");
+    const body = document.createElement("tbody");
+    offered.forEach(function (link) {
+      const row = document.createElement("tr");
+      if (!link.reason) row.className = "followed";
+      row.appendChild(element("td", "t", link.target));
+      row.appendChild(element("td", "s", link.scent === null || link.scent === undefined
+        ? "—" : link.scent.toFixed(2)));
+      row.appendChild(element("td", "v", link.reason ? spelling(link.reason) : "followed"));
+      row.addEventListener("click", function () { select(link.target); });
+      body.appendChild(row);
+    });
+    table.appendChild(body);
+    detail.appendChild(table);
+  }
+}
+
+function answerOf(n) { return n.answer === null ? null : EVENTS[n.answer]; }
+
+// ----------------------------------------------------------- the replay
+
+let step = 0;
+let playing = false;
+let timer = null;
+const last = EVENTS.length - 1;
+const scrub = document.getElementById("scrub");
+const playButton = document.getElementById("play");
+const clock = document.getElementById("clock");
+scrub.max = String(Math.max(0, last));
+scrub.value = "0";
+
+function interval() {
+  return 340 / Number(document.getElementById("speed").value);
+}
+
+function clockText() {
+  if (!EVENTS.length) return "no events";
+  const record = EVENTS[step];
+  const time = record.t_ms === undefined ? "" : " · " + record.t_ms + " ms";
+  return "event " + (step + 1) + "/" + EVENTS.length + time + " · " + describe(record);
+}
+
+function describe(record) {
+  switch (record.event) {
+    case "started": return "the run starts";
+    case "popped": return "popped " + record.path + " at " + record.path_score.toFixed(2);
+    case "requested": return "asked about " + record.path +
+      (record.post_index ? " (post " + (record.post_index + 1) + ")" : "");
+    case "answered": return "answered " + record.path + ", relevance " + record.relevance.toFixed(2) +
+      (record.cached ? " (from the cache)" : "");
+    case "admitted": return "followed " + record.source + " → " + record.target +
+      " at " + record.scent.toFixed(2);
+    case "pruned": return "passed over " + record.target + " (" + spelling(record.reason) + ")";
+    case "result": return "visited " + record.path + (record.earned_a_place ? " — in the list" : "");
+    default: return record.event;
+  }
+}
+
+function paint() {
+  const record = EVENTS[step];
+  nodeElements.forEach(function (held, path) {
+    const n = held.node;
+    const seen = n.first !== null && n.first <= step;
+    held.box.classList.toggle("gone", !seen);
+    const dropped = n.dropped !== null && n.dropped <= step;
+    const popped = n.pop !== null && n.pop <= step;
+    held.box.classList.toggle("waiting", seen && !popped && !dropped);
+    held.box.classList.toggle("dropped", dropped);
+    const answered = n.answer !== null && n.answer <= step;
+    held.box.classList.toggle("answered", answered);
+    if (answered) {
+      const relevance = EVENTS[n.answer].relevance;
+      held.value.textContent = relevance.toFixed(2);
+      held.value.classList.remove("none");
+      held.fill.style.width = (relevance * 100).toFixed(1) + "%";
+    } else {
+      held.value.textContent = popped && n.score !== null ? n.score.toFixed(2) : "·";
+      held.value.classList.toggle("none", !popped);
+      held.fill.style.width = "0%";
+    }
+    const resulted = n.result !== null && n.result <= step;
+    held.box.classList.toggle("result", resulted);
+    held.chip.textContent = resulted ? (n.earned ? "in list" : "walked")
+      : dropped ? "dropped" : (popped ? "visited" : "waiting");
+    held.box.classList.toggle("now", record !== undefined && concerns(record, path));
+    held.box.classList.toggle("selected", path === selected);
+  });
+
+  edgeElements.forEach(function (held) {
+    const visible = held.edge.at <= step;
+    held.path.style.opacity = visible ? (held.edge.source === selected || held.edge.target === selected
+      ? "0.85" : (held.edge.kind === "followed" ? String(0.25 + 0.6 * held.edge.scent) : "0.35")) : "0";
+    held.label.style.opacity = visible && (held.edge.source === selected || held.edge.target === selected
+      || held.edge.at === step) ? "1" : "0";
+  });
+
+  nodeElements.forEach(function (held) {
+    held.ticks.forEach(function (mark) {
+      const visible = mark.tick.at <= step;
+      mark.mark.style.opacity = visible ? "1" : "0";
+      mark.mark.classList.toggle("now", mark.tick.at === step);
+    });
+  });
+
+  listRows.forEach(function (held) {
+    held.row.classList.toggle("gone", held.entry.at > step);
+  });
+
+  scrub.value = String(step);
+  clock.textContent = clockText();
+  playButton.textContent = playing ? "❚❚ Pause" : "▶ Play";
+}
+
+function concerns(record, path) {
+  switch (record.event) {
+    case "popped": case "requested": case "answered": case "result":
+      return record.path === path;
+    case "admitted": case "pruned":
+      return record.source === path || record.target === path;
+    default:
+      return false;
+  }
+}
+
+function go(to) {
+  step = Math.max(0, Math.min(Math.max(0, last), to));
+  paint();
+}
+
+function stop() {
+  playing = false;
+  if (timer !== null) { clearTimeout(timer); timer = null; }
+  paint();
+}
+
+function advance() {
+  if (step >= last) { stop(); return; }
+  go(step + 1);
+  timer = setTimeout(advance, interval());
+}
+
+function play() {
+  if (playing) { stop(); return; }
+  if (!EVENTS.length) return;
+  playing = true;
+  if (step >= last) go(0);
+  paint();
+  timer = setTimeout(advance, interval());
+}
+
+document.getElementById("play").addEventListener("click", play);
+document.getElementById("restart").addEventListener("click", function () { stop(); go(0); });
+document.getElementById("forward").addEventListener("click", function () { stop(); go(step + 1); });
+document.getElementById("back").addEventListener("click", function () { stop(); go(step - 1); });
+document.getElementById("speed").addEventListener("change", function () {
+  if (playing) { clearTimeout(timer); timer = setTimeout(advance, interval()); }
+});
+scrub.addEventListener("input", function () { stop(); go(Number(scrub.value)); });
+document.addEventListener("keydown", function (event) {
+  // A control the reader is on keeps its own keys: space on a button is that
+  // button, and the arrows on the scrubber are the scrubber.
+  if (event.target.closest && event.target.closest("button, select, input")) return;
+  if (event.key === " ") { event.preventDefault(); play(); }
+  else if (event.key === "ArrowRight") { event.preventDefault(); stop(); go(step + 1); }
+  else if (event.key === "ArrowLeft") { event.preventDefault(); stop(); go(step - 1); }
+  else if (event.key === "Home") { event.preventDefault(); stop(); go(0); }
+  else if (event.key === "End") { event.preventDefault(); stop(); go(last); }
+});
+
+// --------------------------------------------------------------- the frame
+
+(function head() {
+  const started = RUN.started;
+  const title = document.getElementById("title");
+  const subtitle = document.getElementById("subtitle");
+  if (started) {
+    title.textContent = "“" + started.query + "”";
+    document.title = started.query + " — s1m";
+    const parts = ["criterion " + started.mode];
+    parts.push("cutoff " + started.threshold.toFixed(2));
+    parts.push("traced from " + RUN.trace);
+    subtitle.textContent = parts.join(" · ");
+  } else {
+    title.textContent = RUN.trace;
+    document.title = RUN.trace + " — s1m";
+    subtitle.textContent = "no run record in this trace: it was written before s1m recorded "
+      + "what was asked, so the query and the cutoff are not in it";
+  }
+
+  const s = RUN.summary;
+  const stats = document.getElementById("stats");
+  const figures = [
+    [String(s.files), s.files === 1 ? "file visited" : "files visited"],
+    [String(s.requests), s.requests === 1 ? "request" : "requests"],
+    [s.bought + " / " + s.cached, "bought / cached"],
+    [s.earned + " / " + s.files, "in the list"],
+    [String(s.followed), "links followed"],
+    [String(s.passed_over + s.dropped), "passed over"],
+    [s.duration_ms + " ms", "wall time"],
+  ];
+  figures.forEach(function (figure) {
+    const cell = document.createElement("div");
+    cell.appendChild(element("dt", null, figure[1]));
+    cell.appendChild(element("dd", null, figure[0]));
+    stats.appendChild(cell);
+  });
+})();
+
+(function legend() {
+  const counts = new Map();
+  prunings.forEach(function (prune) {
+    counts.set(prune.reason, (counts.get(prune.reason) || 0) + 1);
+  });
+  const legend = document.getElementById("legend");
+  const ramp = element("div", "ramp");
+  ramp.appendChild(element("span", null, "scent"));
+  const strip = element("span", "strip");
+  const cut = threshold();
+  if (cut !== null) {
+    const mark = element("span", "cut");
+    mark.style.left = (cut * 100).toFixed(1) + "%";
+    mark.title = "the cutoff, " + cut.toFixed(2);
+    strip.appendChild(mark);
+  }
+  ramp.appendChild(strip);
+  ramp.appendChild(element("span", null, "1.0"));
+  legend.appendChild(ramp);
+  legend.appendChild(element("div", "key",
+    "an edge is a link the walk followed, a tick one it passed over"));
+
+  const order = ["below-threshold", "not-kept", "unjudged", "out-of-root", "past-depth",
+    "already-reached", "already-queued", "ignored", "beam", "max-files"];
+  let any = false;
+  order.forEach(function (reason) {
+    if (!counts.has(reason)) return;
+    any = true;
+    legend.appendChild(element("div", "key", spelling(reason) + " × " + counts.get(reason)));
+  });
+  if (!any) legend.appendChild(element("div", "key", "every link it judged was followed"));
+})();
+
+document.getElementById("list-note").textContent = "in the order the walk found them";
+
+// The page opens on the file a reader would ask about first: the most relevant
+// one that earned a place. Nothing earned means nothing to show, and the panel
+// says how to pick one.
+const best = results.filter(function (entry) { return entry.record.earned_a_place; })
+  .sort(function (a, b) { return b.record.relevance - a.record.relevance; })[0];
+select(best ? best.record.path : null);
+
+const reduced = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+if (reduced) { go(last); } else { play(); }
+</script>
+</body>
+</html>
