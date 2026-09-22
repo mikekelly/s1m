@@ -82,7 +82,7 @@ The query text goes in the state. The mode selects which instructions and criter
 
 Custom criteria can be supplied from a file for anything else: the file's whole content is the
 criterion, and it replaces the mode's rather than adding to it. The file format is documented in
-the README's Custom criteria section.
+the reference's Custom criteria section (`docs/reference.md`).
 
 ### Scoring and pruning
 
@@ -149,7 +149,7 @@ what keeps them measurable.
 
 The flag table above is what the code holds — `src/main.rs` for the numbers, `JevScorer::from_env`
 for previews with frontmatter and the frontmatter inside them — so the decision is this record and
-the README's table rather than a diff.
+the reference's flag table (`docs/reference.md`) rather than a diff.
 
 ### Output
 

@@ -143,4 +143,4 @@ names the path or the flag.
 - **`s1m --help`** carries the same description, every flag with its default, and the exit codes.
 
 The design, the output schema in full and the measured results on a real wiki are in the
-[README](README.md) and [eval/REPORT.md](eval/REPORT.md).
+[README](README.md), its [reference](docs/reference.md) and [eval/REPORT.md](eval/REPORT.md).
