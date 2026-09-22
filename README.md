@@ -22,13 +22,13 @@ line ranges, ready for an agent to open.
 | **s1m** | Judges meaning *and* follows the links: one small judgment per file the walk reaches, per section and per link, best-first | One cheap judgment per file the walk visits — and it returns line ranges, not whole pages |
 
 The last two of those have been measured against each other: 20 labelled queries on one
-1,933-page wiki, in [`eval/PRIVATE_WIKI_REPORT.md`](eval/PRIVATE_WIKI_REPORT.md). Every cell is
-a mean, over the runs the *Runs* column counts.
+1,933-page wiki, 60 runs a condition, in
+[`eval/PRIVATE_WIKI_REPORT.md`](eval/PRIVATE_WIKI_REPORT.md). Every cell is a mean over those
+runs; s1m's cold figures are the 20 runs that were measured cold.
 
 | Measured | Runs | Recall | Precision | Cost a query | Wall | Tokens |
 | --- | --- | --- | --- | --- | --- | --- |
 | Claude Code **Explore**, sonnet ([row](eval/PRIVATE_WIKI_REPORT.md#results)) | 60 | 0.85 | 0.17 | $0.29 | 78 s | ~310k read |
-| Claude Code **Explore**, haiku ([row](eval/PRIVATE_WIKI_REPORT.md#the-haiku-explore-baseline)) | 20 | 0.86 | 0.35 | $0.12 | 59 s | ~310k read |
 | **s1m** at today's defaults ([row](eval/PRIVATE_WIKI_REPORT.md#reading-the-numbers)) | 60 warm, 20 cold | 0.87 | 0.21 | $0.03 cold, $0 warm | 1.9 s cold, 0.2 s warm | ~15k handed to the agent |
 
 One wiki, one machine, one network — and the sonnet Explore baseline's parent session read the
