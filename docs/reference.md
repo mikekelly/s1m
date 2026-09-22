@@ -39,12 +39,71 @@ real pages is in [docs/spike-notes.md](spike-notes.md).
 
 ## Install
 
+macOS and Linux install a prebuilt binary, with no Rust toolchain:
+
 ```bash
-cargo install --git https://github.com/mikekelly/s1m
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
 ```
 
+`latest` selects a *release*, and the installer that release carries is pinned to it: it fetches
+its archive from `releases/download/v0.1.0`, never from `latest`, so what you install cannot
+drift underneath you. In order, the installer
+
+| | |
+| --- | --- |
+| detects the platform | `uname` decides which of the [four targets](#the-archives-directly) this is, and a glibc older than the one the archive was built against is refused too |
+| downloads | `s1m-<target>.tar.xz` from the release the installer came from |
+| verifies | compares the archive against the SHA-256 baked into the script, and stops with `checksum mismatch` and exit 1 if the bytes are not those bytes |
+| installs | `s1m` into `$XDG_BIN_HOME`, or into `~/.local/bin` when that variable is unset |
+
+Both directories are the user's own, so `sudo` is never needed and nothing outside `$HOME` is
+touched. `$S1M_INSTALL_DIR` overrides the choice, and `S1M_NO_MODIFY_PATH=1` leaves your shell
+profiles alone; `s1m-installer.sh --help` lists the flags the script also takes.
+
+Then it puts that directory on your `PATH`: it writes `$XDG_CONFIG_HOME/s1m/env.sh` — a script
+that prepends the directory when `$PATH` is missing it — and adds `. "$HOME/.config/s1m/env.sh"`
+to `.profile` and to whichever of `.bashrc`, `.bash_profile`, `.bash_login`, `.zshrc`, `.zshenv`
+exist, plus `~/.config/fish/conf.d/s1m.env.fish` for fish. When those files are only read at the
+next login it prints the one `source` line to run now, which is the whole of what a fresh shell
+needs: `s1m --version` answers `s1m 0.1.0` in it.
+
+Pin the version by fetching that release's installer instead of `latest`'s:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
+```
+
+A platform the release does not carry is refused before anything is downloaded, with exit 1 and
+the platform it detected:
+
+```text
+$ sh s1m-installer.sh
+ERROR: there isn't a download for your platform x86_64-unknown-freebsd
+```
+
+Windows is not supported, and neither is any Linux the archives were not built for.
+
+### The archives directly
+
+Every release also carries the archives and their checksums, for anyone who would rather not put
+a script through their shell: `s1m-<target>.tar.xz`, a `.sha256` beside each one, and
+`sha256.sum` over all of them for `sha256sum -c`.
+
+| Asset | Runs on |
+| --- | --- |
+| `s1m-aarch64-apple-darwin.tar.xz` | macOS, Apple silicon |
+| `s1m-x86_64-apple-darwin.tar.xz` | macOS, Intel |
+| `s1m-aarch64-unknown-linux-gnu.tar.xz` | Linux, arm64 |
+| `s1m-x86_64-unknown-linux-gnu.tar.xz` | Linux, x86-64 |
+
+Each archive is a directory named for its target, holding `s1m`, the `LICENSE` and the `README`.
+
+### From source
+
 Stable Rust, edition 2024 — rustc 1.85 or newer — is the only requirement. The crate is not
-published to crates.io or anywhere else, so `cargo install --git` is the install. From a
+published to crates.io or anywhere else, so `cargo install --git` is the source install. From a
 checkout, `cargo build --release` leaves the binary at `target/release/s1m`, which is what the
 rest of this README spells `s1m`: run `./target/release/s1m` there, or `cargo install --path .`
 to put it on your `PATH`. Either way the binary is one command, and the scoring calls need a key
@@ -844,6 +903,8 @@ text it is written in rather than from its heading.
 | `cargo build` | Debug build |
 | `cargo fmt` | Format; `cargo fmt --check` to verify |
 | `cargo clippy --all-targets -- -D warnings` | Lint, warnings are errors |
+| `dist plan` | What a release would build, without building it — what pull requests run |
+| `dist generate` | Rewrite `.github/workflows/release.yml` from `dist-workspace.toml` |
 
 CI runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` and
 `cargo build` on the stable toolchain, then a smoke test on the built binary: `--help` prints
@@ -857,3 +918,24 @@ and covers the rest of the interface: the exit codes, the reading list on stdout
 with the key set it scores the vendored wiki's index page and release page and this
 repository's plan, checks that the release page outranks an unrelated one, and checks that the
 second identical run is answered from the cache rather than the API.
+
+### Releases
+
+The prebuilt releases are [dist](https://axodotdev.github.io/cargo-dist/)'s.
+`dist-workspace.toml` at the root is the configuration — the four targets, the installer's
+install path, and `[dist.binaries]`, which keeps the archives to `s1m` alone, since `eval` and
+`eval-agent` are built from this crate but stay with the source checkout.
+`.github/workflows/release.yml` is generated from that file and committed, and `dist generate`
+rewrites it after a config change.
+
+A tag on a released version builds the four targets and publishes them: `v0.1.0`, or
+`v0.1.0-rc.1` for a version with a prerelease suffix, which GitHub is told to mark as a
+prerelease. The release carries `s1m-installer.sh`, the four archives
+[Install](#install) lists, a `.sha256` beside each one and `sha256.sum`. The installer is
+generated for that one tag, which is where its pinned archive URL and its baked-in checksums
+come from.
+
+The same workflow runs on every pull request, and there it stops at the plan: `dist plan`
+validates the configuration and says what a tag would build, and nothing is published. A stale
+committed `release.yml` fails that job, so the generated file cannot drift from the config it
+came from.

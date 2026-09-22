@@ -35,9 +35,11 @@ associative trails through linked documents.
 ## Quickstart
 
 ```bash
-# Stable Rust, edition 2024 — rustc 1.85 or newer. Not published to crates.io,
-# so `cargo install --git` is the install.
-cargo install --git https://github.com/mikekelly/s1m
+# macOS or Linux, no Rust toolchain: the installer detects the platform,
+# checks the archive against its SHA-256, and writes `s1m` to $XDG_BIN_HOME,
+# or to ~/.local/bin when that is unset. It never needs sudo.
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/mikekelly/s1m/releases/latest/download/s1m-installer.sh | sh
 
 # Run it on the wiki vendored in this repository. No API key needed: the answers
 # are in the committed cache, which is why the run reports 0 calls.
@@ -47,6 +49,25 @@ S1M_CACHE_DIR=eval/cache s1m --format md \
   "how do I cut a release and publish the package" \
   eval/wikis/llm-wiki-manager/wiki/index.md
 ```
+
+Two other ways in, for anyone who would rather not pipe a script into a shell. Pin the version —
+the installer is pinned to the release it came from, and resolves nothing through `latest`:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/mikekelly/s1m/releases/download/v0.1.0/s1m-installer.sh | sh
+```
+
+Or take the archive for your platform and its `.sha256` from the
+[releases page](https://github.com/mikekelly/s1m/releases), or build from source with stable
+Rust — edition 2024, rustc 1.85 or newer, and not published to crates.io, so:
+
+```bash
+cargo install --git https://github.com/mikekelly/s1m
+```
+
+`$S1M_INSTALL_DIR` overrides the install directory, and
+[Install](docs/reference.md#install) has the targets the releases carry and the rest.
 
 ```markdown
 # Reading list: how do I cut a release and publish the package
@@ -214,7 +235,8 @@ request, nothing fetched — and [the reference](docs/reference.md#playing-a-tra
 
 Everything below is in [`docs/reference.md`](docs/reference.md), one click away and complete.
 
-**[Install](docs/reference.md#install)** — `cargo install --git`, `cargo install --path .` from a
+**[Install](docs/reference.md#install)** — the prebuilt installer for macOS and Linux, the
+release archives and checksums it fetches, `cargo install --git`, `cargo install --path .` from a
 checkout, or `cargo build --release` and the binary at `target/release/s1m`; and the key the
 scoring calls need.
 

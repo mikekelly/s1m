@@ -1,0 +1,31 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.33.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell"]
+# Where to host releases
+hosting = "github"
+# Target platforms to build apps for (Rust target-triple syntax).
+# Windows is out of scope: s1m ships macOS and Linux archives only (#81).
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in: the XDG user bin directory
+# when it is set, else ~/.local/bin. Both are user-owned, so no sudo; neither
+# needs a Rust toolchain. $S1M_INSTALL_DIR overrides either.
+install-path = ["$XDG_BIN_HOME/", "~/.local/bin"]
+# Run 'dist plan' on pull requests, so the release workflow is checked there
+# without publishing anything
+pr-run-mode = "plan"
+# Automatic self-update is out of scope (#81)
+install-updater = false
+
+# The releases carry the CLI only. `eval` and `eval-agent` are the measurement
+# harnesses, run from a checkout with `cargo run --bin eval`, and a user's bin
+# directory is no place for a binary called `eval`.
+[dist.binaries]
+"*" = ["s1m"]
