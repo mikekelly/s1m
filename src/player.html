@@ -198,10 +198,14 @@
         <button id="forward" title="Forward one event (Right)">&#9654;</button>
         <label class="quiet" style="font-size:12px;color:var(--muted)">speed
           <select id="speed">
+            <option value="0.125">0.125&times;</option>
+            <option value="0.25" selected>0.25&times;</option>
             <option value="0.5">0.5&times;</option>
-            <option value="1" selected>1&times;</option>
+            <option value="1">1&times;</option>
             <option value="2">2&times;</option>
             <option value="4">4&times;</option>
+            <option value="8">8&times;</option>
+            <option value="16">16&times;</option>
           </select>
         </label>
         <input id="scrub" type="range" min="0" max="0" value="0" step="1">
@@ -689,8 +693,27 @@ const clock = document.getElementById("clock");
 scrub.max = String(Math.max(0, last));
 scrub.value = "0";
 
+// One event's pause at 1×, and every other speed is this divided or multiplied:
+// 1× is 85 ms an event, 0.25× — the speed a page opens at, and what the control
+// called 1× before the ladder was recalibrated — is 340 ms, and 16× is about
+// 5 ms. An event stepped by hand is the control for a reader who wants to look
+// closely, so the ladder starts just above 0 and goes up.
+const INTERVAL_1X = 85;
+
+// A frame, near enough: 16 ms is what a browser repaints in, so a speed faster
+// than that steps several events per tick and paints once. Without it the
+// animation is paced by how long a paint takes — on a graph of a thousand boxes
+// that is tens of milliseconds, and every speed above 4× would run at the same
+// rate. What is on screen at 16× is a blur either way; what the control
+// promises is how long the run takes, and this is what keeps it.
+const FRAME_MS = 16;
+
 function interval() {
-  return 340 / Number(document.getElementById("speed").value);
+  return INTERVAL_1X / Number(document.getElementById("speed").value);
+}
+
+function tickLength() {
+  return Math.max(FRAME_MS, interval());
 }
 
 function clockText() {
@@ -801,10 +824,21 @@ function stop() {
   paint();
 }
 
+// The pace is measured, not assumed: each tick advances as many events as the
+// time since the last one is worth. A paint on a graph of a thousand boxes
+// takes tens of milliseconds and blocks the loop, so a tick that always stepped
+// one event would run every fast speed at the same stretched rate; stepping
+// what the elapsed time is owed keeps the run as long as the control says.
+let lastTick = 0;
+
 function advance() {
   if (step >= last) { stop(); return; }
-  go(step + 1);
-  timer = setTimeout(advance, interval());
+  const now = performance.now();
+  const elapsed = lastTick ? now - lastTick : interval();
+  lastTick = now;
+  const owed = Math.max(1, Math.round(elapsed / interval()));
+  go(Math.min(last, step + owed));
+  timer = setTimeout(advance, tickLength());
 }
 
 function play() {
@@ -813,7 +847,8 @@ function play() {
   playing = true;
   if (step >= last) go(0);
   paint();
-  timer = setTimeout(advance, interval());
+  lastTick = performance.now();
+  timer = setTimeout(advance, tickLength());
 }
 
 document.getElementById("play").addEventListener("click", play);
@@ -821,7 +856,7 @@ document.getElementById("restart").addEventListener("click", function () { stop(
 document.getElementById("forward").addEventListener("click", function () { stop(); go(step + 1); });
 document.getElementById("back").addEventListener("click", function () { stop(); go(step - 1); });
 document.getElementById("speed").addEventListener("change", function () {
-  if (playing) { clearTimeout(timer); timer = setTimeout(advance, interval()); }
+  if (playing) { clearTimeout(timer); timer = setTimeout(advance, tickLength()); }
 });
 // The value is read before `stop()`, which paints and puts the range back to
 // the step on screen: read after it, every drag would ask to go where the run

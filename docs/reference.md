@@ -326,7 +326,10 @@ implied.
 
 Play, step and the scrubber move the run along by event rather than by wall clock — a warm run's
 whole trace spans about 20 ms, so equal time per event is the only way to watch one — and the
-clock shows the real `t_ms` of whatever is on screen all the same.
+clock shows the real `t_ms` of whatever is on screen all the same. The speed control runs from
+0.125× to 16×, where 1× is 85 ms an event and 0.25× — the pace a page opens at — is 340 ms; past
+roughly 5× the run advances several events per frame, so the tempo the control promises holds even
+where the picture cannot keep up.
 
 The panel beside it is the question a reading list answers without evidence. It lists the files the
 walk visited in the order it found them, marks the ones that earned a place, and says what earned
